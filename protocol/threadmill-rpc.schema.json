@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threadmill.dev/protocol/threadmill-rpc.schema.json",
+  "title": "Threadmill RPC Protocol",
+  "description": "JSON-RPC 2.0 protocol between Threadmill (macOS app) and Spindle (beast daemon). Text frames carry JSON-RPC. Binary frames carry terminal I/O with a 2-byte channel ID prefix.",
+  "version": "0.1.0",
+
+  "$defs": {
+    "JsonRpcRequest": {
+      "type": "object",
+      "required": ["jsonrpc", "method"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "type": ["integer", "string", "null"], "description": "Present for requests, absent for notifications" },
+        "method": { "type": "string" },
+        "params": {}
+      }
+    },
+
+    "JsonRpcResponse": {
+      "type": "object",
+      "required": ["jsonrpc", "id"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "type": ["integer", "string", "null"] },
+        "result": {},
+        "error": { "$ref": "#/$defs/JsonRpcError" }
+      }
+    },
+
+    "JsonRpcError": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "integer" },
+        "message": { "type": "string" }
+      }
+    },
+
+    "BinaryFrame": {
+      "description": "Binary WebSocket frame: [u16be channel_id][raw terminal bytes]. Channel ID assigned by terminal.attach response.",
+      "type": "object",
+      "properties": {
+        "channel_id": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "First 2 bytes, big-endian u16" },
+        "data": { "type": "string", "contentEncoding": "binary", "description": "Remaining bytes: raw terminal I/O" }
+      }
+    },
+
+    "Project": {
+      "type": "object",
+      "required": ["id", "name", "path", "default_branch"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "name": { "type": "string" },
+        "path": { "type": "string", "description": "Absolute path on beast" },
+        "default_branch": { "type": "string" }
+      }
+    },
+
+    "Thread": {
+      "type": "object",
+      "required": ["id", "project_id", "name", "branch", "worktree_path", "status", "source_type", "created_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "project_id": { "type": "string", "format": "uuid" },
+        "name": { "type": "string" },
+        "branch": { "type": "string" },
+        "worktree_path": { "type": "string" },
+        "status": { "$ref": "#/$defs/ThreadStatus" },
+        "source_type": { "$ref": "#/$defs/SourceType" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "ThreadStatus": {
+      "type": "string",
+      "enum": ["creating", "active", "closing", "closed", "hidden", "failed"]
+    },
+
+    "SourceType": {
+      "type": "string",
+      "enum": ["new_feature", "existing_branch", "pull_request"]
+    },
+
+    "PresetStatus": {
+      "type": "string",
+      "enum": ["running", "stopped", "crashed"]
+    },
+
+    "DirectoryEntry": {
+      "type": "object",
+      "required": ["name", "is_dir"],
+      "properties": {
+        "name": { "type": "string" },
+        "is_dir": { "type": "boolean" },
+        "is_git_repo": { "type": "boolean" }
+      }
+    }
+  },
+
+  "methods": {
+    "ping": {
+      "description": "Health check",
+      "params": null,
+      "result": { "const": "pong" }
+    },
+
+    "project.list": {
+      "description": "List all registered projects",
+      "params": null,
+      "result": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/Project" }
+      }
+    },
+
+    "project.add": {
+      "description": "Register an existing repo as a project",
+      "params": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string", "description": "Absolute path to git repo on beast" }
+        }
+      },
+      "result": { "$ref": "#/$defs/Project" }
+    },
+
+    "project.clone": {
+      "description": "Clone a repo and register it as a project",
+      "params": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "description": "Git clone URL" },
+          "path": { "type": "string", "description": "Optional target directory. Defaults to projects_root/<repo-name>" }
+        }
+      },
+      "result": { "$ref": "#/$defs/Project" }
+    },
+
+    "project.remove": {
+      "description": "Unregister a project (does not delete files)",
+      "params": {
+        "type": "object",
+        "required": ["project_id"],
+        "properties": {
+          "project_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "result": { "type": "object", "properties": { "removed": { "type": "boolean" } } }
+    },
+
+    "project.branches": {
+      "description": "List remote branches for a project",
+      "params": {
+        "type": "object",
+        "required": ["project_id"],
+        "properties": {
+          "project_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "result": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+
+    "project.browse": {
+      "description": "List directory contents on beast (for project picker UI)",
+      "params": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" }
+        }
+      },
+      "result": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/DirectoryEntry" }
+      }
+    },
+
+    "thread.create": {
+      "description": "Create a new thread (worktree + tmux session). Returns immediately with thread ID. Progress streamed via thread.progress events.",
+      "params": {
+        "type": "object",
+        "required": ["project_id", "name", "source_type"],
+        "properties": {
+          "project_id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "description": "Thread/branch name" },
+          "source_type": { "$ref": "#/$defs/SourceType" },
+          "source_ref": { "type": "string", "description": "Branch name or PR URL for existing_branch/pull_request source types" }
+        }
+      },
+      "result": { "$ref": "#/$defs/Thread" }
+    },
+
+    "thread.close": {
+      "description": "Close or hide a thread",
+      "params": {
+        "type": "object",
+        "required": ["thread_id", "mode"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" },
+          "mode": { "type": "string", "enum": ["close", "hide"] }
+        }
+      },
+      "result": { "type": "object", "properties": { "status": { "$ref": "#/$defs/ThreadStatus" } } }
+    },
+
+    "thread.reopen": {
+      "description": "Reopen a hidden thread",
+      "params": {
+        "type": "object",
+        "required": ["thread_id"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "result": { "$ref": "#/$defs/Thread" }
+    },
+
+    "thread.list": {
+      "description": "List threads, optionally filtered by project",
+      "params": {
+        "type": "object",
+        "properties": {
+          "project_id": { "type": "string", "format": "uuid", "description": "Optional filter" }
+        }
+      },
+      "result": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/Thread" }
+      }
+    },
+
+    "thread.cancel": {
+      "description": "Cancel a thread that is currently being created",
+      "params": {
+        "type": "object",
+        "required": ["thread_id"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "result": { "type": "object", "properties": { "cancelled": { "type": "boolean" } } }
+    },
+
+    "thread.open_editor": {
+      "description": "Get editor URI for a thread's worktree",
+      "params": {
+        "type": "object",
+        "required": ["thread_id"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "uri": { "type": "string", "description": "vscode:// or cursor:// remote SSH URI" }
+        }
+      }
+    },
+
+    "terminal.attach": {
+      "description": "Attach to a tmux pane and start relaying I/O as binary frames",
+      "params": {
+        "type": "object",
+        "required": ["session", "window", "pane"],
+        "properties": {
+          "session": { "type": "string" },
+          "window": { "type": "integer", "minimum": 0 },
+          "pane": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "result": {
+        "type": "object",
+        "required": ["channel_id"],
+        "properties": {
+          "channel_id": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        }
+      }
+    },
+
+    "terminal.detach": {
+      "description": "Stop relaying a tmux pane",
+      "params": {
+        "type": "object",
+        "required": ["session", "window", "pane"],
+        "properties": {
+          "session": { "type": "string" },
+          "window": { "type": "integer", "minimum": 0 },
+          "pane": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "result": { "type": "object", "properties": { "detached": { "type": "boolean" } } }
+    },
+
+    "terminal.resize": {
+      "description": "Resize an attached tmux pane",
+      "params": {
+        "type": "object",
+        "required": ["session", "window", "pane", "cols", "rows"],
+        "properties": {
+          "session": { "type": "string" },
+          "window": { "type": "integer", "minimum": 0 },
+          "pane": { "type": "integer", "minimum": 0 },
+          "cols": { "type": "integer", "minimum": 1 },
+          "rows": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "result": { "type": "object", "properties": { "resized": { "type": "boolean" } } }
+    },
+
+    "preset.start": {
+      "description": "Start a preset for a thread",
+      "params": {
+        "type": "object",
+        "required": ["thread_id", "preset"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" },
+          "preset": { "type": "string" }
+        }
+      },
+      "result": { "type": "object", "properties": { "started": { "type": "boolean" } } }
+    },
+
+    "preset.stop": {
+      "description": "Stop a preset for a thread",
+      "params": {
+        "type": "object",
+        "required": ["thread_id", "preset"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" },
+          "preset": { "type": "string" }
+        }
+      },
+      "result": { "type": "object", "properties": { "stopped": { "type": "boolean" } } }
+    },
+
+    "preset.restart": {
+      "description": "Restart a preset for a thread",
+      "params": {
+        "type": "object",
+        "required": ["thread_id", "preset"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" },
+          "preset": { "type": "string" }
+        }
+      },
+      "result": { "type": "object", "properties": { "restarted": { "type": "boolean" } } }
+    }
+  },
+
+  "events": {
+    "thread.progress": {
+      "description": "Streamed during thread.create",
+      "params": {
+        "type": "object",
+        "required": ["thread_id", "step"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" },
+          "step": { "type": "string", "enum": ["fetching", "creating_worktree", "copying_files", "running_hooks", "starting_presets", "ready"] },
+          "message": { "type": "string" },
+          "error": { "type": ["string", "null"] }
+        }
+      }
+    },
+
+    "thread.status_changed": {
+      "description": "Thread status transition",
+      "params": {
+        "type": "object",
+        "required": ["thread_id", "old", "new"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" },
+          "old": { "$ref": "#/$defs/ThreadStatus" },
+          "new": { "$ref": "#/$defs/ThreadStatus" }
+        }
+      }
+    },
+
+    "preset.process_event": {
+      "description": "Preset process lifecycle event",
+      "params": {
+        "type": "object",
+        "required": ["thread_id", "preset", "event"],
+        "properties": {
+          "thread_id": { "type": "string", "format": "uuid" },
+          "preset": { "type": "string" },
+          "event": { "type": "string", "enum": ["started", "exited", "crashed"] },
+          "exit_code": { "type": ["integer", "null"] }
+        }
+      }
+    }
+  }
+}
