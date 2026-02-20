@@ -22,6 +22,14 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+pub mod protocol;
+
+use crate::protocol::{
+    TerminalAttachParams, TerminalDetachParams, TerminalResizeParams, METHOD_PING,
+    METHOD_PROJECT_LIST, METHOD_TERMINAL_ATTACH, METHOD_TERMINAL_DETACH, METHOD_TERMINAL_RESIZE,
+    METHOD_THREAD_LIST,
+};
+
 pub const DEFAULT_ADDR: &str = "127.0.0.1:19990";
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 
@@ -182,22 +190,6 @@ struct JsonRpcRequest {
     params: Value,
 }
 
-#[derive(Deserialize)]
-struct TerminalTargetParams {
-    session: String,
-    window: u32,
-    pane: u32,
-}
-
-#[derive(Deserialize)]
-struct TerminalResizeParams {
-    session: String,
-    window: u32,
-    pane: u32,
-    cols: u16,
-    rows: u16,
-}
-
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -261,15 +253,22 @@ async fn handle_connection(
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Some(response) =
-                        handle_text_message(text.to_string(), state, connection_state, outbound_tx.clone()).await
+                    if let Some(response) = handle_text_message(
+                        text.to_string(),
+                        state,
+                        connection_state,
+                        outbound_tx.clone(),
+                    )
+                    .await
                     {
                         let _ = outbound_tx.send(response);
                     }
                 });
             }
             Ok(Message::Binary(data)) => {
-                if let Err(err) = handle_binary_message(data.to_vec(), Arc::clone(&connection_state)).await {
+                if let Err(err) =
+                    handle_binary_message(data.to_vec(), Arc::clone(&connection_state)).await
+                {
                     warn!(%connection_id, error = %err, "failed to route binary frame");
                 }
             }
@@ -332,20 +331,20 @@ async fn dispatch_request(
     outbound_tx: mpsc::UnboundedSender<Message>,
 ) -> Result<Value, String> {
     match request.method.as_str() {
-        "ping" => Ok(json!("pong")),
-        "project.list" => Ok(json!([])),
-        "thread.list" => Ok(json!([])),
-        "terminal.attach" => {
-            let params: TerminalTargetParams = serde_json::from_value(request.params)
+        METHOD_PING => Ok(json!("pong")),
+        METHOD_PROJECT_LIST => Ok(json!([])),
+        METHOD_THREAD_LIST => Ok(json!([])),
+        METHOD_TERMINAL_ATTACH => {
+            let params: TerminalAttachParams = serde_json::from_value(request.params)
                 .map_err(|err| format!("invalid terminal.attach params: {err}"))?;
             terminal_attach(params, state, connection_state, outbound_tx).await
         }
-        "terminal.detach" => {
-            let params: TerminalTargetParams = serde_json::from_value(request.params)
+        METHOD_TERMINAL_DETACH => {
+            let params: TerminalDetachParams = serde_json::from_value(request.params)
                 .map_err(|err| format!("invalid terminal.detach params: {err}"))?;
             terminal_detach(params, state, connection_state).await
         }
-        "terminal.resize" => {
+        METHOD_TERMINAL_RESIZE => {
             let params: TerminalResizeParams = serde_json::from_value(request.params)
                 .map_err(|err| format!("invalid terminal.resize params: {err}"))?;
             terminal_resize(params, connection_state).await
@@ -380,7 +379,7 @@ async fn handle_binary_message(
 }
 
 async fn terminal_attach(
-    params: TerminalTargetParams,
+    params: TerminalAttachParams,
     state: Arc<AppState>,
     connection_state: Arc<Mutex<ConnectionState>>,
     outbound_tx: mpsc::UnboundedSender<Message>,
@@ -562,7 +561,7 @@ async fn terminal_attach(
 }
 
 async fn terminal_detach(
-    params: TerminalTargetParams,
+    params: TerminalDetachParams,
     state: Arc<AppState>,
     connection_state: Arc<Mutex<ConnectionState>>,
 ) -> Result<Value, String> {
@@ -741,7 +740,13 @@ async fn list_window_indexes(session: &str) -> Result<Vec<u32>, String> {
 
 async fn list_panes(window_target: &str) -> Result<Vec<(u32, String)>, String> {
     let output = Command::new("tmux")
-        .args(["list-panes", "-t", window_target, "-F", "#{pane_index} #{pane_id}"])
+        .args([
+            "list-panes",
+            "-t",
+            window_target,
+            "-F",
+            "#{pane_index} #{pane_id}",
+        ])
         .output()
         .await
         .map_err(|err| format!("failed to run tmux list-panes: {err}"))?;
