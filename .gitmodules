@@ -1,0 +1,3 @@
+[submodule "threadmill"]
+	path = threadmill
+	url = git@github.com:kevin-courbet/threadmill.git
