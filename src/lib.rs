@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicU16, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -32,6 +33,8 @@ use crate::protocol::{
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:19990";
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
+const INPUT_CHANNEL_CAPACITY: usize = 256;
+const SEND_KEYS_HEX_CHUNK_BYTES: usize = 512;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -55,7 +58,12 @@ impl AppState {
     }
 
     fn alloc_channel_id(&self) -> u16 {
-        self.next_channel_id.fetch_add(1, Ordering::Relaxed)
+        loop {
+            let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
+            if channel_id != 0 {
+                return channel_id;
+            }
+        }
     }
 
     fn emit_event(&self, method: impl Into<String>, params: Value) {
@@ -169,13 +177,15 @@ impl From<tokio_tungstenite::tungstenite::Error> for ConnectionError {
 struct ConnectionState {
     by_channel: HashMap<u16, Attachment>,
     by_target: HashMap<String, u16>,
+    attaching_targets: HashMap<String, u16>,
 }
 
 struct Attachment {
     target: String,
     pane_target: String,
+    window_target: String,
     fifo_path: String,
-    input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    input_tx: Option<mpsc::Sender<Vec<u8>>>,
     input_task: JoinHandle<()>,
     output_task: JoinHandle<()>,
 }
@@ -364,18 +374,22 @@ async fn handle_binary_message(
     let channel_id = u16::from_be_bytes([data[0], data[1]]);
     let payload = data[2..].to_vec();
 
-    let guard = connection_state.lock().await;
-    let Some(attachment) = guard.by_channel.get(&channel_id) else {
-        return Err(format!("unknown channel {channel_id}"));
-    };
+    let input_tx = {
+        let guard = connection_state.lock().await;
+        let Some(attachment) = guard.by_channel.get(&channel_id) else {
+            return Err(format!("unknown channel {channel_id}"));
+        };
 
-    let Some(input_tx) = &attachment.input_tx else {
-        return Err(format!("channel {channel_id} is closed"));
+        let Some(input_tx) = &attachment.input_tx else {
+            return Err(format!("channel {channel_id} is closed"));
+        };
+
+        input_tx.clone()
     };
 
     input_tx
-        .send(payload)
-        .map_err(|_| format!("channel {channel_id} is closed"))
+        .try_send(payload)
+        .map_err(|err| format!("failed to queue input for channel {channel_id}: {err}"))
 }
 
 async fn terminal_attach(
@@ -385,141 +399,191 @@ async fn terminal_attach(
     outbound_tx: mpsc::UnboundedSender<Message>,
 ) -> Result<Value, String> {
     let target = tmux_target(&params.session, params.window, params.pane);
-    {
-        let guard = connection_state.lock().await;
+    let channel_id = {
+        let mut guard = connection_state.lock().await;
         if let Some(channel_id) = guard.by_target.get(&target) {
             return Ok(json!({ "channel_id": channel_id }));
         }
-    }
-
-    let channel_id = state.alloc_channel_id();
-    let pane_target = resolve_pane_target(&params.session, params.window, params.pane).await?;
-    let fifo_path = format!("/tmp/threadmill-pipe-{channel_id}-{}", Uuid::new_v4());
-
-    match std::fs::remove_file(&fifo_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("failed to clear stale fifo {fifo_path}: {err}")),
-    }
-
-    let mkfifo_output = Command::new("mkfifo")
-        .arg(&fifo_path)
-        .output()
-        .await
-        .map_err(|err| format!("failed to run mkfifo for {fifo_path}: {err}"))?;
-    if !mkfifo_output.status.success() {
-        return Err(format!(
-            "mkfifo failed for {fifo_path}: {}",
-            String::from_utf8_lossy(&mkfifo_output.stderr).trim()
-        ));
-    }
-
-    let pipe_command = format!("cat > {fifo_path}");
-    let pipe_output = match Command::new("tmux")
-        .args(["pipe-pane", "-t", &pane_target, "-O", &pipe_command])
-        .output()
-        .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            let _ = std::fs::remove_file(&fifo_path);
-            return Err(format!("failed to run tmux pipe-pane: {err}"));
+        if guard.attaching_targets.contains_key(&target) {
+            return Err(format!("target {target} is already attaching"));
         }
-    };
-    if !pipe_output.status.success() {
-        let _ = std::fs::remove_file(&fifo_path);
-        return Err(format!(
-            "tmux pipe-pane failed for {target}: {}",
-            String::from_utf8_lossy(&pipe_output.stderr).trim()
-        ));
-    }
 
-    let output_tx = outbound_tx.clone();
-    let fifo_path_for_task = fifo_path.clone();
-    let output_task = tokio::task::spawn_blocking(move || {
-        let mut reader = match OpenOptions::new().read(true).open(&fifo_path_for_task) {
-            Ok(reader) => reader,
-            Err(err) => {
-                warn!(fifo = %fifo_path_for_task, error = %err, "failed to open tmux fifo");
-                return;
+        let reserved_channel_id = loop {
+            let candidate = state.alloc_channel_id();
+            if !guard.by_channel.contains_key(&candidate)
+                && !guard.attaching_targets.values().any(|existing| *existing == candidate)
+            {
+                break candidate;
             }
         };
+        guard
+            .attaching_targets
+            .insert(target.clone(), reserved_channel_id);
+        reserved_channel_id
+    };
 
-        let mut buf = [0_u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(read_len) => {
-                    let mut payload = Vec::with_capacity(read_len + 2);
-                    payload.extend_from_slice(&channel_id.to_be_bytes());
-                    payload.extend_from_slice(&buf[..read_len]);
-                    if output_tx.send(Message::Binary(payload)).is_err() {
+    let attach_result = async {
+        let pane_target = resolve_pane_target(&params.session, params.window, params.pane).await?;
+        let window_target = resolve_window_target(&pane_target).await?;
+        let fifo_path = format!("/tmp/threadmill-pipe-{channel_id}-{}", Uuid::new_v4());
+
+        match std::fs::remove_file(&fifo_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("failed to clear stale fifo {fifo_path}: {err}")),
+        }
+
+        let mkfifo_output = Command::new("mkfifo")
+            .arg(&fifo_path)
+            .output()
+            .await
+            .map_err(|err| format!("failed to run mkfifo for {fifo_path}: {err}"))?;
+        if !mkfifo_output.status.success() {
+            return Err(format!(
+                "mkfifo failed for {fifo_path}: {}",
+                String::from_utf8_lossy(&mkfifo_output.stderr).trim()
+            ));
+        }
+
+        let clear_pipe_output = match Command::new("tmux")
+            .args(["pipe-pane", "-t", &pane_target])
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = std::fs::remove_file(&fifo_path);
+                return Err(format!("failed to clear existing tmux pipe-pane: {err}"));
+            }
+        };
+        if !clear_pipe_output.status.success() {
+            let _ = std::fs::remove_file(&fifo_path);
+            return Err(format!(
+                "tmux pipe-pane clear failed for {target}: {}",
+                String::from_utf8_lossy(&clear_pipe_output.stderr).trim()
+            ));
+        }
+
+        let pipe_command = format!("cat > {fifo_path}");
+        let pipe_output = match Command::new("tmux")
+            .args(["pipe-pane", "-t", &pane_target, "-O", &pipe_command])
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = std::fs::remove_file(&fifo_path);
+                return Err(format!("failed to run tmux pipe-pane: {err}"));
+            }
+        };
+        if !pipe_output.status.success() {
+            let _ = std::fs::remove_file(&fifo_path);
+            return Err(format!(
+                "tmux pipe-pane failed for {target}: {}",
+                String::from_utf8_lossy(&pipe_output.stderr).trim()
+            ));
+        }
+
+        let output_tx = outbound_tx.clone();
+        let fifo_path_for_task = fifo_path.clone();
+        let output_task = tokio::task::spawn_blocking(move || {
+            let mut reader = match OpenOptions::new().read(true).open(&fifo_path_for_task) {
+                Ok(reader) => reader,
+                Err(err) => {
+                    warn!(fifo = %fifo_path_for_task, error = %err, "failed to open tmux fifo");
+                    return;
+                }
+            };
+
+            let mut buf = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read_len) => {
+                        let mut payload = Vec::with_capacity(read_len + 2);
+                        payload.extend_from_slice(&channel_id.to_be_bytes());
+                        payload.extend_from_slice(&buf[..read_len]);
+                        if output_tx.send(Message::Binary(payload)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        warn!(fifo = %fifo_path_for_task, error = %err, "failed to read tmux fifo");
                         break;
                     }
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => {
-                    warn!(fifo = %fifo_path_for_task, error = %err, "failed to read tmux fifo");
-                    break;
+            }
+        });
+
+        // Input injection: use `tmux send-keys -H` to send hex-encoded bytes.
+        // Writing to the pane TTY slave only produces output, not input.
+        // Batch keystrokes over a short window to avoid per-keystroke process spawns.
+        let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(INPUT_CHANNEL_CAPACITY);
+        let pane_target_for_input = pane_target.clone();
+        let input_task = tokio::spawn(async move {
+            'input: while let Some(mut batch) = input_rx.recv().await {
+                while let Ok(more) = input_rx.try_recv() {
+                    batch.extend_from_slice(&more);
+                }
+
+                for chunk in batch.chunks(SEND_KEYS_HEX_CHUNK_BYTES) {
+                    let hex_args: Vec<String> = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+                    let mut args = vec![
+                        "send-keys".to_string(),
+                        "-t".to_string(),
+                        pane_target_for_input.clone(),
+                        "-H".to_string(),
+                    ];
+                    args.extend(hex_args);
+
+                    match Command::new("tmux").args(&args).output().await {
+                        Ok(output) if !output.status.success() => {
+                            warn!(
+                                pane = %pane_target_for_input,
+                                error = %String::from_utf8_lossy(&output.stderr).trim(),
+                                "tmux send-keys failed"
+                            );
+                            break 'input;
+                        }
+                        Err(err) => {
+                            warn!(
+                                pane = %pane_target_for_input,
+                                error = %err,
+                                "failed to run tmux send-keys"
+                            );
+                            break 'input;
+                        }
+                        Ok(_) => {}
+                    }
                 }
             }
+        });
+
+        Ok::<Attachment, String>(Attachment {
+            target: target.clone(),
+            pane_target,
+            window_target,
+            fifo_path,
+            input_tx: Some(input_tx),
+            input_task,
+            output_task,
+        })
+    }
+    .await;
+
+    let attachment = match attach_result {
+        Ok(attachment) => attachment,
+        Err(err) => {
+            let mut guard = connection_state.lock().await;
+            guard.attaching_targets.remove(&target);
+            return Err(err);
         }
-    });
-
-    // Input injection: use `tmux send-keys -H` to send hex-encoded bytes.
-    // Writing to the pane TTY slave only produces output, not input.
-    // Batch keystrokes over a short window to avoid per-keystroke process spawns.
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let pane_target_for_input = pane_target.clone();
-    let input_task = tokio::spawn(async move {
-        while let Some(mut batch) = input_rx.recv().await {
-            // Drain any additional pending chunks to batch them
-            while let Ok(more) = input_rx.try_recv() {
-                batch.extend_from_slice(&more);
-            }
-
-            let hex_args: Vec<String> = batch.iter().map(|b| format!("{b:02x}")).collect();
-            let mut args = vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                pane_target_for_input.clone(),
-                "-H".to_string(),
-            ];
-            args.extend(hex_args);
-
-            match Command::new("tmux").args(&args).output().await {
-                Ok(output) if !output.status.success() => {
-                    warn!(
-                        pane = %pane_target_for_input,
-                        error = %String::from_utf8_lossy(&output.stderr).trim(),
-                        "tmux send-keys failed"
-                    );
-                    break;
-                }
-                Err(err) => {
-                    warn!(
-                        pane = %pane_target_for_input,
-                        error = %err,
-                        "failed to run tmux send-keys"
-                    );
-                    break;
-                }
-                Ok(_) => {}
-            }
-        }
-    });
-
-    let attachment = Attachment {
-        target: target.clone(),
-        pane_target,
-        fifo_path,
-        input_tx: Some(input_tx),
-        input_task,
-        output_task,
     };
 
     {
         let mut guard = connection_state.lock().await;
+        guard.attaching_targets.remove(&target);
         guard.by_target.insert(target.clone(), channel_id);
         guard.by_channel.insert(channel_id, attachment);
     }
@@ -562,7 +626,7 @@ async fn terminal_resize(
     connection_state: Arc<Mutex<ConnectionState>>,
 ) -> Result<Value, String> {
     let target = tmux_target(&params.session, params.window, params.pane);
-    let _pane_target = {
+    let window_target = {
         let guard = connection_state.lock().await;
         let channel_id = *guard
             .by_target
@@ -572,17 +636,12 @@ async fn terminal_resize(
             .by_channel
             .get(&channel_id)
             .ok_or_else(|| format!("channel {channel_id} not found"))?
-            .pane_target
+            .window_target
             .clone()
     };
 
     // Resize the tmux window (which resizes the pane to fill it).
     // resize-pane alone won't shrink a single-pane window.
-    let window_target = format!(
-        "{}:{}",
-        params.session,
-        if params.window == 0 { 1 } else { params.window as u32 }
-    );
     let output = Command::new("tmux")
         .args([
             "resize-window",
@@ -630,6 +689,7 @@ async fn cleanup_connection(connection_state: Arc<Mutex<ConnectionState>>) {
     let attachments = {
         let mut guard = connection_state.lock().await;
         guard.by_target.clear();
+        guard.attaching_targets.clear();
         std::mem::take(&mut guard.by_channel)
     };
 
@@ -669,7 +729,15 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
     }
 
     attachment.input_task.abort();
-    attachment.output_task.abort();
+    let _ = (&mut attachment.input_task).await;
+
+    if tokio::time::timeout(Duration::from_millis(250), &mut attachment.output_task)
+        .await
+        .is_err()
+    {
+        attachment.output_task.abort();
+    }
+    let _ = (&mut attachment.output_task).await;
 }
 
 fn tmux_target(session: &str, window: u32, pane: u32) -> String {
@@ -702,6 +770,34 @@ async fn resolve_pane_target(session: &str, window: u32, pane: u32) -> Result<St
     Err(format!(
         "pane {pane} is neither an existing tmux index nor a valid zero-based ordinal in {window_target}"
     ))
+}
+
+async fn resolve_window_target(pane_target: &str) -> Result<String, String> {
+    let output = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane_target,
+            "#{session_name}:#{window_index}",
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run tmux display-message: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "tmux display-message failed for {pane_target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let window_target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if window_target.is_empty() {
+        return Err(format!("tmux returned empty window target for {pane_target}"));
+    }
+
+    Ok(window_target)
 }
 
 async fn list_window_indexes(session: &str) -> Result<Vec<u32>, String> {
