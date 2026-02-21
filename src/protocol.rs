@@ -1,5 +1,5 @@
 // Generated from threadmill/protocol/threadmill-rpc.schema.json
-// Do not edit manually. Run: ./codegen/generate.sh
+// Manual extensions for Spindle M1 services.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,9 +21,10 @@ pub struct Thread {
     pub status: ThreadStatus,
     pub source_type: SourceType,
     pub created_at: String,
+    pub tmux_session: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ThreadStatus {
     #[serde(rename = "creating")]
     Creating,
@@ -39,7 +40,7 @@ pub enum ThreadStatus {
     Failed,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SourceType {
     #[serde(rename = "new_feature")]
     NewFeature,
@@ -50,33 +51,12 @@ pub enum SourceType {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum PresetStatus {
-    #[serde(rename = "running")]
-    Running,
-    #[serde(rename = "stopped")]
-    Stopped,
-    #[serde(rename = "crashed")]
-    Crashed,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
     pub name: String,
     pub is_dir: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_git_repo: Option<bool>,
 }
-
-/// Binary WebSocket frame: [u16be channel_id][raw terminal bytes]. Channel ID assigned by terminal.attach response.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BinaryFrame {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel_id: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
-}
-
-// Request params
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PingParams;
@@ -87,13 +67,6 @@ pub struct ProjectListParams;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProjectAddParams {
     pub path: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ProjectCloneParams {
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -117,7 +90,7 @@ pub struct ThreadCreateParams {
     pub name: String,
     pub source_type: SourceType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_ref: Option<String>,
+    pub branch: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -131,41 +104,28 @@ pub struct ThreadReopenParams {
     pub thread_id: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ThreadCancelParams {
-    pub thread_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ThreadOpenEditorParams {
-    pub thread_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalAttachParams {
-    pub session: String,
-    pub window: u32,
-    pub pane: u32,
+    pub thread_id: String,
+    pub preset: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalDetachParams {
-    pub session: String,
-    pub window: u32,
-    pub pane: u32,
+    pub thread_id: String,
+    pub preset: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalResizeParams {
-    pub session: String,
-    pub window: u32,
-    pub pane: u32,
+    pub thread_id: String,
+    pub preset: String,
     pub cols: u32,
     pub rows: u32,
 }
@@ -188,15 +148,14 @@ pub struct PresetRestartParams {
     pub preset: String,
 }
 
-// Response results
-
 pub type PingResult = String;
-
 pub type ProjectListResult = Vec<Project>;
-
 pub type ProjectAddResult = Project;
-
-pub type ProjectCloneResult = Project;
+pub type ProjectBranchesResult = Vec<String>;
+pub type ProjectBrowseResult = Vec<DirectoryEntry>;
+pub type ThreadCreateResult = Thread;
+pub type ThreadReopenResult = Thread;
+pub type ThreadListResult = Vec<Thread>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProjectRemoveResult {
@@ -204,32 +163,10 @@ pub struct ProjectRemoveResult {
     pub removed: Option<bool>,
 }
 
-pub type ProjectBranchesResult = Vec<String>;
-
-pub type ProjectBrowseResult = Vec<DirectoryEntry>;
-
-pub type ThreadCreateResult = Thread;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadCloseResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ThreadStatus>,
-}
-
-pub type ThreadReopenResult = Thread;
-
-pub type ThreadListResult = Vec<Thread>;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ThreadCancelResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancelled: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ThreadOpenEditorResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uri: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -267,12 +204,9 @@ pub struct PresetRestartResult {
     pub restarted: Option<bool>,
 }
 
-// Method constants
-
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_PROJECT_LIST: &str = "project.list";
 pub const METHOD_PROJECT_ADD: &str = "project.add";
-pub const METHOD_PROJECT_CLONE: &str = "project.clone";
 pub const METHOD_PROJECT_REMOVE: &str = "project.remove";
 pub const METHOD_PROJECT_BRANCHES: &str = "project.branches";
 pub const METHOD_PROJECT_BROWSE: &str = "project.browse";
@@ -280,16 +214,12 @@ pub const METHOD_THREAD_CREATE: &str = "thread.create";
 pub const METHOD_THREAD_CLOSE: &str = "thread.close";
 pub const METHOD_THREAD_REOPEN: &str = "thread.reopen";
 pub const METHOD_THREAD_LIST: &str = "thread.list";
-pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
-pub const METHOD_THREAD_OPEN_EDITOR: &str = "thread.open_editor";
 pub const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
 pub const METHOD_TERMINAL_DETACH: &str = "terminal.detach";
 pub const METHOD_TERMINAL_RESIZE: &str = "terminal.resize";
 pub const METHOD_PRESET_START: &str = "preset.start";
 pub const METHOD_PRESET_STOP: &str = "preset.stop";
 pub const METHOD_PRESET_RESTART: &str = "preset.restart";
-
-// Method -> params dispatch
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "method", content = "params")]
@@ -300,8 +230,6 @@ pub enum RequestDispatch {
     ProjectList(ProjectListParams),
     #[serde(rename = "project.add")]
     ProjectAdd(ProjectAddParams),
-    #[serde(rename = "project.clone")]
-    ProjectClone(ProjectCloneParams),
     #[serde(rename = "project.remove")]
     ProjectRemove(ProjectRemoveParams),
     #[serde(rename = "project.branches")]
@@ -316,10 +244,6 @@ pub enum RequestDispatch {
     ThreadReopen(ThreadReopenParams),
     #[serde(rename = "thread.list")]
     ThreadList(ThreadListParams),
-    #[serde(rename = "thread.cancel")]
-    ThreadCancel(ThreadCancelParams),
-    #[serde(rename = "thread.open_editor")]
-    ThreadOpenEditor(ThreadOpenEditorParams),
     #[serde(rename = "terminal.attach")]
     TerminalAttach(TerminalAttachParams),
     #[serde(rename = "terminal.detach")]
@@ -345,9 +269,6 @@ pub fn parse_request_dispatch(method: &str, params: serde_json::Value) -> Result
         METHOD_PROJECT_ADD => serde_json::from_value::<ProjectAddParams>(params)
             .map(RequestDispatch::ProjectAdd)
             .map_err(|err| format!("invalid project.add params: {err}")),
-        METHOD_PROJECT_CLONE => serde_json::from_value::<ProjectCloneParams>(params)
-            .map(RequestDispatch::ProjectClone)
-            .map_err(|err| format!("invalid project.clone params: {err}")),
         METHOD_PROJECT_REMOVE => serde_json::from_value::<ProjectRemoveParams>(params)
             .map(RequestDispatch::ProjectRemove)
             .map_err(|err| format!("invalid project.remove params: {err}")),
@@ -369,12 +290,6 @@ pub fn parse_request_dispatch(method: &str, params: serde_json::Value) -> Result
         METHOD_THREAD_LIST => serde_json::from_value::<ThreadListParams>(params)
             .map(RequestDispatch::ThreadList)
             .map_err(|err| format!("invalid thread.list params: {err}")),
-        METHOD_THREAD_CANCEL => serde_json::from_value::<ThreadCancelParams>(params)
-            .map(RequestDispatch::ThreadCancel)
-            .map_err(|err| format!("invalid thread.cancel params: {err}")),
-        METHOD_THREAD_OPEN_EDITOR => serde_json::from_value::<ThreadOpenEditorParams>(params)
-            .map(RequestDispatch::ThreadOpenEditor)
-            .map_err(|err| format!("invalid thread.open_editor params: {err}")),
         METHOD_TERMINAL_ATTACH => serde_json::from_value::<TerminalAttachParams>(params)
             .map(RequestDispatch::TerminalAttach)
             .map_err(|err| format!("invalid terminal.attach params: {err}")),
