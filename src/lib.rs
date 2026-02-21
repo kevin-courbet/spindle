@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::OpenOptions,
-    io::{Read, Write},
+    io::Read,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU16, Ordering},
@@ -394,7 +394,6 @@ async fn terminal_attach(
 
     let channel_id = state.alloc_channel_id();
     let pane_target = resolve_pane_target(&params.session, params.window, params.pane).await?;
-    let pane_tty = pane_tty(&pane_target).await?;
     let fifo_path = format!("/tmp/threadmill-pipe-{channel_id}-{}", Uuid::new_v4());
 
     match std::fs::remove_file(&fifo_path) {
@@ -435,47 +434,6 @@ async fn terminal_attach(
         ));
     }
 
-    let capture_output = match Command::new("tmux")
-        .args(["capture-pane", "-t", &pane_target, "-p", "-S", "-"])
-        .output()
-        .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            let _ = Command::new("tmux")
-                .args(["pipe-pane", "-t", &pane_target])
-                .output()
-                .await;
-            let _ = std::fs::remove_file(&fifo_path);
-            return Err(format!("failed to run tmux capture-pane: {err}"));
-        }
-    };
-    if !capture_output.status.success() {
-        let _ = Command::new("tmux")
-            .args(["pipe-pane", "-t", &pane_target])
-            .output()
-            .await;
-        let _ = std::fs::remove_file(&fifo_path);
-        return Err(format!(
-            "tmux capture-pane failed for {target}: {}",
-            String::from_utf8_lossy(&capture_output.stderr).trim()
-        ));
-    }
-
-    if !capture_output.stdout.is_empty() {
-        let mut payload = Vec::with_capacity(capture_output.stdout.len() + 2);
-        payload.extend_from_slice(&channel_id.to_be_bytes());
-        payload.extend_from_slice(&capture_output.stdout);
-        if outbound_tx.send(Message::Binary(payload)).is_err() {
-            let _ = Command::new("tmux")
-                .args(["pipe-pane", "-t", &pane_target])
-                .output()
-                .await;
-            let _ = std::fs::remove_file(&fifo_path);
-            return Err("failed to emit initial terminal output".to_string());
-        }
-    }
-
     let output_tx = outbound_tx.clone();
     let fifo_path_for_task = fifo_path.clone();
     let output_task = tokio::task::spawn_blocking(move || {
@@ -508,27 +466,45 @@ async fn terminal_attach(
         }
     });
 
-    let mut tty_writer = match OpenOptions::new().write(true).open(&pane_tty) {
-        Ok(writer) => writer,
-        Err(err) => {
-            let _ = Command::new("tmux")
-                .args(["pipe-pane", "-t", &pane_target])
-                .output()
-                .await;
-            output_task.abort();
-            let _ = std::fs::remove_file(&fifo_path);
-            return Err(format!("failed to open pane tty {pane_tty}: {err}"));
-        }
-    };
-
+    // Input injection: use `tmux send-keys -H` to send hex-encoded bytes.
+    // Writing to the pane TTY slave only produces output, not input.
+    // Batch keystrokes over a short window to avoid per-keystroke process spawns.
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let input_task = tokio::task::spawn_blocking(move || {
-        while let Some(chunk) = input_rx.blocking_recv() {
-            if tty_writer.write_all(&chunk).is_err() {
-                break;
+    let pane_target_for_input = pane_target.clone();
+    let input_task = tokio::spawn(async move {
+        while let Some(mut batch) = input_rx.recv().await {
+            // Drain any additional pending chunks to batch them
+            while let Ok(more) = input_rx.try_recv() {
+                batch.extend_from_slice(&more);
             }
-            if tty_writer.flush().is_err() {
-                break;
+
+            let hex_args: Vec<String> = batch.iter().map(|b| format!("{b:02x}")).collect();
+            let mut args = vec![
+                "send-keys".to_string(),
+                "-t".to_string(),
+                pane_target_for_input.clone(),
+                "-H".to_string(),
+            ];
+            args.extend(hex_args);
+
+            match Command::new("tmux").args(&args).output().await {
+                Ok(output) if !output.status.success() => {
+                    warn!(
+                        pane = %pane_target_for_input,
+                        error = %String::from_utf8_lossy(&output.stderr).trim(),
+                        "tmux send-keys failed"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        pane = %pane_target_for_input,
+                        error = %err,
+                        "failed to run tmux send-keys"
+                    );
+                    break;
+                }
+                Ok(_) => {}
             }
         }
     });
@@ -586,7 +562,7 @@ async fn terminal_resize(
     connection_state: Arc<Mutex<ConnectionState>>,
 ) -> Result<Value, String> {
     let target = tmux_target(&params.session, params.window, params.pane);
-    let pane_target = {
+    let _pane_target = {
         let guard = connection_state.lock().await;
         let channel_id = *guard
             .by_target
@@ -600,11 +576,18 @@ async fn terminal_resize(
             .clone()
     };
 
+    // Resize the tmux window (which resizes the pane to fill it).
+    // resize-pane alone won't shrink a single-pane window.
+    let window_target = format!(
+        "{}:{}",
+        params.session,
+        if params.window == 0 { 1 } else { params.window as u32 }
+    );
     let output = Command::new("tmux")
         .args([
-            "resize-pane",
+            "resize-window",
             "-t",
-            &pane_target,
+            &window_target,
             "-x",
             &params.cols.to_string(),
             "-y",
@@ -612,12 +595,12 @@ async fn terminal_resize(
         ])
         .output()
         .await
-        .map_err(|err| format!("failed to run tmux resize-pane: {err}"))?;
+        .map_err(|err| format!("failed to run tmux resize-window: {err}"))?;
 
     if !output.status.success() {
         return Err(format!(
-            "tmux resize-pane failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "tmux resize-window failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
 
@@ -793,27 +776,6 @@ fn parse_pane_lines(raw: &[u8]) -> Result<Vec<(u32, String)>, String> {
         .collect()
 }
 
-async fn pane_tty(target: &str) -> Result<String, String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-t", target, "-p", "#{pane_tty}"])
-        .output()
-        .await
-        .map_err(|err| format!("failed to run tmux display-message: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "tmux display-message failed for {target}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let pane_tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if pane_tty.is_empty() {
-        return Err(format!("tmux returned empty pane_tty for {target}"));
-    }
-
-    Ok(pane_tty)
-}
 
 fn success_response(id: Value, result: Value) -> Message {
     Message::Text(
