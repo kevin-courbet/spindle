@@ -3,13 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use serde_json::json;
 use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
     protocol,
-    state::{Project, StateStore},
+    state::Project,
     AppState,
 };
 

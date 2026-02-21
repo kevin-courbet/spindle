@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
