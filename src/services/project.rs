@@ -81,7 +81,7 @@ impl ProjectService {
         Ok(project)
     }
 
-    pub async fn clone_repo(
+    pub async fn clone(
         state: Arc<AppState>,
         params: protocol::ProjectCloneParams,
     ) -> Result<protocol::Project, String> {
@@ -265,6 +265,8 @@ struct ProjectPresetFile {
     command: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    commands: Vec<String>,
 }
 
 pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetConfig>, String> {
@@ -278,10 +280,6 @@ pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetCo
     let parsed: ProjectConfigFile = serde_yaml::from_str(&raw)
         .map_err(|err| format!("failed to parse {}: {err}", config_path.display()))?;
 
-    if parsed.presets.is_empty() {
-        return Ok(default_presets());
-    }
-
     let mut presets = Vec::with_capacity(parsed.presets.len());
     for (name, preset) in parsed.presets {
         let command = preset
@@ -290,6 +288,13 @@ pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetCo
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
+            .or_else(|| {
+                if preset.commands.is_empty() {
+                    None
+                } else {
+                    Some(preset.commands.join(" && "))
+                }
+            })
             .ok_or_else(|| {
                 format!(
                     "preset {} in {} must define command",
