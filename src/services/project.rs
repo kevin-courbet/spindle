@@ -21,10 +21,10 @@ impl ProjectService {
             return Err("project path must be absolute".to_string());
         }
         if !path.exists() {
-            return Err(format!("project path does not exist: {}", path.display()));
+            return Err("path does not exist".to_string());
         }
 
-        ensure_git_repo(&params.path).await?;
+        ensure_git_repo(&path).await?;
 
         let canonical = std::fs::canonicalize(&path)
             .map_err(|err| format!("failed to canonicalize {}: {err}", path.display()))?;
@@ -186,26 +186,37 @@ impl ProjectService {
     }
 }
 
-async fn ensure_git_repo(path: &str) -> Result<(), String> {
+async fn ensure_git_repo(path: &Path) -> Result<(), String> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| format!("invalid utf-8 path: {}", path.display()))?;
+
     let output = Command::new("git")
-        .args(["-C", path, "rev-parse", "--is-inside-work-tree"])
+        .args([
+            "-C",
+            path_str,
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--is-bare-repository",
+        ])
         .output()
         .await
         .map_err(|err| format!("failed to run git rev-parse: {err}"))?;
 
     if !output.status.success() {
-        return Err(format!(
-            "path is not a git repository: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err("not a git repository".to_string());
     }
 
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value != "true" {
-        return Err(format!("path is not a git repository: {path}"));
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = output_text.lines();
+    let inside_work_tree = lines.next() == Some("true");
+    let is_bare = lines.next() == Some("true");
+
+    if inside_work_tree || is_bare {
+        return Ok(());
     }
 
-    Ok(())
+    Err("not a git repository".to_string())
 }
 
 async fn detect_default_branch(path: &str) -> Result<String, String> {
