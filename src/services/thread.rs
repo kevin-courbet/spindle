@@ -272,16 +272,18 @@ impl ThreadService {
             (thread, project)
         };
 
-        Self::emit_progress(
-            &state,
-            protocol::ThreadProgress {
-                thread_id: thread.id.clone(),
-                step: protocol::ThreadProgressStep::Fetching,
-                message: Some("Fetching origin".to_string()),
-                error: None,
-            },
-        );
-        git(&project.path, &["fetch", "origin"]).await?;
+        if has_origin_remote(&project.path).await? {
+            Self::emit_progress(
+                &state,
+                protocol::ThreadProgress {
+                    thread_id: thread.id.clone(),
+                    step: protocol::ThreadProgressStep::Fetching,
+                    message: Some("Fetching origin".to_string()),
+                    error: None,
+                },
+            );
+            git(&project.path, &["fetch", "origin"]).await?;
+        }
 
         Self::emit_progress(
             &state,
@@ -645,6 +647,31 @@ async fn run_hooks(commands: &[String], cwd: &str, project_path: &str, thread: &
     }
 
     Ok(())
+}
+
+
+async fn has_origin_remote(project_path: &str) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run git remote get-url origin: {err}"))?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.contains("No such remote") {
+        return Ok(false);
+    }
+
+    Err(format!(
+        "git [\"remote\", \"get-url\", \"origin\"] failed: {}",
+        stderr
+    ))
 }
 
 async fn git(project_path: &str, args: &[&str]) -> Result<(), String> {
