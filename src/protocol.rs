@@ -1,7 +1,9 @@
 // Generated from threadmill/protocol/threadmill-rpc.schema.json
-// Manual extensions for Spindle M1 services.
+// Manual extensions for Spindle runtime events and sync deltas.
 
 use serde::{Deserialize, Serialize};
+
+pub type StateVersion = u64;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Project {
@@ -50,6 +52,16 @@ pub enum SourceType {
     PullRequest,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum PresetStatus {
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "stopped")]
+    Stopped,
+    #[serde(rename = "crashed")]
+    Crashed,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
     pub name: String,
@@ -58,8 +70,131 @@ pub struct DirectoryEntry {
     pub is_git_repo: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum ThreadProgressStep {
+    #[serde(rename = "fetching")]
+    Fetching,
+    #[serde(rename = "creating_worktree")]
+    CreatingWorktree,
+    #[serde(rename = "copying_files")]
+    CopyingFiles,
+    #[serde(rename = "running_hooks")]
+    RunningHooks,
+    #[serde(rename = "starting_presets")]
+    StartingPresets,
+    #[serde(rename = "ready")]
+    Ready,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadProgress {
+    pub thread_id: String,
+    pub step: ThreadProgressStep,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadStatusChanged {
+    pub thread_id: String,
+    pub old: ThreadStatus,
+    pub new: ThreadStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum PresetProcessKind {
+    #[serde(rename = "started")]
+    Started,
+    #[serde(rename = "exited")]
+    Exited,
+    #[serde(rename = "crashed")]
+    Crashed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PresetProcessEvent {
+    pub thread_id: String,
+    pub preset: String,
+    pub event: PresetProcessKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StateSnapshot {
+    pub state_version: StateVersion,
+    pub projects: Vec<Project>,
+    pub threads: Vec<Thread>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum StateDeltaChange {
+    #[serde(rename = "project.added")]
+    ProjectAdded { project: Project },
+    #[serde(rename = "project.removed")]
+    ProjectRemoved { project_id: String },
+    #[serde(rename = "thread.created")]
+    ThreadCreated { thread: Thread },
+    #[serde(rename = "thread.removed")]
+    ThreadRemoved { thread_id: String },
+    #[serde(rename = "thread.status_changed")]
+    ThreadStatusChanged {
+        thread_id: String,
+        old: ThreadStatus,
+        new: ThreadStatus,
+    },
+    #[serde(rename = "preset.process_event")]
+    PresetProcessEvent {
+        thread_id: String,
+        preset: String,
+        event: PresetProcessKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i64>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StateDeltaEvent {
+    pub state_version: StateVersion,
+    pub changes: Vec<StateDeltaChange>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectAddedEvent {
+    pub project: Project,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectRemovedEvent {
+    pub project_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadCreatedEvent {
+    pub thread: Thread,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadRemovedEvent {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BinaryFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PingParams;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct StateSnapshotParams;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ProjectListParams;
@@ -101,6 +236,11 @@ pub struct ThreadCloseParams {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadReopenParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadHideParams {
     pub thread_id: String,
 }
 
@@ -149,6 +289,7 @@ pub struct PresetRestartParams {
 }
 
 pub type PingResult = String;
+pub type StateSnapshotResult = StateSnapshot;
 pub type ProjectListResult = Vec<Project>;
 pub type ProjectAddResult = Project;
 pub type ProjectBranchesResult = Vec<String>;
@@ -170,6 +311,11 @@ pub struct ThreadCloseResult {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadHideResult {
+    pub status: ThreadStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalAttachResult {
     pub channel_id: u16,
 }
@@ -188,23 +334,21 @@ pub struct TerminalResizeResult {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PresetStartResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started: Option<bool>,
+    pub ok: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PresetStopResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stopped: Option<bool>,
+    pub ok: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PresetRestartResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restarted: Option<bool>,
+    pub ok: bool,
 }
 
 pub const METHOD_PING: &str = "ping";
+pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
 pub const METHOD_PROJECT_LIST: &str = "project.list";
 pub const METHOD_PROJECT_ADD: &str = "project.add";
 pub const METHOD_PROJECT_REMOVE: &str = "project.remove";
@@ -213,6 +357,7 @@ pub const METHOD_PROJECT_BROWSE: &str = "project.browse";
 pub const METHOD_THREAD_CREATE: &str = "thread.create";
 pub const METHOD_THREAD_CLOSE: &str = "thread.close";
 pub const METHOD_THREAD_REOPEN: &str = "thread.reopen";
+pub const METHOD_THREAD_HIDE: &str = "thread.hide";
 pub const METHOD_THREAD_LIST: &str = "thread.list";
 pub const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
 pub const METHOD_TERMINAL_DETACH: &str = "terminal.detach";
@@ -226,6 +371,8 @@ pub const METHOD_PRESET_RESTART: &str = "preset.restart";
 pub enum RequestDispatch {
     #[serde(rename = "ping")]
     Ping(PingParams),
+    #[serde(rename = "state.snapshot")]
+    StateSnapshot(StateSnapshotParams),
     #[serde(rename = "project.list")]
     ProjectList(ProjectListParams),
     #[serde(rename = "project.add")]
@@ -242,6 +389,8 @@ pub enum RequestDispatch {
     ThreadClose(ThreadCloseParams),
     #[serde(rename = "thread.reopen")]
     ThreadReopen(ThreadReopenParams),
+    #[serde(rename = "thread.hide")]
+    ThreadHide(ThreadHideParams),
     #[serde(rename = "thread.list")]
     ThreadList(ThreadListParams),
     #[serde(rename = "terminal.attach")]
@@ -263,6 +412,9 @@ pub fn parse_request_dispatch(method: &str, params: serde_json::Value) -> Result
         METHOD_PING => serde_json::from_value::<PingParams>(params)
             .map(RequestDispatch::Ping)
             .map_err(|err| format!("invalid ping params: {err}")),
+        METHOD_STATE_SNAPSHOT => serde_json::from_value::<StateSnapshotParams>(params)
+            .map(RequestDispatch::StateSnapshot)
+            .map_err(|err| format!("invalid state.snapshot params: {err}")),
         METHOD_PROJECT_LIST => serde_json::from_value::<ProjectListParams>(params)
             .map(RequestDispatch::ProjectList)
             .map_err(|err| format!("invalid project.list params: {err}")),
@@ -287,6 +439,9 @@ pub fn parse_request_dispatch(method: &str, params: serde_json::Value) -> Result
         METHOD_THREAD_REOPEN => serde_json::from_value::<ThreadReopenParams>(params)
             .map(RequestDispatch::ThreadReopen)
             .map_err(|err| format!("invalid thread.reopen params: {err}")),
+        METHOD_THREAD_HIDE => serde_json::from_value::<ThreadHideParams>(params)
+            .map(RequestDispatch::ThreadHide)
+            .map_err(|err| format!("invalid thread.hide params: {err}")),
         METHOD_THREAD_LIST => serde_json::from_value::<ThreadListParams>(params)
             .map(RequestDispatch::ThreadList)
             .map_err(|err| format!("invalid thread.list params: {err}")),

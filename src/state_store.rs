@@ -163,15 +163,16 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn project_by_id(&self, project_id: &str) -> Option<&Project> {
-        self.data.projects.iter().find(|project| project.id == project_id)
+    pub fn snapshot(&self, state_version: protocol::StateVersion) -> protocol::StateSnapshot {
+        protocol::StateSnapshot {
+            state_version,
+            projects: self.data.projects.iter().map(Project::to_protocol).collect(),
+            threads: self.data.threads.iter().map(Thread::to_protocol).collect(),
+        }
     }
 
-    pub fn project_by_id_mut(&mut self, project_id: &str) -> Option<&mut Project> {
-        self.data
-            .projects
-            .iter_mut()
-            .find(|project| project.id == project_id)
+    pub fn project_by_id(&self, project_id: &str) -> Option<&Project> {
+        self.data.projects.iter().find(|project| project.id == project_id)
     }
 
     pub fn thread_by_id(&self, thread_id: &str) -> Option<&Thread> {

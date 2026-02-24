@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -18,13 +18,13 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub mod protocol;
-pub mod rpc;
+pub mod rpc_router;
 pub mod services;
-pub mod state;
+pub mod state_store;
 pub mod tmux;
 
 use services::terminal::{self, TerminalConnectionState};
-use state::StateStore;
+use state_store::StateStore;
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:19990";
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
@@ -33,6 +33,7 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 pub struct AppState {
     events_tx: broadcast::Sender<ServerEvent>,
     next_channel_id: Arc<AtomicU16>,
+    state_version: Arc<AtomicU64>,
     pub store: Arc<Mutex<StateStore>>,
 }
 
@@ -48,24 +49,87 @@ impl AppState {
         Self {
             events_tx,
             next_channel_id: Arc::new(AtomicU16::new(1)),
+            state_version: Arc::new(AtomicU64::new(0)),
             store: Arc::new(Mutex::new(store)),
         }
     }
 
-    pub fn alloc_channel_id(&self) -> u16 {
+    pub fn alloc_channel_id_with<F>(&self, mut is_active: F) -> u16
+    where
+        F: FnMut(u16) -> bool,
+    {
         loop {
             let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
-            if channel_id != 0 {
-                return channel_id;
+            if channel_id == 0 {
+                continue;
             }
+            if is_active(channel_id) {
+                continue;
+            }
+            return channel_id;
         }
     }
 
-    pub fn emit_event(&self, method: impl Into<String>, params: Value) {
+    pub fn state_version(&self) -> protocol::StateVersion {
+        self.state_version.load(Ordering::Relaxed)
+    }
+
+    pub fn emit_event(&self, method: impl Into<String>, params: impl serde::Serialize) {
+        let params = match serde_json::to_value(params) {
+            Ok(params) => params,
+            Err(err) => {
+                warn!(error = %err, "failed to serialize event payload");
+                return;
+            }
+        };
+
         let _ = self.events_tx.send(ServerEvent {
             method: method.into(),
             params,
         });
+    }
+
+    pub fn emit_thread_progress(&self, event: protocol::ThreadProgress) {
+        self.emit_event("thread.progress", event);
+    }
+
+    pub fn emit_thread_status_changed(&self, event: protocol::ThreadStatusChanged) {
+        self.emit_event("thread.status_changed", event);
+    }
+
+    pub fn emit_project_added(&self, event: protocol::ProjectAddedEvent) {
+        self.emit_event("project.added", event);
+    }
+
+    pub fn emit_project_removed(&self, event: protocol::ProjectRemovedEvent) {
+        self.emit_event("project.removed", event);
+    }
+
+    pub fn emit_thread_created(&self, event: protocol::ThreadCreatedEvent) {
+        self.emit_event("thread.created", event);
+    }
+
+    pub fn emit_thread_removed(&self, event: protocol::ThreadRemovedEvent) {
+        self.emit_event("thread.removed", event);
+    }
+
+    pub fn emit_preset_process_event(&self, event: protocol::PresetProcessEvent) {
+        self.emit_event("preset.process_event", event);
+    }
+
+    pub fn emit_state_delta(&self, changes: Vec<protocol::StateDeltaChange>) {
+        if changes.is_empty() {
+            return;
+        }
+
+        let state_version = self.state_version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.emit_event(
+            "state.delta",
+            protocol::StateDeltaEvent {
+                state_version,
+                changes,
+            },
+        );
     }
 }
 
@@ -303,7 +367,7 @@ async fn handle_text_message(
     }
 
     let id = request.id.clone();
-    let result = rpc::dispatch_request(
+    let result = rpc_router::dispatch_request(
         &request.method,
         request.params,
         state,
