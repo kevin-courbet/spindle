@@ -370,13 +370,13 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
     attachment.input_task.abort();
     let _ = (&mut attachment.input_task).await;
 
-    if tokio::time::timeout(Duration::from_millis(250), &mut attachment.output_task)
-        .await
-        .is_err()
-    {
-        attachment.output_task.abort();
+    match tokio::time::timeout(Duration::from_millis(250), &mut attachment.output_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            attachment.output_task.abort();
+            let _ = (&mut attachment.output_task).await;
+        }
     }
-    let _ = (&mut attachment.output_task).await;
 
     if let Err(err) = std::fs::remove_file(&attachment.fifo_path) {
         if err.kind() != std::io::ErrorKind::NotFound {
