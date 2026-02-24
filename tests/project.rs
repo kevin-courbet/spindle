@@ -184,3 +184,70 @@ async fn project_clone_registers_project() {
         "project.list should include cloned project"
     );
 }
+
+#[tokio::test]
+async fn project_list_returns_presets_from_threadmill_config() {
+    let mut harness = setup_test_server().await;
+    let config = r#"presets:
+  editor:
+    command: nvim
+  shell:
+    command: zsh
+  server:
+    command: npm run dev
+    cwd: ./frontend
+"#;
+    let project = common::create_git_project(Some(config), true)
+        .await
+        .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+    let project_id = added["id"]
+        .as_str()
+        .expect("project id in add response")
+        .to_string();
+
+    let listed = harness
+        .rpc("project.list", json!({}))
+        .await
+        .expect("list projects");
+    let projects = listed.as_array().expect("project.list returns array");
+    let project_row = projects
+        .iter()
+        .find(|project| project["id"] == project_id)
+        .expect("project present in list");
+
+    let presets = project_row["presets"]
+        .as_array()
+        .expect("project includes presets array");
+
+    assert!(presets.iter().any(|preset| {
+        preset["name"] == "editor"
+            && preset["command"] == "nvim"
+            && preset["cwd"].is_null()
+    }));
+
+    assert!(presets.iter().any(|preset| {
+        preset["name"] == "shell"
+            && preset["command"] == "zsh"
+            && preset["cwd"].is_null()
+    }));
+
+    assert!(presets.iter().any(|preset| {
+        preset["name"] == "server"
+            && preset["command"] == "npm run dev"
+            && preset["cwd"] == "./frontend"
+    }));
+
+    harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await
+        .expect("remove project");
+}

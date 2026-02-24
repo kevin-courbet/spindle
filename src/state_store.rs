@@ -7,7 +7,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{protocol, tmux};
+use crate::{protocol, services::project, tmux};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppData {
@@ -39,13 +39,14 @@ pub struct Thread {
 }
 
 impl Project {
-    pub fn to_protocol(&self) -> protocol::Project {
-        protocol::Project {
+    pub fn to_protocol(&self) -> Result<protocol::Project, String> {
+        Ok(protocol::Project {
             id: self.id.clone(),
             name: self.name.clone(),
             path: self.path.clone(),
             default_branch: self.default_branch.clone(),
-        }
+            presets: project::load_project_presets(&self.path)?,
+        })
     }
 }
 
@@ -163,12 +164,17 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn snapshot(&self, state_version: protocol::StateVersion) -> protocol::StateSnapshot {
-        protocol::StateSnapshot {
+    pub fn snapshot(&self, state_version: protocol::StateVersion) -> Result<protocol::StateSnapshot, String> {
+        Ok(protocol::StateSnapshot {
             state_version,
-            projects: self.data.projects.iter().map(Project::to_protocol).collect(),
+            projects: self
+                .data
+                .projects
+                .iter()
+                .map(Project::to_protocol)
+                .collect::<Result<Vec<_>, _>>()?,
             threads: self.data.threads.iter().map(Thread::to_protocol).collect(),
-        }
+        })
     }
 
     pub fn project_by_id(&self, project_id: &str) -> Option<&Project> {

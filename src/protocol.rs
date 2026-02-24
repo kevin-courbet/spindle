@@ -6,11 +6,21 @@ use serde::{Deserialize, Serialize};
 pub type StateVersion = u64;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PresetConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Project {
     pub id: String,
     pub name: String,
     pub path: String,
     pub default_branch: String,
+    #[serde(default)]
+    pub presets: Vec<PresetConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

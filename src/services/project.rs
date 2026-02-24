@@ -1,9 +1,12 @@
 use std::{
+    collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
 };
 
+use serde::Deserialize;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
@@ -51,7 +54,7 @@ impl ProjectService {
                 .iter()
                 .find(|project| project.path == canonical_str)
             {
-                (existing.to_protocol(), false)
+                (existing.to_protocol()?, false)
             } else {
                 let project = Project {
                     id: Uuid::new_v4().to_string(),
@@ -59,7 +62,7 @@ impl ProjectService {
                     path: canonical_str,
                     default_branch,
                 };
-                let protocol_project = project.to_protocol();
+                let protocol_project = project.to_protocol()?;
                 store.data.projects.push(project);
                 store.save()?;
                 (protocol_project, true)
@@ -140,12 +143,12 @@ impl ProjectService {
 
     pub async fn list(state: Arc<AppState>) -> Result<Vec<protocol::Project>, String> {
         let store = state.store.lock().await;
-        Ok(store
+        store
             .data
             .projects
             .iter()
             .map(Project::to_protocol)
-            .collect())
+            .collect()
     }
 
     pub async fn remove(
@@ -247,6 +250,103 @@ impl ProjectService {
 
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ProjectConfigFile {
+    #[serde(default)]
+    presets: BTreeMap<String, ProjectPresetFile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ProjectPresetFile {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetConfig>, String> {
+    let config_path = Path::new(project_path).join(".threadmill.yml");
+    if !config_path.exists() {
+        return Ok(default_presets());
+    }
+
+    let raw = fs::read_to_string(&config_path)
+        .map_err(|err| format!("failed to read {}: {err}", config_path.display()))?;
+    let parsed: ProjectConfigFile = serde_yaml::from_str(&raw)
+        .map_err(|err| format!("failed to parse {}: {err}", config_path.display()))?;
+
+    if parsed.presets.is_empty() {
+        return Ok(default_presets());
+    }
+
+    let mut presets = Vec::with_capacity(parsed.presets.len());
+    for (name, preset) in parsed.presets {
+        let command = preset
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "preset {} in {} must define command",
+                    name,
+                    config_path.display()
+                )
+            })?;
+
+        let cwd = preset
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        presets.push(protocol::PresetConfig { name, command, cwd });
+    }
+
+    Ok(presets)
+}
+
+pub fn resolve_preset_cwd(worktree_path: &str, cwd: Option<&str>) -> Result<String, String> {
+    let Some(cwd) = cwd else {
+        return Ok(worktree_path.to_string());
+    };
+
+    let cwd_path = Path::new(cwd);
+    if cwd_path.is_absolute() {
+        return Err(format!("preset cwd must be relative to worktree: {cwd}"));
+    }
+
+    let joined = Path::new(worktree_path).join(cwd_path);
+    joined
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("invalid utf-8 preset cwd: {}", joined.display()))
+}
+
+fn default_presets() -> Vec<protocol::PresetConfig> {
+    vec![
+        protocol::PresetConfig {
+            name: "editor".to_string(),
+            command: env_var_or_default("EDITOR", "nvim"),
+            cwd: None,
+        },
+        protocol::PresetConfig {
+            name: "shell".to_string(),
+            command: env_var_or_default("SHELL", "bash"),
+            cwd: None,
+        },
+    ]
+}
+
+fn env_var_or_default(name: &str, fallback: &str) -> String {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => fallback.to_string(),
     }
 }
 

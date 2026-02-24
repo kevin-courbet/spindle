@@ -28,7 +28,7 @@ pub async fn dispatch_request(
         RequestDispatch::StateSnapshot(_) => {
             let snapshot = {
                 let store = state.store.lock().await;
-                store.snapshot(state.state_version())
+                store.snapshot(state.state_version())?
             };
             to_value("state.snapshot", snapshot)
         }

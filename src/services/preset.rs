@@ -4,7 +4,11 @@ use tokio::time::sleep;
 
 use crate::{
     protocol,
-    services::thread::load_threadmill_config,
+    services::{
+        project::{load_project_presets, resolve_preset_cwd},
+        thread::load_threadmill_config,
+    },
+    state_store::Thread,
     tmux, AppState,
 };
 
@@ -36,46 +40,21 @@ impl PresetService {
             return Ok(protocol::PresetStartResult { ok: true });
         }
 
-        let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
-        let preset = config
-            .presets
-            .get(&params.preset)
-            .ok_or_else(|| format!("preset not found: {}", params.preset))?
-            .clone();
-
-        if preset.commands.is_empty() {
-            return Err(format!("preset {} has no commands", params.preset));
-        }
-
-        if preset.parallel && preset.commands.len() > 1 {
+        let project_presets = load_project_presets(&project_path)?;
+        if let Some(preset) = project_presets
+            .into_iter()
+            .find(|preset| preset.name == params.preset)
+        {
+            let cwd = resolve_preset_cwd(&thread.worktree_path, preset.cwd.as_deref())?;
             tmux::create_window(
                 &thread.tmux_session,
                 &params.preset,
-                &preset.commands[0],
-                &thread.worktree_path,
+                &preset.command,
+                &cwd,
             )
             .await?;
-
-            for command in preset.commands.iter().skip(1) {
-                tmux::split_window(
-                    &thread.tmux_session,
-                    &params.preset,
-                    command,
-                    &thread.worktree_path,
-                )
-                .await?;
-            }
-
-            tmux::select_layout(&thread.tmux_session, &params.preset, "tiled").await?;
         } else {
-            let command = preset.commands.join(" && ");
-            tmux::create_window(
-                &thread.tmux_session,
-                &params.preset,
-                &command,
-                &thread.worktree_path,
-            )
-            .await?;
+            start_legacy_preset(&thread, &params.preset, &project_path).await?;
         }
 
         emit_preset_event(
@@ -149,6 +128,51 @@ impl PresetService {
     }
 }
 
+async fn start_legacy_preset(thread: &Thread, preset_name: &str, project_path: &str) -> Result<(), String> {
+    let config = load_threadmill_config(&thread.worktree_path, project_path)?;
+    let preset = config
+        .presets
+        .get(preset_name)
+        .ok_or_else(|| format!("preset not found: {}", preset_name))?
+        .clone();
+
+    if preset.commands.is_empty() {
+        return Err(format!("preset {} has no commands", preset_name));
+    }
+
+    if preset.parallel && preset.commands.len() > 1 {
+        tmux::create_window(
+            &thread.tmux_session,
+            preset_name,
+            &preset.commands[0],
+            &thread.worktree_path,
+        )
+        .await?;
+
+        for command in preset.commands.iter().skip(1) {
+            tmux::split_window(
+                &thread.tmux_session,
+                preset_name,
+                command,
+                &thread.worktree_path,
+            )
+            .await?;
+        }
+
+        tmux::select_layout(&thread.tmux_session, preset_name, "tiled").await?;
+    } else {
+        let command = preset.commands.join(" && ");
+        tmux::create_window(
+            &thread.tmux_session,
+            preset_name,
+            &command,
+            &thread.worktree_path,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
 
 fn spawn_preset_monitor(state: Arc<AppState>, thread_id: String, preset: String, session: String) {
     tokio::spawn(async move {
