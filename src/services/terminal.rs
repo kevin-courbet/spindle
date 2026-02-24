@@ -1,16 +1,17 @@
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
-    io::Read,
     sync::Arc,
     time::Duration,
 };
 
 use serde_json::{json, Value};
 use tokio::{
+    fs::OpenOptions,
+    io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
+    time::sleep,
 };
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
@@ -19,7 +20,7 @@ use uuid::Uuid;
 use crate::{protocol, AppState};
 
 const INPUT_CHANNEL_CAPACITY: usize = 256;
-const SEND_KEYS_HEX_CHUNK_BYTES: usize = 512;
+const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(15);
 
 #[derive(Default)]
 pub struct TerminalConnectionState {
@@ -31,9 +32,9 @@ pub struct TerminalConnectionState {
 struct Attachment {
     target: String,
     pane_target: String,
-    window_target: String,
     fifo_path: String,
     input_tx: Option<mpsc::Sender<Vec<u8>>>,
+    output_shutdown_tx: Option<oneshot::Sender<()>>,
     input_task: JoinHandle<()>,
     output_task: JoinHandle<()>,
 }
@@ -82,34 +83,36 @@ pub async fn attach(
     };
 
     let target_key = target_key(&params.thread_id, &params.preset);
-    let channel_id = {
-        let mut guard = connection_state.lock().await;
-        if let Some(channel_id) = guard.by_target.get(&target_key) {
-            return Ok(json!({ "channel_id": channel_id }));
-        }
+    let channel_id = loop {
+        let maybe_channel = {
+            let mut guard = connection_state.lock().await;
+            if let Some(channel_id) = guard.by_target.get(&target_key) {
+                return Ok(json!({ "channel_id": channel_id }));
+            }
 
-        if guard.attaching_targets.contains_key(&target_key) {
-            return Err(format!("target {target_key} is already attaching"));
-        }
-
-        let reserved_channel_id = loop {
-            let candidate = state.alloc_channel_id();
-            if !guard.by_channel.contains_key(&candidate)
-                && !guard.attaching_targets.values().any(|existing| *existing == candidate)
-            {
-                break candidate;
+            if guard.attaching_targets.contains_key(&target_key) {
+                None
+            } else {
+                let reserved_channel_id = state.alloc_channel_id_with(|candidate| {
+                    guard.by_channel.contains_key(&candidate)
+                        || guard.attaching_targets.values().any(|existing| *existing == candidate)
+                });
+                guard
+                    .attaching_targets
+                    .insert(target_key.clone(), reserved_channel_id);
+                Some(reserved_channel_id)
             }
         };
 
-        guard
-            .attaching_targets
-            .insert(target_key.clone(), reserved_channel_id);
-        reserved_channel_id
+        if let Some(channel_id) = maybe_channel {
+            break channel_id;
+        }
+        sleep(ATTACH_RETRY_DELAY).await;
     };
 
     let attach_result = async {
         let pane_target = resolve_pane_target(&thread.tmux_session, &params.preset).await?;
-        let window_target = resolve_window_target(&pane_target).await?;
+        let pane_tty = resolve_pane_tty(&pane_target).await?;
         let fifo_path = format!("/tmp/threadmill-pipe-{channel_id}-{}", Uuid::new_v4());
 
         match std::fs::remove_file(&fifo_path) {
@@ -157,10 +160,11 @@ pub async fn attach(
             ));
         }
 
+        let (output_shutdown_tx, mut output_shutdown_rx) = oneshot::channel();
         let output_tx = outbound_tx.clone();
         let fifo_path_for_task = fifo_path.clone();
-        let output_task = tokio::task::spawn_blocking(move || {
-            let mut reader = match OpenOptions::new().read(true).open(&fifo_path_for_task) {
+        let output_task = tokio::spawn(async move {
+            let mut reader = match OpenOptions::new().read(true).open(&fifo_path_for_task).await {
                 Ok(reader) => reader,
                 Err(err) => {
                     warn!(fifo = %fifo_path_for_task, error = %err, "failed to open tmux fifo");
@@ -170,63 +174,53 @@ pub async fn attach(
 
             let mut buf = [0_u8; 8192];
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(read_len) => {
-                        let mut payload = Vec::with_capacity(read_len + 2);
-                        payload.extend_from_slice(&channel_id.to_be_bytes());
-                        payload.extend_from_slice(&buf[..read_len]);
-                        if output_tx.send(Message::Binary(payload.into())).is_err() {
-                            break;
+                tokio::select! {
+                    _ = &mut output_shutdown_rx => break,
+                    read_result = reader.read(&mut buf) => {
+                        match read_result {
+                            Ok(0) => break,
+                            Ok(read_len) => {
+                                let mut payload = Vec::with_capacity(read_len + 2);
+                                payload.extend_from_slice(&channel_id.to_be_bytes());
+                                payload.extend_from_slice(&buf[..read_len]);
+                                if output_tx.send(Message::Binary(payload.into())).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(err) => {
+                                warn!(fifo = %fifo_path_for_task, error = %err, "failed to read tmux fifo");
+                                break;
+                            }
                         }
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => {
-                        warn!(fifo = %fifo_path_for_task, error = %err, "failed to read tmux fifo");
-                        break;
                     }
                 }
             }
         });
 
         let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(INPUT_CHANNEL_CAPACITY);
-        let pane_target_for_input = pane_target.clone();
         let input_task = tokio::spawn(async move {
-            'input: while let Some(mut batch) = input_rx.recv().await {
+            let mut writer = match OpenOptions::new().write(true).open(&pane_tty).await {
+                Ok(writer) => writer,
+                Err(err) => {
+                    warn!(tty = %pane_tty, error = %err, "failed to open pane tty for input");
+                    return;
+                }
+            };
+
+            while let Some(mut batch) = input_rx.recv().await {
                 while let Ok(more) = input_rx.try_recv() {
                     batch.extend_from_slice(&more);
                 }
 
-                for chunk in batch.chunks(SEND_KEYS_HEX_CHUNK_BYTES) {
-                    let hex_args: Vec<String> =
-                        chunk.iter().map(|byte| format!("{byte:02x}")).collect();
-                    let mut args = vec![
-                        "send-keys".to_string(),
-                        "-t".to_string(),
-                        pane_target_for_input.clone(),
-                        "-H".to_string(),
-                    ];
-                    args.extend(hex_args);
+                if let Err(err) = writer.write_all(&batch).await {
+                    warn!(tty = %pane_tty, error = %err, "failed to write pane input");
+                    break;
+                }
 
-                    match Command::new("tmux").args(&args).output().await {
-                        Ok(output) if !output.status.success() => {
-                            warn!(
-                                pane = %pane_target_for_input,
-                                error = %String::from_utf8_lossy(&output.stderr).trim(),
-                                "tmux send-keys failed"
-                            );
-                            break 'input;
-                        }
-                        Err(err) => {
-                            warn!(
-                                pane = %pane_target_for_input,
-                                error = %err,
-                                "failed to run tmux send-keys"
-                            );
-                            break 'input;
-                        }
-                        Ok(_) => {}
-                    }
+                if let Err(err) = writer.flush().await {
+                    warn!(tty = %pane_tty, error = %err, "failed to flush pane input");
+                    break;
                 }
             }
         });
@@ -234,9 +228,9 @@ pub async fn attach(
         Ok::<Attachment, String>(Attachment {
             target: target_key.clone(),
             pane_target,
-            window_target,
             fifo_path,
             input_tx: Some(input_tx),
+            output_shutdown_tx: Some(output_shutdown_tx),
             input_task,
             output_task,
         })
@@ -276,7 +270,7 @@ pub async fn resize(
     connection_state: Arc<Mutex<TerminalConnectionState>>,
 ) -> Result<Value, String> {
     let target = target_key(&params.thread_id, &params.preset);
-    let window_target = {
+    let pane_target = {
         let guard = connection_state.lock().await;
         let channel_id = *guard
             .by_target
@@ -286,15 +280,15 @@ pub async fn resize(
             .by_channel
             .get(&channel_id)
             .ok_or_else(|| format!("channel {channel_id} not found"))?
-            .window_target
+            .pane_target
             .clone()
     };
 
     let output = Command::new("tmux")
         .args([
-            "resize-window",
+            "resize-pane",
             "-t",
-            &window_target,
+            &pane_target,
             "-x",
             &params.cols.to_string(),
             "-y",
@@ -302,11 +296,11 @@ pub async fn resize(
         ])
         .output()
         .await
-        .map_err(|err| format!("failed to run tmux resize-window: {err}"))?;
+        .map_err(|err| format!("failed to run tmux resize-pane: {err}"))?;
 
     if !output.status.success() {
         return Err(format!(
-            "tmux resize-window failed: {}",
+            "tmux resize-pane failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -351,6 +345,9 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
     if let Some(input_tx) = attachment.input_tx.take() {
         drop(input_tx);
     }
+    if let Some(output_shutdown_tx) = attachment.output_shutdown_tx.take() {
+        let _ = output_shutdown_tx.send(());
+    }
 
     let stop_pipe_output = Command::new("tmux")
         .args(["pipe-pane", "-t", &attachment.pane_target])
@@ -370,12 +367,6 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
         Ok(_) => {}
     }
 
-    if let Err(err) = std::fs::remove_file(&attachment.fifo_path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            warn!(fifo = %attachment.fifo_path, error = %err, "failed to remove tmux fifo");
-        }
-    }
-
     attachment.input_task.abort();
     let _ = (&mut attachment.input_task).await;
 
@@ -386,6 +377,12 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
         attachment.output_task.abort();
     }
     let _ = (&mut attachment.output_task).await;
+
+    if let Err(err) = std::fs::remove_file(&attachment.fifo_path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            warn!(fifo = %attachment.fifo_path, error = %err, "failed to remove tmux fifo");
+        }
+    }
 }
 
 async fn resolve_pane_target(session: &str, preset: &str) -> Result<String, String> {
@@ -413,15 +410,9 @@ async fn resolve_pane_target(session: &str, preset: &str) -> Result<String, Stri
     Ok(pane)
 }
 
-async fn resolve_window_target(pane_target: &str) -> Result<String, String> {
+async fn resolve_pane_tty(pane_target: &str) -> Result<String, String> {
     let output = Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            pane_target,
-            "#{session_name}:#{window_index}",
-        ])
+        .args(["display-message", "-p", "-t", pane_target, "#{pane_tty}"])
         .output()
         .await
         .map_err(|err| format!("failed to run tmux display-message: {err}"))?;
@@ -433,12 +424,12 @@ async fn resolve_window_target(pane_target: &str) -> Result<String, String> {
         ));
     }
 
-    let window_target = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if window_target.is_empty() {
-        return Err(format!("tmux returned empty window target for {pane_target}"));
+    let pane_tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pane_tty.is_empty() {
+        return Err(format!("tmux returned empty pane tty for {pane_target}"));
     }
 
-    Ok(window_target)
+    Ok(pane_tty)
 }
 
 fn target_key(thread_id: &str, preset: &str) -> String {
