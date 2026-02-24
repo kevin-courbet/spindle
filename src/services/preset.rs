@@ -31,7 +31,7 @@ impl PresetService {
         }
 
         if tmux::window_exists(&thread.tmux_session, &params.preset).await? {
-            return Ok(protocol::PresetStartResult { started: Some(true) });
+            return Ok(protocol::PresetStartResult { ok: true });
         }
 
         let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
@@ -42,7 +42,7 @@ impl PresetService {
             .clone();
 
         if preset.commands.is_empty() {
-            return Err(format!("preset '{}' has no commands", params.preset));
+            return Err(format!("preset {} has no commands", params.preset));
         }
 
         if preset.parallel && preset.commands.len() > 1 {
@@ -76,9 +76,15 @@ impl PresetService {
             .await?;
         }
 
-        Ok(protocol::PresetStartResult {
-            started: Some(true),
-        })
+        emit_preset_event(
+            &state,
+            &params.thread_id,
+            &params.preset,
+            protocol::PresetProcessKind::Started,
+            None,
+        );
+
+        Ok(protocol::PresetStartResult { ok: true })
     }
 
     pub async fn stop(
@@ -94,16 +100,19 @@ impl PresetService {
         };
 
         if !tmux::window_exists(&thread.tmux_session, &params.preset).await? {
-            return Ok(protocol::PresetStopResult {
-                stopped: Some(false),
-            });
+            return Ok(protocol::PresetStopResult { ok: false });
         }
 
         tmux::kill_window(&thread.tmux_session, &params.preset).await?;
+        emit_preset_event(
+            &state,
+            &params.thread_id,
+            &params.preset,
+            protocol::PresetProcessKind::Exited,
+            None,
+        );
 
-        Ok(protocol::PresetStopResult {
-            stopped: Some(true),
-        })
+        Ok(protocol::PresetStopResult { ok: true })
     }
 
     pub async fn restart(
@@ -128,8 +137,27 @@ impl PresetService {
         )
         .await?;
 
-        Ok(protocol::PresetRestartResult {
-            restarted: Some(true),
-        })
+        Ok(protocol::PresetRestartResult { ok: true })
     }
+}
+
+fn emit_preset_event(
+    state: &AppState,
+    thread_id: &str,
+    preset: &str,
+    event: protocol::PresetProcessKind,
+    exit_code: Option<i64>,
+) {
+    state.emit_preset_process_event(protocol::PresetProcessEvent {
+        thread_id: thread_id.to_string(),
+        preset: preset.to_string(),
+        event: event.clone(),
+        exit_code,
+    });
+    state.emit_state_delta(vec![protocol::StateDeltaChange::PresetProcessEvent {
+        thread_id: thread_id.to_string(),
+        preset: preset.to_string(),
+        event,
+        exit_code,
+    }]);
 }

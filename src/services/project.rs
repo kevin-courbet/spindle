@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     protocol,
-    state::Project,
+    state_store::Project,
     AppState,
 };
 
@@ -39,7 +39,7 @@ impl ProjectService {
             .to_string();
         let default_branch = detect_default_branch(&canonical_str).await?;
 
-        let project = {
+        let (project, is_new) = {
             let mut store = state.store.lock().await;
             if let Some(existing) = store
                 .data
@@ -47,21 +47,31 @@ impl ProjectService {
                 .iter()
                 .find(|project| project.path == canonical_str)
             {
-                return Ok(existing.to_protocol());
+                (existing.to_protocol(), false)
+            } else {
+                let project = Project {
+                    id: Uuid::new_v4().to_string(),
+                    name,
+                    path: canonical_str,
+                    default_branch,
+                };
+                let protocol_project = project.to_protocol();
+                store.data.projects.push(project);
+                store.save()?;
+                (protocol_project, true)
             }
-
-            let project = Project {
-                id: Uuid::new_v4().to_string(),
-                name,
-                path: canonical_str,
-                default_branch,
-            };
-            store.data.projects.push(project.clone());
-            store.save()?;
-            project
         };
 
-        Ok(project.to_protocol())
+        if is_new {
+            state.emit_project_added(protocol::ProjectAddedEvent {
+                project: project.clone(),
+            });
+            state.emit_state_delta(vec![protocol::StateDeltaChange::ProjectAdded {
+                project: project.clone(),
+            }]);
+        }
+
+        Ok(project)
     }
 
     pub async fn list(state: Arc<AppState>) -> Result<Vec<protocol::Project>, String> {
@@ -91,6 +101,15 @@ impl ProjectService {
             }
             changed
         };
+
+        if removed {
+            state.emit_project_removed(protocol::ProjectRemovedEvent {
+                project_id: params.project_id.clone(),
+            });
+            state.emit_state_delta(vec![protocol::StateDeltaChange::ProjectRemoved {
+                project_id: params.project_id,
+            }]);
+        }
 
         Ok(protocol::ProjectRemoveResult {
             removed: Some(removed),

@@ -7,7 +7,6 @@ use std::{
 
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::json;
 use tokio::process::Command;
 use tracing::error;
 use uuid::Uuid;
@@ -15,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     protocol,
     services::{preset::PresetService, sanitize_name, short_id},
-    state::{thread_env, Thread},
+    state_store::{thread_env, Thread},
     tmux, AppState,
 };
 
@@ -47,7 +46,7 @@ pub struct PresetDefinition {
 
 impl ThreadService {
     pub async fn create(state: Arc<AppState>, params: protocol::ThreadCreateParams) -> Result<protocol::Thread, String> {
-        let (thread, project_path) = {
+        let (thread, protocol_thread) = {
             let mut store = state.store.lock().await;
             let project = store
                 .project_by_id(&params.project_id)
@@ -55,10 +54,7 @@ impl ThreadService {
                 .clone();
 
             let thread_name = sanitize_name(&params.name);
-            let branch = params
-                .branch
-                .clone()
-                .unwrap_or_else(|| thread_name.clone());
+            let branch = params.branch.clone().unwrap_or_else(|| thread_name.clone());
             let worktree_path = format!(
                 "/home/wsl/dev/.threadmill/{}/{}",
                 sanitize_name(&project.name),
@@ -78,15 +74,21 @@ impl ThreadService {
                 tmux_session,
             };
 
+            let protocol_thread = thread.to_protocol();
             store.data.threads.push(thread.clone());
             store.save()?;
-            (thread, project.path)
+            (thread, protocol_thread)
         };
 
-        let response = thread.to_protocol();
+        state.emit_thread_created(protocol::ThreadCreatedEvent {
+            thread: protocol_thread.clone(),
+        });
+        state.emit_state_delta(vec![protocol::StateDeltaChange::ThreadCreated {
+            thread: protocol_thread.clone(),
+        }]);
+
         let thread_id = thread.id.clone();
         let state_for_task = Arc::clone(&state);
-
         tokio::spawn(async move {
             if let Err(err) = Self::run_create_workflow(state_for_task.clone(), &thread_id).await {
                 error!(thread_id = %thread_id, error = %err, "thread.create workflow failed");
@@ -94,8 +96,7 @@ impl ThreadService {
             }
         });
 
-        let _ = project_path;
-        Ok(response)
+        Ok(protocol_thread)
     }
 
     pub async fn list(state: Arc<AppState>, params: protocol::ThreadListParams) -> Result<Vec<protocol::Thread>, String> {
@@ -122,6 +123,19 @@ impl ThreadService {
             return Err(format!("unsupported close mode: {}", params.mode));
         }
 
+        if mode == "hide" {
+            let result = Self::hide(
+                state,
+                protocol::ThreadHideParams {
+                    thread_id: params.thread_id,
+                },
+            )
+            .await?;
+            return Ok(protocol::ThreadCloseResult {
+                status: Some(result.status),
+            });
+        }
+
         let (thread, project_path) = {
             let mut store = state.store.lock().await;
             let thread = store
@@ -134,10 +148,7 @@ impl ThreadService {
                 .path
                 .clone();
 
-            if mode == "close" {
-                Self::set_status_locked(&state, &mut store, &params.thread_id, protocol::ThreadStatus::Closing)?;
-            }
-
+            Self::set_status_locked(&state, &mut store, &params.thread_id, protocol::ThreadStatus::Closing)?;
             (thread, project_path)
         };
 
@@ -145,23 +156,42 @@ impl ThreadService {
             let _ = tmux::kill_session(&thread.tmux_session).await;
         }
 
-        let next_status = if mode == "hide" {
-            protocol::ThreadStatus::Hidden
-        } else {
-            let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
-            run_hooks(&config.teardown, &thread.worktree_path, &project_path, &thread).await?;
-            remove_worktree(&project_path, &thread.worktree_path).await?;
-            protocol::ThreadStatus::Closed
-        };
+        let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
+        run_hooks(&config.teardown, &thread.worktree_path, &project_path, &thread).await?;
+        remove_worktree(&project_path, &thread.worktree_path).await?;
 
         {
             let mut store = state.store.lock().await;
-            Self::set_status_locked(&state, &mut store, &params.thread_id, next_status.clone())?;
+            Self::set_status_locked(&state, &mut store, &params.thread_id, protocol::ThreadStatus::Closed)?;
             store.save()?;
         }
 
         Ok(protocol::ThreadCloseResult {
-            status: Some(next_status),
+            status: Some(protocol::ThreadStatus::Closed),
+        })
+    }
+
+    pub async fn hide(
+        state: Arc<AppState>,
+        params: protocol::ThreadHideParams,
+    ) -> Result<protocol::ThreadHideResult, String> {
+        {
+            let mut store = state.store.lock().await;
+            let thread = store
+                .thread_by_id(&params.thread_id)
+                .ok_or_else(|| format!("thread not found: {}", params.thread_id))?
+                .clone();
+
+            if thread.status == protocol::ThreadStatus::Closed {
+                return Err(format!("thread {} is closed", thread.id));
+            }
+
+            Self::set_status_locked(&state, &mut store, &params.thread_id, protocol::ThreadStatus::Hidden)?;
+            store.save()?;
+        }
+
+        Ok(protocol::ThreadHideResult {
+            status: protocol::ThreadStatus::Hidden,
         })
     }
 
@@ -217,12 +247,7 @@ impl ThreadService {
 
         let updated_thread = {
             let mut store = state.store.lock().await;
-            Self::set_status_locked(
-                &state,
-                &mut store,
-                &thread.id,
-                protocol::ThreadStatus::Active,
-            )?;
+            Self::set_status_locked(&state, &mut store, &thread.id, protocol::ThreadStatus::Active)?;
             store.save()?;
             store
                 .thread_by_id(&thread.id)
@@ -247,15 +272,25 @@ impl ThreadService {
             (thread, project)
         };
 
-        Self::emit_progress(&state, &thread.id, "fetching", "Fetching origin", None);
+        Self::emit_progress(
+            &state,
+            protocol::ThreadProgress {
+                thread_id: thread.id.clone(),
+                step: protocol::ThreadProgressStep::Fetching,
+                message: Some("Fetching origin".to_string()),
+                error: None,
+            },
+        );
         git(&project.path, &["fetch", "origin"]).await?;
 
         Self::emit_progress(
             &state,
-            &thread.id,
-            "creating_worktree",
-            "Creating git worktree",
-            None,
+            protocol::ThreadProgress {
+                thread_id: thread.id.clone(),
+                step: protocol::ThreadProgressStep::CreatingWorktree,
+                message: Some("Creating git worktree".to_string()),
+                error: None,
+            },
         );
         create_worktree(&project.path, &project.default_branch, &thread).await?;
 
@@ -263,10 +298,12 @@ impl ThreadService {
 
         Self::emit_progress(
             &state,
-            &thread.id,
-            "copying_files",
-            "Copying configured files",
-            None,
+            protocol::ThreadProgress {
+                thread_id: thread.id.clone(),
+                step: protocol::ThreadProgressStep::CopyingFiles,
+                message: Some("Copying configured files".to_string()),
+                error: None,
+            },
         );
         for relative in &config.copy_from_main {
             copy_from_main(&project.path, &thread.worktree_path, relative)?;
@@ -274,10 +311,12 @@ impl ThreadService {
 
         Self::emit_progress(
             &state,
-            &thread.id,
-            "running_hooks",
-            "Running setup hooks",
-            None,
+            protocol::ThreadProgress {
+                thread_id: thread.id.clone(),
+                step: protocol::ThreadProgressStep::RunningHooks,
+                message: Some("Running setup hooks".to_string()),
+                error: None,
+            },
         );
         run_hooks(&config.setup, &thread.worktree_path, &project.path, &thread).await?;
 
@@ -290,10 +329,12 @@ impl ThreadService {
 
         Self::emit_progress(
             &state,
-            &thread.id,
-            "starting_presets",
-            "Starting autostart presets",
-            None,
+            protocol::ThreadProgress {
+                thread_id: thread.id.clone(),
+                step: protocol::ThreadProgressStep::StartingPresets,
+                message: Some("Starting autostart presets".to_string()),
+                error: None,
+            },
         );
         for (preset_name, preset) in &config.presets {
             if preset.autostart {
@@ -310,16 +351,19 @@ impl ThreadService {
 
         {
             let mut store = state.store.lock().await;
-            Self::set_status_locked(
-                &state,
-                &mut store,
-                &thread.id,
-                protocol::ThreadStatus::Active,
-            )?;
+            Self::set_status_locked(&state, &mut store, &thread.id, protocol::ThreadStatus::Active)?;
             store.save()?;
         }
 
-        Self::emit_progress(&state, &thread.id, "ready", "Thread is ready", None);
+        Self::emit_progress(
+            &state,
+            protocol::ThreadProgress {
+                thread_id: thread.id,
+                step: protocol::ThreadProgressStep::Ready,
+                message: Some("Thread is ready".to_string()),
+                error: None,
+            },
+        );
         Ok(())
     }
 
@@ -335,22 +379,19 @@ impl ThreadService {
                 .ok_or_else(|| format!("project not found: {}", thread.project_id))?
                 .path
                 .clone();
-            Self::set_status_locked(
-                &state,
-                &mut store,
-                thread_id,
-                protocol::ThreadStatus::Failed,
-            )?;
+            Self::set_status_locked(&state, &mut store, thread_id, protocol::ThreadStatus::Failed)?;
             store.save()?;
             (thread, project_path)
         };
 
         Self::emit_progress(
             &state,
-            thread_id,
-            "running_hooks",
-            "Thread creation failed",
-            Some(reason.to_string()),
+            protocol::ThreadProgress {
+                thread_id: thread_id.to_string(),
+                step: protocol::ThreadProgressStep::RunningHooks,
+                message: Some("Thread creation failed".to_string()),
+                error: Some(reason.to_string()),
+            },
         );
 
         let _ = tmux::kill_session(&thread.tmux_session).await;
@@ -360,7 +401,7 @@ impl ThreadService {
 
     fn set_status_locked(
         state: &Arc<AppState>,
-        store: &mut crate::state::StateStore,
+        store: &mut crate::state_store::StateStore,
         thread_id: &str,
         next: protocol::ThreadStatus,
     ) -> Result<(), String> {
@@ -369,33 +410,22 @@ impl ThreadService {
             .ok_or_else(|| format!("thread not found: {thread_id}"))?;
         let previous = thread.status.clone();
         thread.status = next.clone();
-        state.emit_event(
-            "thread.status_changed",
-            json!({
-                "thread_id": thread_id,
-                "old": previous,
-                "new": next,
-            }),
-        );
+
+        state.emit_thread_status_changed(protocol::ThreadStatusChanged {
+            thread_id: thread_id.to_string(),
+            old: previous.clone(),
+            new: next.clone(),
+        });
+        state.emit_state_delta(vec![protocol::StateDeltaChange::ThreadStatusChanged {
+            thread_id: thread_id.to_string(),
+            old: previous,
+            new: next,
+        }]);
         Ok(())
     }
 
-    fn emit_progress(
-        state: &Arc<AppState>,
-        thread_id: &str,
-        step: &str,
-        message: &str,
-        error: Option<String>,
-    ) {
-        state.emit_event(
-            "thread.progress",
-            json!({
-                "thread_id": thread_id,
-                "step": step,
-                "message": message,
-                "error": error,
-            }),
-        );
+    fn emit_progress(state: &Arc<AppState>, event: protocol::ThreadProgress) {
+        state.emit_thread_progress(event);
     }
 }
 
@@ -483,7 +513,7 @@ async fn create_worktree(project_path: &str, default_branch: &str, thread: &Thre
                 &thread.branch,
                 &base,
             ];
-            if let Err(_) = git(project_path, &args).await {
+            if git(project_path, &args).await.is_err() {
                 let fallback = [
                     "worktree",
                     "add",
@@ -533,11 +563,7 @@ async fn remove_worktree(project_path: &str, worktree_path: &str) -> Result<(), 
         return Ok(());
     }
 
-    git(
-        project_path,
-        &["worktree", "remove", "--force", worktree_path],
-    )
-    .await
+    git(project_path, &["worktree", "remove", "--force", worktree_path]).await
 }
 
 fn copy_from_main(main_path: &str, worktree_path: &str, relative: &str) -> Result<(), String> {
@@ -585,7 +611,7 @@ async fn run_hooks(commands: &[String], cwd: &str, project_path: &str, thread: &
         return Ok(());
     }
 
-    let project = crate::state::Project {
+    let project = crate::state_store::Project {
         id: thread.project_id.clone(),
         name: Path::new(project_path)
             .file_name()
@@ -608,11 +634,11 @@ async fn run_hooks(commands: &[String], cwd: &str, project_path: &str, thread: &
         let output = process
             .output()
             .await
-            .map_err(|err| format!("failed to execute hook '{command}': {err}"))?;
+            .map_err(|err| format!("failed to execute hook {command}: {err}"))?;
 
         if !output.status.success() {
             return Err(format!(
-                "hook failed '{command}': {}",
+                "hook failed {command}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
