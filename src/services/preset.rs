@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+use tokio::time::sleep;
 
 use crate::{
     protocol,
@@ -83,6 +85,12 @@ impl PresetService {
             protocol::PresetProcessKind::Started,
             None,
         );
+        spawn_preset_monitor(
+            Arc::clone(&state),
+            params.thread_id.clone(),
+            params.preset.clone(),
+            thread.tmux_session.clone(),
+        );
 
         Ok(protocol::PresetStartResult { ok: true })
     }
@@ -139,6 +147,38 @@ impl PresetService {
 
         Ok(protocol::PresetRestartResult { ok: true })
     }
+}
+
+
+fn spawn_preset_monitor(state: Arc<AppState>, thread_id: String, preset: String, session: String) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(2)).await;
+            match tmux::window_exists(&session, &preset).await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    emit_preset_event(
+                        &state,
+                        &thread_id,
+                        &preset,
+                        protocol::PresetProcessKind::Exited,
+                        None,
+                    );
+                    break;
+                }
+                Err(_) => {
+                    emit_preset_event(
+                        &state,
+                        &thread_id,
+                        &preset,
+                        protocol::PresetProcessKind::Crashed,
+                        None,
+                    );
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn emit_preset_event(
