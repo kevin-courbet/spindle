@@ -191,13 +191,13 @@ pub struct BinaryFrame {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct PingParams;
+pub struct PingParams {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct StateSnapshotParams;
+pub struct StateSnapshotParams {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct ProjectListParams;
+pub struct ProjectListParams {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProjectAddParams {
