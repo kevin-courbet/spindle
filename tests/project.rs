@@ -149,3 +149,38 @@ async fn project_branches_returns_remote_branches() {
         .await
         .expect("remove project");
 }
+
+
+#[tokio::test]
+async fn project_clone_registers_project() {
+    let mut harness = setup_test_server().await;
+    let clone_path = std::env::temp_dir().join(common::unique_name("clone-rust-mustache"));
+    harness.register_cleanup_path(clone_path.clone());
+
+    let cloned = harness
+        .rpc(
+            "project.clone",
+            json!({
+                "url": "https://github.com/nickel-org/rust-mustache.git",
+                "path": clone_path.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("clone project");
+
+    let project_id = cloned["id"]
+        .as_str()
+        .expect("project id in clone response")
+        .to_string();
+
+    let listed = harness
+        .rpc("project.list", json!({}))
+        .await
+        .expect("list projects after clone");
+    let listed = listed.as_array().expect("project.list returns array");
+
+    assert!(
+        listed.iter().any(|entry| entry["id"] == project_id),
+        "project.list should include cloned project"
+    );
+}

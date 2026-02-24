@@ -205,6 +205,13 @@ pub struct ProjectAddParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectCloneParams {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProjectRemoveParams {
     pub project_id: String,
 }
@@ -292,6 +299,7 @@ pub type PingResult = String;
 pub type StateSnapshotResult = StateSnapshot;
 pub type ProjectListResult = Vec<Project>;
 pub type ProjectAddResult = Project;
+pub type ProjectCloneResult = Project;
 pub type ProjectBranchesResult = Vec<String>;
 pub type ProjectBrowseResult = Vec<DirectoryEntry>;
 pub type ThreadCreateResult = Thread;
@@ -351,6 +359,7 @@ pub const METHOD_PING: &str = "ping";
 pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
 pub const METHOD_PROJECT_LIST: &str = "project.list";
 pub const METHOD_PROJECT_ADD: &str = "project.add";
+pub const METHOD_PROJECT_CLONE: &str = "project.clone";
 pub const METHOD_PROJECT_REMOVE: &str = "project.remove";
 pub const METHOD_PROJECT_BRANCHES: &str = "project.branches";
 pub const METHOD_PROJECT_BROWSE: &str = "project.browse";
@@ -377,6 +386,8 @@ pub enum RequestDispatch {
     ProjectList(ProjectListParams),
     #[serde(rename = "project.add")]
     ProjectAdd(ProjectAddParams),
+    #[serde(rename = "project.clone")]
+    ProjectClone(ProjectCloneParams),
     #[serde(rename = "project.remove")]
     ProjectRemove(ProjectRemoveParams),
     #[serde(rename = "project.branches")]
@@ -421,6 +432,9 @@ pub fn parse_request_dispatch(method: &str, params: serde_json::Value) -> Result
         METHOD_PROJECT_ADD => serde_json::from_value::<ProjectAddParams>(params)
             .map(RequestDispatch::ProjectAdd)
             .map_err(|err| format!("invalid project.add params: {err}")),
+        METHOD_PROJECT_CLONE => serde_json::from_value::<ProjectCloneParams>(params)
+            .map(RequestDispatch::ProjectClone)
+            .map_err(|err| format!("invalid project.clone params: {err}")),
         METHOD_PROJECT_REMOVE => serde_json::from_value::<ProjectRemoveParams>(params)
             .map(RequestDispatch::ProjectRemove)
             .map_err(|err| format!("invalid project.remove params: {err}")),

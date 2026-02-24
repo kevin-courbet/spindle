@@ -1,9 +1,13 @@
 use std::{
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
 };
 
-use tokio::process::Command;
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -72,6 +76,66 @@ impl ProjectService {
         }
 
         Ok(project)
+    }
+
+    pub async fn clone_repo(
+        state: Arc<AppState>,
+        params: protocol::ProjectCloneParams,
+    ) -> Result<protocol::Project, String> {
+        let destination = resolve_clone_destination(&params.url, params.path.as_deref())?;
+        if destination.exists() {
+            return Err(format!("destination already exists: {}", destination.display()));
+        }
+
+        let parent = destination
+            .parent()
+            .ok_or_else(|| format!("invalid clone destination: {}", destination.display()))?;
+        if !parent.exists() {
+            return Err(format!("destination parent does not exist: {}", parent.display()));
+        }
+
+        let destination_str = destination
+            .to_str()
+            .ok_or_else(|| format!("invalid utf-8 path: {}", destination.display()))?
+            .to_string();
+
+        let clone_id = Uuid::new_v4().to_string();
+        emit_clone_progress(
+            &state,
+            &clone_id,
+            protocol::ThreadProgressStep::Fetching,
+            Some(format!("Cloning {}", params.url)),
+            None,
+        );
+
+        if let Err(err) =
+            run_git_clone_with_progress(&state, &clone_id, &params.url, &destination_str).await
+        {
+            emit_clone_progress(
+                &state,
+                &clone_id,
+                protocol::ThreadProgressStep::Fetching,
+                Some("Clone failed".to_string()),
+                Some(err.clone()),
+            );
+            return Err(err);
+        }
+
+        emit_clone_progress(
+            &state,
+            &clone_id,
+            protocol::ThreadProgressStep::Ready,
+            Some(format!("Clone complete: {}", destination_str)),
+            None,
+        );
+
+        Self::add(
+            state,
+            protocol::ProjectAddParams {
+                path: destination_str,
+            },
+        )
+        .await
     }
 
     pub async fn list(state: Arc<AppState>) -> Result<Vec<protocol::Project>, String> {
@@ -184,6 +248,157 @@ impl ProjectService {
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
+}
+
+fn resolve_clone_destination(url: &str, requested_path: Option<&str>) -> Result<PathBuf, String> {
+    let repo_name = repo_name_from_url(url)?;
+
+    match requested_path {
+        Some(path) => {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err("clone path must not be empty".to_string());
+            }
+
+            let destination = PathBuf::from(trimmed);
+            if !destination.is_absolute() {
+                return Err("clone path must be absolute".to_string());
+            }
+
+            if trimmed.ends_with('/') || destination.is_dir() {
+                return Ok(destination.join(repo_name));
+            }
+
+            Ok(destination)
+        }
+        None => Ok(PathBuf::from("/home/wsl/dev").join(repo_name)),
+    }
+}
+
+fn repo_name_from_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("invalid clone url".to_string());
+    }
+    if !trimmed.contains("://") && !trimmed.contains('/') && !trimmed.contains(':') {
+        return Err("invalid clone url".to_string());
+    }
+
+    let normalized = trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+
+    if normalized.is_empty() {
+        return Err("invalid clone url".to_string());
+    }
+
+    let tail = normalized.rsplit('/').next().unwrap_or(normalized);
+    let tail = tail.rsplit(':').next().unwrap_or(tail);
+    let repo_name = tail.trim_end_matches(".git").trim();
+
+    if repo_name.is_empty() || repo_name == "." || repo_name == ".." {
+        return Err("invalid clone url".to_string());
+    }
+
+    Ok(repo_name.to_string())
+}
+
+fn emit_clone_progress(
+    state: &Arc<AppState>,
+    clone_id: &str,
+    step: protocol::ThreadProgressStep,
+    message: Option<String>,
+    error: Option<String>,
+) {
+    state.emit_thread_progress(protocol::ThreadProgress {
+        thread_id: clone_id.to_string(),
+        step,
+        message,
+        error,
+    });
+}
+
+async fn run_git_clone_with_progress(
+    state: &Arc<AppState>,
+    clone_id: &str,
+    url: &str,
+    destination: &str,
+) -> Result<(), String> {
+    let mut child = Command::new("git")
+        .args(["clone", "--progress", url, destination])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run git clone: {err}"))?;
+
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture git clone stderr".to_string())?;
+
+    let mut last_message: Option<String> = None;
+    let mut buffer = [0_u8; 4096];
+    let mut pending = String::new();
+
+    loop {
+        let read = stderr
+            .read(&mut buffer)
+            .await
+            .map_err(|err| format!("failed to read git clone progress: {err}"))?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = String::from_utf8_lossy(&buffer[..read]);
+        for ch in chunk.chars() {
+            if ch == '\r' || ch == '\n' {
+                let message = pending.trim();
+                if !message.is_empty() {
+                    let message = message.to_string();
+                    last_message = Some(message.clone());
+                    emit_clone_progress(
+                        state,
+                        clone_id,
+                        protocol::ThreadProgressStep::Fetching,
+                        Some(message),
+                        None,
+                    );
+                }
+                pending.clear();
+            } else {
+                pending.push(ch);
+            }
+        }
+    }
+
+    let trailing = pending.trim();
+    if !trailing.is_empty() {
+        let message = trailing.to_string();
+        last_message = Some(message.clone());
+        emit_clone_progress(
+            state,
+            clone_id,
+            protocol::ThreadProgressStep::Fetching,
+            Some(message),
+            None,
+        );
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|err| format!("failed to wait for git clone: {err}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "git clone failed: {}",
+            last_message.unwrap_or_else(|| "unknown git clone error".to_string())
+        ));
+    }
+
+    Ok(())
 }
 
 async fn ensure_git_repo(path: &Path) -> Result<(), String> {

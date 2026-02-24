@@ -40,6 +40,10 @@ pub async fn dispatch_request(
             let project = ProjectService::add(state, params).await?;
             to_value("project.add", project)
         }
+        RequestDispatch::ProjectClone(params) => {
+            let project = ProjectService::clone_repo(state, params).await?;
+            to_value("project.clone", project)
+        }
         RequestDispatch::ProjectRemove(params) => {
             let result = ProjectService::remove(state, params).await?;
             to_value("project.remove", result)
