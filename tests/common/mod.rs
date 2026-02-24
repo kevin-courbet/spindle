@@ -440,6 +440,45 @@ pub async fn create_git_project(
     })
 }
 
+pub async fn create_git_project_without_remote(threadmill_config: Option<&str>) -> Result<TestProject, String> {
+    let root_dir = unique_temp_path("spindle-project");
+    fs::create_dir_all(&root_dir)
+        .map_err(|err| format!("failed to create {}: {err}", root_dir.display()))?;
+
+    let repo_path = root_dir.join("repo");
+    fs::create_dir_all(&repo_path)
+        .map_err(|err| format!("failed to create {}: {err}", repo_path.display()))?;
+
+    run_cmd(
+        "git",
+        &["init", &repo_path.to_string_lossy()],
+        None,
+    )
+    .await?;
+
+    run_git(&repo_path, &["config", "user.name", "Spindle Test"]).await?;
+    run_git(&repo_path, &["config", "user.email", "spindle-test@example.com"]).await?;
+    run_git(&repo_path, &["config", "commit.gpgsign", "false"]).await?;
+    run_git(&repo_path, &["checkout", "-b", "main"]).await?;
+
+    fs::write(repo_path.join("README.md"), "spindle integration test\n")
+        .map_err(|err| format!("failed to write README.md: {err}"))?;
+
+    if let Some(config) = threadmill_config {
+        fs::write(repo_path.join(".threadmill.yml"), config)
+            .map_err(|err| format!("failed to write .threadmill.yml: {err}"))?;
+    }
+
+    run_git(&repo_path, &["add", "-A"]).await?;
+    run_git(&repo_path, &["commit", "-m", "initial commit"]).await?;
+
+    Ok(TestProject {
+        root_dir,
+        repo_path,
+        feature_branch: None,
+    })
+}
+
 pub fn unique_name(prefix: &str) -> String {
     format!("{}-{}", prefix, Uuid::new_v4().simple())
 }

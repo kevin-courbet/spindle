@@ -52,7 +52,7 @@ async fn project_add_list_remove_lifecycle() {
 }
 
 #[tokio::test]
-async fn project_add_invalid_path_returns_error() {
+async fn project_add_nonexistent_path_returns_error() {
     let mut harness = setup_test_server().await;
     let invalid_path = format!("/tmp/{}", common::unique_name("missing-project"));
 
@@ -60,7 +60,52 @@ async fn project_add_invalid_path_returns_error() {
         .rpc_expect_error("project.add", json!({ "path": invalid_path }))
         .await;
 
-    assert!(error.contains("project path does not exist"), "{error}");
+    assert_eq!(error, "path does not exist", "{error}");
+}
+
+#[tokio::test]
+async fn project_add_non_git_directory_returns_error() {
+    let mut harness = setup_test_server().await;
+    let non_git_path = std::env::temp_dir().join(common::unique_name("non-git-project"));
+    std::fs::create_dir_all(&non_git_path).expect("create non-git directory");
+    harness.register_cleanup_path(non_git_path.clone());
+
+    let error = harness
+        .rpc_expect_error(
+            "project.add",
+            json!({ "path": non_git_path.to_string_lossy() }),
+        )
+        .await;
+
+    assert_eq!(error, "not a git repository", "{error}");
+}
+
+#[tokio::test]
+async fn project_add_accepts_bare_repository() {
+    let mut harness = setup_test_server().await;
+    let project = common::create_git_project(None, true)
+        .await
+        .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let bare_repo_path = project.root_dir.join("origin.git");
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": bare_repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add bare repository as project");
+
+    let project_id = added["id"]
+        .as_str()
+        .expect("project id in add response")
+        .to_string();
+
+    harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await
+        .expect("remove project");
 }
 
 #[tokio::test]

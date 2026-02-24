@@ -48,6 +48,22 @@ async fn create_thread(harness: &mut common::TestHarness, project_id: &str) -> S
         .to_string()
 }
 
+async fn remove_origin_remote(repo_path: &std::path::Path) {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["remote", "remove", "origin"])
+        .output()
+        .await
+        .expect("run git remote remove origin");
+
+    assert!(
+        output.status.success(),
+        "git remote remove origin failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 async fn wait_for_thread_ready(harness: &mut common::TestHarness, thread_id: &str) {
     loop {
         let event = harness
@@ -96,6 +112,30 @@ async fn thread_create_emits_progress_and_lists_thread() {
 
     let listed = harness
         .rpc("thread.list", json!({ "project_id": project_id }))
+        .await
+        .expect("list threads");
+    let threads = listed.as_array().expect("thread.list returns array");
+    assert!(threads.iter().any(|thread| thread["id"] == thread_id));
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn thread_create_succeeds_without_origin_remote() {
+    if !common::tmux_available().await {
+        eprintln!("skipping thread_create_succeeds_without_origin_remote: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_project(&mut harness).await;
+    remove_origin_remote(&project.repo_path).await;
+
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
         .await
         .expect("list threads");
     let threads = listed.as_array().expect("thread.list returns array");
@@ -187,6 +227,37 @@ async fn thread_create_nonexistent_project_returns_error() {
         .await;
 
     assert!(error.contains("project not found"), "{error}");
+}
+
+#[tokio::test]
+async fn thread_create_repo_without_remote_succeeds() {
+    if !common::tmux_available().await {
+        eprintln!("skipping thread_create_repo_without_remote_succeeds: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let project = common::create_git_project_without_remote(None)
+        .await
+        .expect("create test git project without remote");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+    let project_id = added["id"]
+        .as_str()
+        .expect("project id in add response")
+        .to_string();
+
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
 
 #[tokio::test]
