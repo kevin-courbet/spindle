@@ -6,8 +6,13 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
-use crate::{protocol, services::project, tmux};
+use crate::{
+    protocol,
+    services::{project, thread::load_threadmill_config},
+    tmux,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppData {
@@ -36,16 +41,31 @@ pub struct Thread {
     pub source_type: protocol::SourceType,
     pub created_at: DateTime<Utc>,
     pub tmux_session: String,
+    #[serde(default)]
+    pub port_offset: u16,
 }
 
 impl Project {
     pub fn to_protocol(&self) -> Result<protocol::Project, String> {
+        let presets = match project::load_project_presets(&self.path) {
+            Ok(presets) => presets,
+            Err(err) => {
+                warn!(
+                    project_id = %self.id,
+                    project_path = %self.path,
+                    error = %err,
+                    "failed to load project presets; using defaults"
+                );
+                project::default_presets()
+            }
+        };
+
         Ok(protocol::Project {
             id: self.id.clone(),
             name: self.name.clone(),
             path: self.path.clone(),
             default_branch: self.default_branch.clone(),
-            presets: project::load_project_presets(&self.path)?,
+            presets,
         })
     }
 }
@@ -62,6 +82,7 @@ impl Thread {
             source_type: self.source_type.clone(),
             created_at: self.created_at.to_rfc3339(),
             tmux_session: self.tmux_session.clone(),
+            port_offset: self.port_offset,
         }
     }
 }
@@ -73,9 +94,11 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn load() -> Result<Self, String> {
-        let config_dir = dirs::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
+        let config_dir =
+            dirs::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
         let dir = config_dir.join("threadmill");
-        fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+        fs::create_dir_all(&dir)
+            .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
 
         let path = dir.join("threads.json");
         if !path.exists() {
@@ -114,8 +137,13 @@ impl StateStore {
         let tmp_path = self.path.with_extension("json.tmp");
         fs::write(&tmp_path, serialized)
             .map_err(|err| format!("failed to write {}: {err}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &self.path)
-            .map_err(|err| format!("failed to move {} to {}: {err}", tmp_path.display(), self.path.display()))?;
+        fs::rename(&tmp_path, &self.path).map_err(|err| {
+            format!(
+                "failed to move {} to {}: {err}",
+                tmp_path.display(),
+                self.path.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -151,7 +179,23 @@ impl StateStore {
                     continue;
                 };
 
-                let env = thread_env(project, thread);
+                let config = match load_threadmill_config(&thread.worktree_path, &project.path) {
+                    Ok(config) => config,
+                    Err(_) => {
+                        thread.status = protocol::ThreadStatus::Failed;
+                        continue;
+                    }
+                };
+
+                let port_base = match port_base_with_offset(config.ports.base, thread.port_offset) {
+                    Ok(port_base) => port_base,
+                    Err(_) => {
+                        thread.status = protocol::ThreadStatus::Failed;
+                        continue;
+                    }
+                };
+
+                let env = thread_env(project, thread, port_base);
                 if tmux::create_session(&thread.tmux_session, &thread.worktree_path, &env)
                     .await
                     .is_err()
@@ -164,7 +208,34 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn snapshot(&self, state_version: protocol::StateVersion) -> Result<protocol::StateSnapshot, String> {
+    pub fn allocate_port_offset(&self, project_id: &str, offset_step: u16) -> Result<u16, String> {
+        if offset_step == 0 {
+            return Err("ports.offset must be greater than zero".to_string());
+        }
+
+        let used: HashSet<u16> = self
+            .data
+            .threads
+            .iter()
+            .filter(|thread| thread.project_id == project_id)
+            .filter(|thread| thread_holds_port_offset(&thread.status))
+            .map(|thread| thread.port_offset)
+            .collect();
+
+        let mut candidate = 0_u16;
+        while used.contains(&candidate) {
+            candidate = candidate
+                .checked_add(offset_step)
+                .ok_or_else(|| "port offset space exhausted".to_string())?;
+        }
+
+        Ok(candidate)
+    }
+
+    pub fn snapshot(
+        &self,
+        state_version: protocol::StateVersion,
+    ) -> Result<protocol::StateSnapshot, String> {
         Ok(protocol::StateSnapshot {
             state_version,
             projects: self
@@ -178,11 +249,17 @@ impl StateStore {
     }
 
     pub fn project_by_id(&self, project_id: &str) -> Option<&Project> {
-        self.data.projects.iter().find(|project| project.id == project_id)
+        self.data
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
     }
 
     pub fn thread_by_id(&self, thread_id: &str) -> Option<&Thread> {
-        self.data.threads.iter().find(|thread| thread.id == thread_id)
+        self.data
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
     }
 
     pub fn thread_by_id_mut(&mut self, thread_id: &str) -> Option<&mut Thread> {
@@ -193,7 +270,20 @@ impl StateStore {
     }
 }
 
-pub fn thread_env(project: &Project, thread: &Thread) -> Vec<(String, String)> {
+fn thread_holds_port_offset(status: &protocol::ThreadStatus) -> bool {
+    !matches!(
+        status,
+        protocol::ThreadStatus::Closed | protocol::ThreadStatus::Failed
+    )
+}
+
+pub fn port_base_with_offset(base_port: u16, port_offset: u16) -> Result<u16, String> {
+    base_port
+        .checked_add(port_offset)
+        .ok_or_else(|| format!("port base overflow: {base_port} + {port_offset}"))
+}
+
+pub fn thread_env(project: &Project, thread: &Thread, port_base: u16) -> Vec<(String, String)> {
     vec![
         ("THREADMILL_PROJECT".to_string(), project.name.clone()),
         ("THREADMILL_THREAD".to_string(), thread.name.clone()),
@@ -203,5 +293,10 @@ pub fn thread_env(project: &Project, thread: &Thread) -> Vec<(String, String)> {
             thread.worktree_path.clone(),
         ),
         ("THREADMILL_MAIN".to_string(), project.path.clone()),
+        (
+            "THREADMILL_PORT_OFFSET".to_string(),
+            thread.port_offset.to_string(),
+        ),
+        ("THREADMILL_PORT_BASE".to_string(), port_base.to_string()),
     ]
 }

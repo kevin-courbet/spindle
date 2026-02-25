@@ -85,7 +85,11 @@ async fn wait_for_thread_ready(harness: &mut common::TestHarness, thread_id: &st
     }
 }
 
-async fn cleanup_thread_project(harness: &mut common::TestHarness, thread_id: &str, project_id: &str) {
+async fn cleanup_thread_project(
+    harness: &mut common::TestHarness,
+    thread_id: &str,
+    project_id: &str,
+) {
     let _ = harness
         .rpc(
             "thread.close",
@@ -118,6 +122,84 @@ async fn thread_create_emits_progress_and_lists_thread() {
     assert!(threads.iter().any(|thread| thread["id"] == thread_id));
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn thread_create_assigns_distinct_port_offsets() {
+    if !common::tmux_available().await {
+        eprintln!("skipping thread_create_assigns_distinct_port_offsets: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+
+    let first = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("offset-a"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create first thread");
+    let first_id = first["id"].as_str().expect("first thread id").to_string();
+    let first_offset = first["port_offset"].as_u64().expect("first port_offset");
+    wait_for_thread_ready(&mut harness, &first_id).await;
+
+    let second = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("offset-b"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create second thread");
+    let second_id = second["id"].as_str().expect("second thread id").to_string();
+    let second_offset = second["port_offset"].as_u64().expect("second port_offset");
+
+    assert_ne!(first_offset, second_offset);
+
+    wait_for_thread_ready(&mut harness, &second_id).await;
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
+        .await
+        .expect("list threads");
+    let threads = listed.as_array().expect("thread.list returns array");
+
+    let first_listed = threads
+        .iter()
+        .find(|thread| thread["id"] == first_id)
+        .expect("first thread listed");
+    let second_listed = threads
+        .iter()
+        .find(|thread| thread["id"] == second_id)
+        .expect("second thread listed");
+
+    assert_eq!(first_listed["port_offset"].as_u64(), Some(first_offset));
+    assert_eq!(second_listed["port_offset"].as_u64(), Some(second_offset));
+
+    let _ = harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": first_id, "mode": "close" }),
+        )
+        .await;
+    let _ = harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": second_id, "mode": "close" }),
+        )
+        .await;
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
 }
 
 #[tokio::test]

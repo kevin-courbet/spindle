@@ -22,14 +22,15 @@ pub async fn tmux_run_owned(args: Vec<String>) -> Result<String, String> {
     tmux_run(&arg_refs).await
 }
 
-pub async fn create_session(name: &str, cwd: &str, env: &[(String, String)]) -> Result<(), String> {
-    tmux_run(&["new-session", "-d", "-s", name, "-c", cwd]).await?;
-
+pub async fn set_session_environment(
+    session: &str,
+    env: &[(String, String)],
+) -> Result<(), String> {
     for (key, value) in env {
         tmux_run_owned(vec![
             "set-environment".to_string(),
             "-t".to_string(),
-            name.to_string(),
+            session.to_string(),
             key.clone(),
             value.clone(),
         ])
@@ -39,7 +40,17 @@ pub async fn create_session(name: &str, cwd: &str, env: &[(String, String)]) -> 
     Ok(())
 }
 
-pub async fn create_window(session: &str, name: &str, command: &str, cwd: &str) -> Result<(), String> {
+pub async fn create_session(name: &str, cwd: &str, env: &[(String, String)]) -> Result<(), String> {
+    tmux_run(&["new-session", "-d", "-s", name, "-c", cwd]).await?;
+    set_session_environment(name, env).await
+}
+
+pub async fn create_window(
+    session: &str,
+    name: &str,
+    command: &str,
+    cwd: &str,
+) -> Result<(), String> {
     tmux_run_owned(vec![
         "new-window".to_string(),
         "-d".to_string(),
@@ -55,7 +66,12 @@ pub async fn create_window(session: &str, name: &str, command: &str, cwd: &str) 
     .map(|_| ())
 }
 
-pub async fn split_window(session: &str, name: &str, command: &str, cwd: &str) -> Result<(), String> {
+pub async fn split_window(
+    session: &str,
+    name: &str,
+    command: &str,
+    cwd: &str,
+) -> Result<(), String> {
     let target = format!("{session}:{name}");
     tmux_run_owned(vec![
         "split-window".to_string(),
@@ -101,7 +117,9 @@ pub async fn window_exists(session: &str, name: &str) -> Result<bool, String> {
 
     match windows {
         Ok(raw) => Ok(raw.lines().any(|entry| entry.trim() == name)),
-        Err(err) if err.contains("can't find session") || err.contains("no server running") => Ok(false),
+        Err(err) if err.contains("can't find session") || err.contains("no server running") => {
+            Ok(false)
+        }
         Err(err) => Err(err),
     }
 }

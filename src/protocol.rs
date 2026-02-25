@@ -34,6 +34,8 @@ pub struct Thread {
     pub source_type: SourceType,
     pub created_at: String,
     pub tmux_session: String,
+    #[serde(default)]
+    pub port_offset: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -428,7 +430,10 @@ pub enum RequestDispatch {
     PresetRestart(PresetRestartParams),
 }
 
-pub fn parse_request_dispatch(method: &str, params: serde_json::Value) -> Result<RequestDispatch, String> {
+pub fn parse_request_dispatch(
+    method: &str,
+    params: serde_json::Value,
+) -> Result<RequestDispatch, String> {
     match method {
         METHOD_PING => serde_json::from_value::<PingParams>(params)
             .map(RequestDispatch::Ping)

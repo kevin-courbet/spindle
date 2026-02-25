@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -14,7 +9,7 @@ use uuid::Uuid;
 use crate::{
     protocol,
     services::{preset::PresetService, sanitize_name, short_id},
-    state_store::{thread_env, Thread},
+    state_store::{port_base_with_offset, thread_env, Thread},
     tmux, AppState,
 };
 
@@ -30,6 +25,33 @@ pub struct ThreadmillConfig {
     pub copy_from_main: Vec<String>,
     #[serde(default)]
     pub presets: HashMap<String, PresetDefinition>,
+    #[serde(default)]
+    pub ports: PortsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortsConfig {
+    #[serde(default = "default_base_port")]
+    pub base: u16,
+    #[serde(default = "default_port_offset")]
+    pub offset: u16,
+}
+
+impl Default for PortsConfig {
+    fn default() -> Self {
+        Self {
+            base: default_base_port(),
+            offset: default_port_offset(),
+        }
+    }
+}
+
+fn default_base_port() -> u16 {
+    3000
+}
+
+fn default_port_offset() -> u16 {
+    20
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -45,7 +67,10 @@ pub struct PresetDefinition {
 }
 
 impl ThreadService {
-    pub async fn create(state: Arc<AppState>, params: protocol::ThreadCreateParams) -> Result<protocol::Thread, String> {
+    pub async fn create(
+        state: Arc<AppState>,
+        params: protocol::ThreadCreateParams,
+    ) -> Result<protocol::Thread, String> {
         let (thread, protocol_thread) = {
             let mut store = state.store.lock().await;
             let project = store
@@ -60,7 +85,13 @@ impl ThreadService {
                 sanitize_name(&project.name),
                 thread_name
             );
-            let tmux_session = format!("tm_{}_{}", short_id(&project.id), sanitize_name(&params.name));
+            let tmux_session = format!(
+                "tm_{}_{}",
+                short_id(&project.id),
+                sanitize_name(&params.name)
+            );
+            let config = load_threadmill_config(&worktree_path, &project.path)?;
+            let port_offset = store.allocate_port_offset(&project.id, config.ports.offset)?;
 
             let thread = Thread {
                 id: Uuid::new_v4().to_string(),
@@ -72,6 +103,7 @@ impl ThreadService {
                 source_type: params.source_type.clone(),
                 created_at: Utc::now(),
                 tmux_session,
+                port_offset,
             };
 
             let protocol_thread = thread.to_protocol();
@@ -99,7 +131,10 @@ impl ThreadService {
         Ok(protocol_thread)
     }
 
-    pub async fn list(state: Arc<AppState>, params: protocol::ThreadListParams) -> Result<Vec<protocol::Thread>, String> {
+    pub async fn list(
+        state: Arc<AppState>,
+        params: protocol::ThreadListParams,
+    ) -> Result<Vec<protocol::Thread>, String> {
         let store = state.store.lock().await;
         let project_filter = params.project_id.as_deref();
         Ok(store
@@ -148,7 +183,12 @@ impl ThreadService {
                 .path
                 .clone();
 
-            Self::set_status_locked(&state, &mut store, &params.thread_id, protocol::ThreadStatus::Closing)?;
+            Self::set_status_locked(
+                &state,
+                &mut store,
+                &params.thread_id,
+                protocol::ThreadStatus::Closing,
+            )?;
             (thread, project_path)
         };
 
@@ -157,12 +197,25 @@ impl ThreadService {
         }
 
         let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
-        run_hooks(&config.teardown, &thread.worktree_path, &project_path, &thread).await?;
+        let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
+        run_hooks(
+            &config.teardown,
+            &thread.worktree_path,
+            &project_path,
+            &thread,
+            port_base,
+        )
+        .await?;
         remove_worktree(&project_path, &thread.worktree_path).await?;
 
         {
             let mut store = state.store.lock().await;
-            Self::set_status_locked(&state, &mut store, &params.thread_id, protocol::ThreadStatus::Closed)?;
+            Self::set_status_locked(
+                &state,
+                &mut store,
+                &params.thread_id,
+                protocol::ThreadStatus::Closed,
+            )?;
             store.save()?;
         }
 
@@ -186,7 +239,12 @@ impl ThreadService {
                 return Err(format!("thread {} is closed", thread.id));
             }
 
-            Self::set_status_locked(&state, &mut store, &params.thread_id, protocol::ThreadStatus::Hidden)?;
+            Self::set_status_locked(
+                &state,
+                &mut store,
+                &params.thread_id,
+                protocol::ThreadStatus::Hidden,
+            )?;
             store.save()?;
         }
 
@@ -195,7 +253,10 @@ impl ThreadService {
         })
     }
 
-    pub async fn reopen(state: Arc<AppState>, params: protocol::ThreadReopenParams) -> Result<protocol::Thread, String> {
+    pub async fn reopen(
+        state: Arc<AppState>,
+        params: protocol::ThreadReopenParams,
+    ) -> Result<protocol::Thread, String> {
         let (thread, project_path) = {
             let store = state.store.lock().await;
             let thread = store
@@ -213,7 +274,10 @@ impl ThreadService {
             return Err(format!("thread {} is not hidden", thread.id));
         }
         if !Path::new(&thread.worktree_path).exists() {
-            return Err(format!("worktree no longer exists: {}", thread.worktree_path));
+            return Err(format!(
+                "worktree no longer exists: {}",
+                thread.worktree_path
+            ));
         }
 
         let project = {
@@ -224,14 +288,16 @@ impl ThreadService {
                 .clone()
         };
 
+        let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
+        let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
+
         if tmux::session_exists(&thread.tmux_session).await? {
             let _ = tmux::kill_session(&thread.tmux_session).await;
         }
 
-        let env = thread_env(&project, &thread);
+        let env = thread_env(&project, &thread, port_base);
         tmux::create_session(&thread.tmux_session, &thread.worktree_path, &env).await?;
 
-        let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
         for (preset_name, preset) in &config.presets {
             if preset.autostart {
                 let _ = PresetService::start(
@@ -247,7 +313,12 @@ impl ThreadService {
 
         let updated_thread = {
             let mut store = state.store.lock().await;
-            Self::set_status_locked(&state, &mut store, &thread.id, protocol::ThreadStatus::Active)?;
+            Self::set_status_locked(
+                &state,
+                &mut store,
+                &thread.id,
+                protocol::ThreadStatus::Active,
+            )?;
             store.save()?;
             store
                 .thread_by_id(&thread.id)
@@ -320,13 +391,21 @@ impl ThreadService {
                 error: None,
             },
         );
-        run_hooks(&config.setup, &thread.worktree_path, &project.path, &thread).await?;
+        let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
+        run_hooks(
+            &config.setup,
+            &thread.worktree_path,
+            &project.path,
+            &thread,
+            port_base,
+        )
+        .await?;
 
         if tmux::session_exists(&thread.tmux_session).await? {
             let _ = tmux::kill_session(&thread.tmux_session).await;
         }
 
-        let env = thread_env(&project, &thread);
+        let env = thread_env(&project, &thread, port_base);
         tmux::create_session(&thread.tmux_session, &thread.worktree_path, &env).await?;
 
         Self::emit_progress(
@@ -353,7 +432,12 @@ impl ThreadService {
 
         {
             let mut store = state.store.lock().await;
-            Self::set_status_locked(&state, &mut store, &thread.id, protocol::ThreadStatus::Active)?;
+            Self::set_status_locked(
+                &state,
+                &mut store,
+                &thread.id,
+                protocol::ThreadStatus::Active,
+            )?;
             store.save()?;
         }
 
@@ -369,7 +453,11 @@ impl ThreadService {
         Ok(())
     }
 
-    async fn mark_failed(state: Arc<AppState>, thread_id: &str, reason: &str) -> Result<(), String> {
+    async fn mark_failed(
+        state: Arc<AppState>,
+        thread_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
         let (thread, project_path) = {
             let mut store = state.store.lock().await;
             let thread = store
@@ -381,7 +469,12 @@ impl ThreadService {
                 .ok_or_else(|| format!("project not found: {}", thread.project_id))?
                 .path
                 .clone();
-            Self::set_status_locked(&state, &mut store, thread_id, protocol::ThreadStatus::Failed)?;
+            Self::set_status_locked(
+                &state,
+                &mut store,
+                thread_id,
+                protocol::ThreadStatus::Failed,
+            )?;
             store.save()?;
             (thread, project_path)
         };
@@ -431,14 +524,17 @@ impl ThreadService {
     }
 }
 
-pub fn load_threadmill_config(worktree_path: &str, project_path: &str) -> Result<ThreadmillConfig, String> {
+pub fn load_threadmill_config(
+    worktree_path: &str,
+    project_path: &str,
+) -> Result<ThreadmillConfig, String> {
     let worktree_config = Path::new(worktree_path).join(".threadmill.yml");
     if worktree_config.exists() {
         let raw = fs::read_to_string(&worktree_config)
             .map_err(|err| format!("failed to read {}: {err}", worktree_config.display()))?;
         let config: ThreadmillConfig = serde_yaml::from_str(&raw)
             .map_err(|err| format!("failed to parse {}: {err}", worktree_config.display()))?;
-        return Ok(with_default_terminal_preset(config));
+        return finalize_threadmill_config(config);
     }
 
     let project_config = Path::new(project_path).join(".threadmill.yml");
@@ -450,7 +546,16 @@ pub fn load_threadmill_config(worktree_path: &str, project_path: &str) -> Result
         .map_err(|err| format!("failed to read {}: {err}", project_config.display()))?;
     let config: ThreadmillConfig = serde_yaml::from_str(&raw)
         .map_err(|err| format!("failed to parse {}: {err}", project_config.display()))?;
-    Ok(with_default_terminal_preset(config))
+    finalize_threadmill_config(config)
+}
+
+fn finalize_threadmill_config(config: ThreadmillConfig) -> Result<ThreadmillConfig, String> {
+    let config = with_default_terminal_preset(config);
+    if config.ports.offset == 0 {
+        return Err("ports.offset must be greater than zero".to_string());
+    }
+
+    Ok(config)
 }
 
 fn default_threadmill_config() -> ThreadmillConfig {
@@ -470,6 +575,7 @@ fn default_threadmill_config() -> ThreadmillConfig {
         teardown: Vec::new(),
         copy_from_main: Vec::new(),
         presets,
+        ports: PortsConfig::default(),
     }
 }
 
@@ -493,7 +599,11 @@ fn with_default_terminal_preset(mut config: ThreadmillConfig) -> ThreadmillConfi
     config
 }
 
-async fn create_worktree(project_path: &str, default_branch: &str, thread: &Thread) -> Result<(), String> {
+async fn create_worktree(
+    project_path: &str,
+    default_branch: &str,
+    thread: &Thread,
+) -> Result<(), String> {
     let worktree_parent = Path::new(&thread.worktree_path)
         .parent()
         .ok_or_else(|| format!("invalid worktree path: {}", thread.worktree_path))?;
@@ -565,13 +675,20 @@ async fn remove_worktree(project_path: &str, worktree_path: &str) -> Result<(), 
         return Ok(());
     }
 
-    git(project_path, &["worktree", "remove", "--force", worktree_path]).await
+    git(
+        project_path,
+        &["worktree", "remove", "--force", worktree_path],
+    )
+    .await
 }
 
 fn copy_from_main(main_path: &str, worktree_path: &str, relative: &str) -> Result<(), String> {
     let source = Path::new(main_path).join(relative);
     if !source.exists() {
-        return Err(format!("copy_from_main path does not exist: {}", source.display()));
+        return Err(format!(
+            "copy_from_main path does not exist: {}",
+            source.display()
+        ));
     }
 
     let destination = Path::new(worktree_path).join(relative);
@@ -608,7 +725,13 @@ fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_hooks(commands: &[String], cwd: &str, project_path: &str, thread: &Thread) -> Result<(), String> {
+async fn run_hooks(
+    commands: &[String],
+    cwd: &str,
+    project_path: &str,
+    thread: &Thread,
+    port_base: u16,
+) -> Result<(), String> {
     if commands.is_empty() {
         return Ok(());
     }
@@ -624,7 +747,7 @@ async fn run_hooks(commands: &[String], cwd: &str, project_path: &str, thread: &
         default_branch: "main".to_string(),
     };
 
-    let env = thread_env(&project, thread);
+    let env = thread_env(&project, thread, port_base);
 
     for command in commands {
         let mut process = Command::new("bash");
@@ -648,7 +771,6 @@ async fn run_hooks(commands: &[String], cwd: &str, project_path: &str, thread: &
 
     Ok(())
 }
-
 
 async fn has_origin_remote(project_path: &str) -> Result<bool, String> {
     let output = Command::new("git")

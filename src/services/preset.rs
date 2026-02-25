@@ -8,7 +8,7 @@ use crate::{
         project::{load_project_presets, resolve_preset_cwd},
         thread::load_threadmill_config,
     },
-    state_store::Thread,
+    state_store::{port_base_with_offset, thread_env, Thread},
     tmux, AppState,
 };
 
@@ -19,7 +19,7 @@ impl PresetService {
         state: Arc<AppState>,
         params: protocol::PresetStartParams,
     ) -> Result<protocol::PresetStartResult, String> {
-        let (thread, project_path) = {
+        let (thread, project) = {
             let store = state.store.lock().await;
             let thread = store
                 .thread_by_id(&params.thread_id)
@@ -29,7 +29,7 @@ impl PresetService {
                 .project_by_id(&thread.project_id)
                 .ok_or_else(|| format!("project not found: {}", thread.project_id))?
                 .clone();
-            (thread, project.path)
+            (thread, project)
         };
 
         if !tmux::session_exists(&thread.tmux_session).await? {
@@ -40,21 +40,21 @@ impl PresetService {
             return Ok(protocol::PresetStartResult { ok: true });
         }
 
-        let project_presets = load_project_presets(&project_path)?;
+        let config = load_threadmill_config(&thread.worktree_path, &project.path)?;
+        let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
+        let env = thread_env(&project, &thread, port_base);
+        tmux::set_session_environment(&thread.tmux_session, &env).await?;
+
+        let project_presets = load_project_presets(&project.path)?;
         if let Some(preset) = project_presets
             .into_iter()
             .find(|preset| preset.name == params.preset)
         {
             let cwd = resolve_preset_cwd(&thread.worktree_path, preset.cwd.as_deref())?;
-            tmux::create_window(
-                &thread.tmux_session,
-                &params.preset,
-                &preset.command,
-                &cwd,
-            )
-            .await?;
+            tmux::create_window(&thread.tmux_session, &params.preset, &preset.command, &cwd)
+                .await?;
         } else {
-            start_legacy_preset(&thread, &params.preset, &project_path).await?;
+            start_legacy_preset(&thread, &params.preset, &project.path).await?;
         }
 
         emit_preset_event(
@@ -128,7 +128,11 @@ impl PresetService {
     }
 }
 
-async fn start_legacy_preset(thread: &Thread, preset_name: &str, project_path: &str) -> Result<(), String> {
+async fn start_legacy_preset(
+    thread: &Thread,
+    preset_name: &str,
+    project_path: &str,
+) -> Result<(), String> {
     let config = load_threadmill_config(&thread.worktree_path, project_path)?;
     let preset = config
         .presets
