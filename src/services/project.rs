@@ -372,13 +372,13 @@ pub fn resolve_preset_cwd(worktree_path: &str, cwd: Option<&str>) -> Result<Stri
 pub fn default_presets() -> Vec<protocol::PresetConfig> {
     vec![
         protocol::PresetConfig {
-            name: "editor".to_string(),
-            command: env_var_or_default("EDITOR", "nvim"),
+            name: "terminal".to_string(),
+            command: env_var_or_default("SHELL", "bash"),
             cwd: None,
         },
         protocol::PresetConfig {
-            name: "shell".to_string(),
-            command: env_var_or_default("SHELL", "bash"),
+            name: "opencode".to_string(),
+            command: "opencode".to_string(),
             cwd: None,
         },
     ]
