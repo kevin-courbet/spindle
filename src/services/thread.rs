@@ -121,12 +121,24 @@ impl ThreadService {
 
         let thread_id = thread.id.clone();
         let state_for_task = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(err) = Self::run_create_workflow(state_for_task.clone(), &thread_id).await {
-                error!(thread_id = %thread_id, error = %err, "thread.create workflow failed");
-                let _ = Self::mark_failed(state_for_task, &thread_id, &err).await;
+        let thread_id_for_task = thread_id.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(err) =
+                Self::run_create_workflow(state_for_task.clone(), &thread_id_for_task).await
+            {
+                error!(thread_id = %thread_id_for_task, error = %err, "thread.create workflow failed");
+                let _ =
+                    Self::mark_failed(Arc::clone(&state_for_task), &thread_id_for_task, &err).await;
             }
+
+            let mut create_tasks = state_for_task.create_tasks.lock().await;
+            create_tasks.remove(&thread_id_for_task);
         });
+
+        {
+            let mut create_tasks = state.create_tasks.lock().await;
+            create_tasks.insert(thread_id, handle);
+        }
 
         Ok(protocol_thread)
     }
@@ -147,6 +159,40 @@ impl ThreadService {
             })
             .map(Thread::to_protocol)
             .collect())
+    }
+
+    pub async fn cancel(
+        state: Arc<AppState>,
+        params: protocol::ThreadCancelParams,
+    ) -> Result<protocol::ThreadCancelResult, String> {
+        {
+            let store = state.store.lock().await;
+            let thread = store
+                .thread_by_id(&params.thread_id)
+                .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
+            if thread.status != protocol::ThreadStatus::Creating {
+                return Err(format!("thread {} is not creating", params.thread_id));
+            }
+        }
+
+        let handle = {
+            let mut create_tasks = state.create_tasks.lock().await;
+            create_tasks.remove(&params.thread_id)
+        };
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+
+        Self::mark_failed(
+            Arc::clone(&state),
+            &params.thread_id,
+            "thread creation cancelled",
+        )
+        .await?;
+
+        Ok(protocol::ThreadCancelResult {
+            status: protocol::ThreadStatus::Failed,
+        })
     }
 
     pub async fn close(
@@ -816,7 +862,10 @@ async fn git(project_path: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_branch(params: &protocol::ThreadCreateParams, thread_name: &str) -> Result<String, String> {
+fn resolve_branch(
+    params: &protocol::ThreadCreateParams,
+    thread_name: &str,
+) -> Result<String, String> {
     if let Some(ref branch) = params.branch {
         return Ok(branch.clone());
     }
@@ -836,7 +885,9 @@ fn extract_branch_from_pr_url(pr_url: &str) -> Result<String, String> {
     if let Some(pos) = pr_url.rfind("head:") {
         let branch = &pr_url[pos + 5..];
         if branch.is_empty() {
-            return Err(format!("pr_url has empty branch after head: prefix: {pr_url}"));
+            return Err(format!(
+                "pr_url has empty branch after head: prefix: {pr_url}"
+            ));
         }
         return Ok(branch.to_string());
     }

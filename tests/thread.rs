@@ -1,6 +1,6 @@
 mod common;
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use serde_json::json;
 
@@ -380,6 +380,116 @@ async fn thread_reopen_hidden_thread() {
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
 
+#[tokio::test]
+async fn thread_cancel_inflight_creation_marks_failed_and_cleans_worktree() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping thread_cancel_inflight_creation_marks_failed_and_cleans_worktree: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let project = common::create_git_project(
+        Some(
+            r#"setup:
+  - \"sleep 10\"
+"#,
+        ),
+        false,
+    )
+    .await
+    .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+    let project_id = added["id"].as_str().expect("project id").to_string();
+
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("cancel-thread"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create thread");
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = created["worktree_path"]
+        .as_str()
+        .expect("worktree path")
+        .to_string();
+
+    loop {
+        let event = harness
+            .wait_for_event("thread.progress", Duration::from_secs(45))
+            .await
+            .expect("wait for thread.progress event");
+        let params = &event["params"];
+        if params["thread_id"] != thread_id {
+            continue;
+        }
+
+        if let Some(error) = params["error"].as_str() {
+            panic!("thread creation failed before cancel: {error}");
+        }
+
+        if params["step"] == "running_hooks" {
+            break;
+        }
+    }
+
+    let cancelled = harness
+        .rpc("thread.cancel", json!({ "thread_id": thread_id }))
+        .await
+        .expect("cancel creating thread");
+    assert_eq!(cancelled["status"], "failed");
+
+    let status_event = harness
+        .wait_for_event("thread.status_changed", Duration::from_secs(45))
+        .await
+        .expect("wait for thread.status_changed");
+    assert_eq!(status_event["params"]["thread_id"], thread_id);
+    assert_eq!(status_event["params"]["new"], "failed");
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
+        .await
+        .expect("list threads");
+    let threads = listed.as_array().expect("thread.list returns array");
+    if let Some(thread) = threads.iter().find(|thread| thread["id"] == thread_id) {
+        assert_eq!(thread["status"], "failed");
+    }
+
+    for _ in 0..50 {
+        if !Path::new(&worktree_path).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !Path::new(&worktree_path).exists(),
+        "worktree should be removed after cancel"
+    );
+
+    let _ = harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": thread_id, "mode": "close" }),
+        )
+        .await;
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
+}
 
 #[tokio::test]
 async fn thread_create_from_pr_url_resolves_branch() {

@@ -256,6 +256,11 @@ pub struct ThreadCloseParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadCancelParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadReopenParams {
     pub thread_id: String,
 }
@@ -338,6 +343,11 @@ pub struct ThreadHideResult {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadCancelResult {
+    pub status: ThreadStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalAttachResult {
     pub channel_id: u16,
 }
@@ -379,6 +389,7 @@ pub const METHOD_PROJECT_BRANCHES: &str = "project.branches";
 pub const METHOD_PROJECT_BROWSE: &str = "project.browse";
 pub const METHOD_THREAD_CREATE: &str = "thread.create";
 pub const METHOD_THREAD_CLOSE: &str = "thread.close";
+pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
 pub const METHOD_THREAD_REOPEN: &str = "thread.reopen";
 pub const METHOD_THREAD_HIDE: &str = "thread.hide";
 pub const METHOD_THREAD_LIST: &str = "thread.list";
@@ -412,6 +423,8 @@ pub enum RequestDispatch {
     ThreadCreate(ThreadCreateParams),
     #[serde(rename = "thread.close")]
     ThreadClose(ThreadCloseParams),
+    #[serde(rename = "thread.cancel")]
+    ThreadCancel(ThreadCancelParams),
     #[serde(rename = "thread.reopen")]
     ThreadReopen(ThreadReopenParams),
     #[serde(rename = "thread.hide")]
@@ -467,6 +480,9 @@ pub fn parse_request_dispatch(
         METHOD_THREAD_CLOSE => serde_json::from_value::<ThreadCloseParams>(params)
             .map(RequestDispatch::ThreadClose)
             .map_err(|err| format!("invalid thread.close params: {err}")),
+        METHOD_THREAD_CANCEL => serde_json::from_value::<ThreadCancelParams>(params)
+            .map(RequestDispatch::ThreadCancel)
+            .map_err(|err| format!("invalid thread.cancel params: {err}")),
         METHOD_THREAD_REOPEN => serde_json::from_value::<ThreadReopenParams>(params)
             .map(RequestDispatch::ThreadReopen)
             .map_err(|err| format!("invalid thread.reopen params: {err}")),

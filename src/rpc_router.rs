@@ -86,6 +86,10 @@ pub async fn dispatch_request(
             let result = ThreadService::close(state, params).await?;
             to_value("thread.close", result)
         }
+        RequestDispatch::ThreadCancel(params) => {
+            let result = ThreadService::cancel(state, params).await?;
+            to_value("thread.cancel", result)
+        }
         RequestDispatch::ThreadReopen(params) => {
             let thread = ThreadService::reopen(state, params).await?;
             to_value("thread.reopen", thread)

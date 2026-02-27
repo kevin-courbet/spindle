@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU16, AtomicU64, Ordering},
@@ -12,6 +13,7 @@ use serde_json::{json, Value};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, oneshot, Mutex, Semaphore},
+    task::JoinHandle,
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -35,6 +37,7 @@ pub struct AppState {
     next_channel_id: Arc<AtomicU16>,
     state_version: Arc<AtomicU64>,
     pub store: Arc<Mutex<StateStore>>,
+    pub create_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +54,7 @@ impl AppState {
             next_channel_id: Arc::new(AtomicU16::new(1)),
             state_version: Arc::new(AtomicU64::new(0)),
             store: Arc::new(Mutex::new(store)),
+            create_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
