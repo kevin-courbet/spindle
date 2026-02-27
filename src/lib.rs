@@ -315,15 +315,23 @@ async fn handle_connection(
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Some(response) =
-                        handle_text_message(text.to_string(), state, connection_state, outbound_tx.clone()).await
+                    if let Some(response) = handle_text_message(
+                        text.to_string(),
+                        state,
+                        connection_state,
+                        outbound_tx.clone(),
+                    )
+                    .await
                     {
                         let _ = outbound_tx.send(response);
                     }
                 });
             }
             Ok(Message::Binary(data)) => {
-                if let Err(err) = terminal::handle_binary_frame(data.to_vec(), Arc::clone(&connection_state)).await {
+                if let Err(err) =
+                    terminal::handle_binary_frame(data.to_vec(), Arc::clone(&connection_state))
+                        .await
+                {
                     warn!(%connection_id, error = %err, "failed to route binary frame");
                 }
             }

@@ -82,7 +82,11 @@ async fn wait_for_thread_ready(harness: &mut common::TestHarness, thread_id: &st
     }
 }
 
-async fn cleanup_thread_project(harness: &mut common::TestHarness, thread_id: &str, project_id: &str) {
+async fn cleanup_thread_project(
+    harness: &mut common::TestHarness,
+    thread_id: &str,
+    project_id: &str,
+) {
     let _ = harness
         .rpc(
             "thread.close",
@@ -138,7 +142,10 @@ async fn binary_frames_route_to_matching_channels() {
         .await
         .expect("send terminal channel input");
     harness
-        .send_binary(aux_channel, format!("printf '{aux_marker}\\n'\n").as_bytes())
+        .send_binary(
+            aux_channel,
+            format!("printf '{aux_marker}\\n'\n").as_bytes(),
+        )
         .await
         .expect("send aux channel input");
 
@@ -151,7 +158,11 @@ async fn binary_frames_route_to_matching_channels() {
         .await
         .expect("terminal channel output");
     let aux_output = harness
-        .wait_for_channel_output_contains(aux_channel, aux_marker.as_bytes(), Duration::from_secs(20))
+        .wait_for_channel_output_contains(
+            aux_channel,
+            aux_marker.as_bytes(),
+            Duration::from_secs(20),
+        )
         .await
         .expect("aux channel output");
 

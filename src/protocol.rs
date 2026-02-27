@@ -245,6 +245,8 @@ pub struct ThreadCreateParams {
     pub source_type: SourceType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

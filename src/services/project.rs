@@ -7,22 +7,19 @@ use std::{
 };
 
 use serde::Deserialize;
-use tokio::{
-    io::AsyncReadExt,
-    process::Command,
-};
+use tokio::{io::AsyncReadExt, process::Command};
+use tracing::warn;
 use uuid::Uuid;
 
-use crate::{
-    protocol,
-    state_store::Project,
-    AppState,
-};
+use crate::{protocol, state_store::Project, AppState};
 
 pub struct ProjectService;
 
 impl ProjectService {
-    pub async fn add(state: Arc<AppState>, params: protocol::ProjectAddParams) -> Result<protocol::Project, String> {
+    pub async fn add(
+        state: Arc<AppState>,
+        params: protocol::ProjectAddParams,
+    ) -> Result<protocol::Project, String> {
         let path = PathBuf::from(&params.path);
         if !path.is_absolute() {
             return Err("project path must be absolute".to_string());
@@ -42,7 +39,12 @@ impl ProjectService {
         let name = canonical
             .file_name()
             .and_then(|entry| entry.to_str())
-            .ok_or_else(|| format!("unable to resolve project name from {}", canonical.display()))?
+            .ok_or_else(|| {
+                format!(
+                    "unable to resolve project name from {}",
+                    canonical.display()
+                )
+            })?
             .to_string();
         let default_branch = detect_default_branch(&canonical_str).await?;
 
@@ -54,7 +56,7 @@ impl ProjectService {
                 .iter()
                 .find(|project| project.path == canonical_str)
             {
-                (existing.to_protocol()?, false)
+                (existing.clone(), false)
             } else {
                 let project = Project {
                     id: Uuid::new_v4().to_string(),
@@ -62,39 +64,51 @@ impl ProjectService {
                     path: canonical_str,
                     default_branch,
                 };
-                let protocol_project = project.to_protocol()?;
-                store.data.projects.push(project);
+                store.data.projects.push(project.clone());
                 store.save()?;
-                (protocol_project, true)
+                (project, true)
             }
         };
 
+        let protocol_project = project.to_protocol()?;
+
         if is_new {
             state.emit_project_added(protocol::ProjectAddedEvent {
-                project: project.clone(),
+                project: protocol_project.clone(),
             });
             state.emit_state_delta(vec![protocol::StateDeltaChange::ProjectAdded {
-                project: project.clone(),
+                project: protocol_project.clone(),
             }]);
         }
 
-        Ok(project)
+        Ok(protocol_project)
     }
 
     pub async fn clone(
         state: Arc<AppState>,
         params: protocol::ProjectCloneParams,
     ) -> Result<protocol::Project, String> {
-        let destination = resolve_clone_destination(&params.url, params.path.as_deref())?;
+        let url = params.url.trim().to_string();
+        if url.starts_with("-") {
+            return Err("clone url must not start with '-'".to_string());
+        }
+
+        let destination = resolve_clone_destination(&url, params.path.as_deref())?;
         if destination.exists() {
-            return Err(format!("destination already exists: {}", destination.display()));
+            return Err(format!(
+                "destination already exists: {}",
+                destination.display()
+            ));
         }
 
         let parent = destination
             .parent()
             .ok_or_else(|| format!("invalid clone destination: {}", destination.display()))?;
         if !parent.exists() {
-            return Err(format!("destination parent does not exist: {}", parent.display()));
+            return Err(format!(
+                "destination parent does not exist: {}",
+                parent.display()
+            ));
         }
 
         let destination_str = destination
@@ -107,12 +121,12 @@ impl ProjectService {
             &state,
             &clone_id,
             protocol::ThreadProgressStep::Fetching,
-            Some(format!("Cloning {}", params.url)),
+            Some(format!("Cloning {}", url)),
             None,
         );
 
         if let Err(err) =
-            run_git_clone_with_progress(&state, &clone_id, &params.url, &destination_str).await
+            run_git_clone_with_progress(&state, &clone_id, &url, &destination_str).await
         {
             emit_clone_progress(
                 &state,
@@ -142,12 +156,14 @@ impl ProjectService {
     }
 
     pub async fn list(state: Arc<AppState>) -> Result<Vec<protocol::Project>, String> {
-        let store = state.store.lock().await;
-        store
-            .data
-            .projects
-            .iter()
-            .map(Project::to_protocol)
+        let projects = {
+            let store = state.store.lock().await;
+            store.data.projects.clone()
+        };
+
+        projects
+            .into_iter()
+            .map(|project| project.to_protocol())
             .collect()
     }
 
@@ -196,11 +212,7 @@ impl ProjectService {
                 .clone()
         };
 
-        let output = git_command(
-            &project_path,
-            &["branch", "-r", "--list", "origin/*"],
-        )
-        .await?;
+        let output = git_command(&project_path, &["branch", "-r", "--list", "origin/*"]).await?;
 
         let branches = output
             .lines()
@@ -218,7 +230,9 @@ impl ProjectService {
         Ok(branches)
     }
 
-    pub async fn browse(params: protocol::ProjectBrowseParams) -> Result<Vec<protocol::DirectoryEntry>, String> {
+    pub async fn browse(
+        params: protocol::ProjectBrowseParams,
+    ) -> Result<Vec<protocol::DirectoryEntry>, String> {
         let path = PathBuf::from(&params.path);
         if !path.is_absolute() {
             return Err("browse path must be absolute".to_string());
@@ -277,8 +291,18 @@ pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetCo
 
     let raw = fs::read_to_string(&config_path)
         .map_err(|err| format!("failed to read {}: {err}", config_path.display()))?;
-    let parsed: ProjectConfigFile = serde_yaml::from_str(&raw)
-        .map_err(|err| format!("failed to parse {}: {err}", config_path.display()))?;
+    let parsed: ProjectConfigFile = match serde_yaml::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warn!(
+                project_path = %project_path,
+                config_path = %config_path.display(),
+                error = %err,
+                "failed to parse project presets; using defaults"
+            );
+            return Ok(default_presets());
+        }
+    };
 
     let mut presets = Vec::with_capacity(parsed.presets.len());
     for (name, preset) in parsed.presets {
@@ -294,14 +318,17 @@ pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetCo
                 } else {
                     Some(preset.commands.join(" && "))
                 }
-            })
-            .ok_or_else(|| {
-                format!(
-                    "preset {} in {} must define command",
-                    name,
-                    config_path.display()
-                )
-            })?;
+            });
+
+        let Some(command) = command else {
+            warn!(
+                project_path = %project_path,
+                config_path = %config_path.display(),
+                preset_name = %name,
+                "invalid preset config missing command; using defaults"
+            );
+            return Ok(default_presets());
+        };
 
         let cwd = preset
             .cwd
@@ -326,14 +353,23 @@ pub fn resolve_preset_cwd(worktree_path: &str, cwd: Option<&str>) -> Result<Stri
         return Err(format!("preset cwd must be relative to worktree: {cwd}"));
     }
 
-    let joined = Path::new(worktree_path).join(cwd_path);
-    joined
+    let worktree_root = fs::canonicalize(worktree_path)
+        .map_err(|err| format!("failed to canonicalize worktree {}: {err}", worktree_path))?;
+    let joined = worktree_root.join(cwd_path);
+    let resolved = fs::canonicalize(&joined)
+        .map_err(|err| format!("failed to resolve preset cwd {}: {err}", joined.display()))?;
+
+    if !resolved.starts_with(&worktree_root) {
+        return Err(format!("preset cwd escapes worktree: {cwd}"));
+    }
+
+    resolved
         .to_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("invalid utf-8 preset cwd: {}", joined.display()))
+        .ok_or_else(|| format!("invalid utf-8 preset cwd: {}", resolved.display()))
 }
 
-fn default_presets() -> Vec<protocol::PresetConfig> {
+pub fn default_presets() -> Vec<protocol::PresetConfig> {
     vec![
         protocol::PresetConfig {
             name: "editor".to_string(),
@@ -417,12 +453,15 @@ fn emit_clone_progress(
     message: Option<String>,
     error: Option<String>,
 ) {
-    state.emit_thread_progress(protocol::ThreadProgress {
-        thread_id: clone_id.to_string(),
-        step,
-        message,
-        error,
-    });
+    state.emit_event(
+        "project.clone_progress",
+        protocol::ThreadProgress {
+            thread_id: clone_id.to_string(),
+            step,
+            message,
+            error,
+        },
+    );
 }
 
 async fn run_git_clone_with_progress(
@@ -432,7 +471,11 @@ async fn run_git_clone_with_progress(
     destination: &str,
 ) -> Result<(), String> {
     let mut child = Command::new("git")
-        .args(["clone", "--progress", url, destination])
+        .arg("clone")
+        .arg("--progress")
+        .arg("--")
+        .arg(url)
+        .arg(destination)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -541,7 +584,13 @@ async fn ensure_git_repo(path: &Path) -> Result<(), String> {
 
 async fn detect_default_branch(path: &str) -> Result<String, String> {
     let remote_head = Command::new("git")
-        .args(["-C", path, "symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
+        .args([
+            "-C",
+            path,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "--short",
+        ])
         .output()
         .await
         .map_err(|err| format!("failed to run git symbolic-ref: {err}"))?;

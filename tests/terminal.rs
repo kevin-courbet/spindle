@@ -195,3 +195,77 @@ async fn terminal_double_attach_returns_same_channel() {
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
+
+#[tokio::test]
+async fn reattach_receives_scrollback_replay() {
+    if !common::tmux_available().await {
+        eprintln!("skipping reattach_receives_scrollback_replay: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let first_attach = harness
+        .rpc(
+            "terminal.attach",
+            json!({ "thread_id": thread_id, "preset": "terminal" }),
+        )
+        .await
+        .expect("attach terminal first time");
+    let first_channel_id = first_attach["channel_id"]
+        .as_u64()
+        .expect("channel id in first attach response") as u16;
+    assert!(first_channel_id > 0);
+
+    let marker = common::unique_name("hello-scrollback");
+    let command = format!("printf '{marker}\\n'\\n");
+    harness
+        .send_binary(first_channel_id, command.as_bytes())
+        .await
+        .expect("send binary input on first attach");
+
+    harness
+        .wait_for_channel_output_contains(
+            first_channel_id,
+            marker.as_bytes(),
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("receive marker output before detach");
+
+    let detach = harness
+        .rpc(
+            "terminal.detach",
+            json!({ "thread_id": thread_id, "preset": "terminal" }),
+        )
+        .await
+        .expect("detach terminal");
+    assert_eq!(detach["detached"], true);
+
+    let second_attach = harness
+        .rpc(
+            "terminal.attach",
+            json!({ "thread_id": thread_id, "preset": "terminal" }),
+        )
+        .await
+        .expect("attach terminal second time");
+    let second_channel_id = second_attach["channel_id"]
+        .as_u64()
+        .expect("channel id in second attach response") as u16;
+    assert!(second_channel_id > 0);
+
+    let replay_result = harness
+        .wait_for_channel_output_contains(
+            second_channel_id,
+            marker.as_bytes(),
+            Duration::from_secs(2),
+        )
+        .await;
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+
+    replay_result.expect("reattach should replay recent scrollback output");
+}

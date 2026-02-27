@@ -379,3 +379,68 @@ async fn thread_reopen_hidden_thread() {
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
+
+
+#[tokio::test]
+async fn thread_create_from_pr_url_resolves_branch() {
+    if !common::tmux_available().await {
+        eprintln!("skipping thread_create_from_pr_url_resolves_branch: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+
+    let expected_branch = "feature/integration-test";
+    let name = common::unique_name("pr-test");
+    let result = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": name,
+                "source_type": "pull_request",
+                "pr_url": "https://example.com/acme/repo/pull/42/head:feature/integration-test"
+            }),
+        )
+        .await;
+
+    match result {
+        Ok(created) => {
+            if let Some(thread_id) = created["id"].as_str() {
+                let _ = harness
+                    .rpc(
+                        "thread.close",
+                        json!({ "thread_id": thread_id, "mode": "close" }),
+                    )
+                    .await;
+            }
+            let _ = harness
+                .rpc("project.remove", json!({ "project_id": project_id }))
+                .await;
+
+            let branch = created["branch"].as_str().unwrap_or_default();
+            assert_eq!(
+                branch, expected_branch,
+                "pull_request source should resolve branch from pr_url instead of defaulting to thread name"
+            );
+        }
+        Err(error) => {
+            let _ = harness
+                .rpc("project.remove", json!({ "project_id": project_id }))
+                .await;
+
+            let lower = error.to_lowercase();
+            assert!(
+                !lower.contains("invalid thread.create params"),
+                "expected PR-resolution error, got generic param error: {error}"
+            );
+            assert!(
+                lower.contains("pull request")
+                    || lower.contains("pr url")
+                    || lower.contains("resolve"),
+                "expected clear PR resolution error, got: {error}"
+            );
+        }
+    }
+}

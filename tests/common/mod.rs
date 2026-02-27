@@ -16,11 +16,7 @@ use tokio::{
     sync::{oneshot, Mutex, MutexGuard},
     task::JoinHandle,
 };
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::Message,
-    MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -115,7 +111,11 @@ impl TestHarness {
             .map_err(|err| format!("failed to send binary frame for channel {channel_id}: {err}"))
     }
 
-    pub async fn wait_for_event(&mut self, method: &str, timeout: Duration) -> Result<Value, String> {
+    pub async fn wait_for_event(
+        &mut self,
+        method: &str,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let deadline = Instant::now() + timeout;
 
         if let Some(event) = self.take_event(method) {
@@ -164,7 +164,10 @@ impl TestHarness {
 
         while let Some(chunk) = self.take_binary_chunk(channel_id) {
             collected.extend_from_slice(&chunk);
-            if collected.windows(needle.len()).any(|window| window == needle) {
+            if collected
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
                 return Ok(collected);
             }
         }
@@ -180,7 +183,10 @@ impl TestHarness {
 
                     if frame_channel == channel_id {
                         collected.extend_from_slice(payload);
-                        if collected.windows(needle.len()).any(|window| window == needle) {
+                        if collected
+                            .windows(needle.len())
+                            .any(|window| window == needle)
+                        {
                             return Ok(collected);
                         }
                     } else {
@@ -242,9 +248,7 @@ impl TestHarness {
                     };
 
                     if frame_channel == channel_id
-                        && payload
-                            .windows(needle.len())
-                            .any(|window| window == needle)
+                        && payload.windows(needle.len()).any(|window| window == needle)
                     {
                         return Err(format!(
                             "unexpected payload for channel {channel_id}: {:?}",
@@ -288,10 +292,11 @@ impl TestHarness {
     }
 
     fn take_binary_chunk(&mut self, channel_id: u16) -> Option<Vec<u8>> {
-        let index = self
-            .binaries
-            .iter()
-            .position(|frame| split_binary_frame(frame).map(|(id, _)| id == channel_id).unwrap_or(false))?;
+        let index = self.binaries.iter().position(|frame| {
+            split_binary_frame(frame)
+                .map(|(id, _)| id == channel_id)
+                .unwrap_or(false)
+        })?;
         let frame = self.binaries.remove(index)?;
         let (_, payload) = split_binary_frame(&frame)?;
         Some(payload.to_vec())
@@ -403,7 +408,11 @@ pub async fn create_git_project(
     .await?;
 
     run_git(&repo_path, &["config", "user.name", "Spindle Test"]).await?;
-    run_git(&repo_path, &["config", "user.email", "spindle-test@example.com"]).await?;
+    run_git(
+        &repo_path,
+        &["config", "user.email", "spindle-test@example.com"],
+    )
+    .await?;
     run_git(&repo_path, &["config", "commit.gpgsign", "false"]).await?;
     run_git(&repo_path, &["checkout", "-b", "main"]).await?;
 
@@ -440,7 +449,9 @@ pub async fn create_git_project(
     })
 }
 
-pub async fn create_git_project_without_remote(threadmill_config: Option<&str>) -> Result<TestProject, String> {
+pub async fn create_git_project_without_remote(
+    threadmill_config: Option<&str>,
+) -> Result<TestProject, String> {
     let root_dir = unique_temp_path("spindle-project");
     fs::create_dir_all(&root_dir)
         .map_err(|err| format!("failed to create {}: {err}", root_dir.display()))?;
@@ -449,15 +460,14 @@ pub async fn create_git_project_without_remote(threadmill_config: Option<&str>) 
     fs::create_dir_all(&repo_path)
         .map_err(|err| format!("failed to create {}: {err}", repo_path.display()))?;
 
-    run_cmd(
-        "git",
-        &["init", &repo_path.to_string_lossy()],
-        None,
-    )
-    .await?;
+    run_cmd("git", &["init", &repo_path.to_string_lossy()], None).await?;
 
     run_git(&repo_path, &["config", "user.name", "Spindle Test"]).await?;
-    run_git(&repo_path, &["config", "user.email", "spindle-test@example.com"]).await?;
+    run_git(
+        &repo_path,
+        &["config", "user.email", "spindle-test@example.com"],
+    )
+    .await?;
     run_git(&repo_path, &["config", "commit.gpgsign", "false"]).await?;
     run_git(&repo_path, &["checkout", "-b", "main"]).await?;
 

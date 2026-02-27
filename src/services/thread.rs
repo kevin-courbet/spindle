@@ -79,7 +79,7 @@ impl ThreadService {
                 .clone();
 
             let thread_name = sanitize_name(&params.name);
-            let branch = params.branch.clone().unwrap_or_else(|| thread_name.clone());
+            let branch = resolve_branch(&params, &thread_name)?;
             let worktree_path = format!(
                 "/home/wsl/dev/.threadmill/{}/{}",
                 sanitize_name(&project.name),
@@ -814,4 +814,31 @@ async fn git(project_path: &str, args: &[&str]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn resolve_branch(params: &protocol::ThreadCreateParams, thread_name: &str) -> Result<String, String> {
+    if let Some(ref branch) = params.branch {
+        return Ok(branch.clone());
+    }
+
+    if params.source_type == protocol::SourceType::PullRequest {
+        if let Some(ref pr_url) = params.pr_url {
+            return extract_branch_from_pr_url(pr_url);
+        }
+        return Err("pull_request source_type requires pr_url or branch".to_string());
+    }
+
+    Ok(thread_name.to_string())
+}
+
+fn extract_branch_from_pr_url(pr_url: &str) -> Result<String, String> {
+    // URL format: https://example.com/owner/repo/pull/123/head:<branch>
+    if let Some(pos) = pr_url.rfind("head:") {
+        let branch = &pr_url[pos + 5..];
+        if branch.is_empty() {
+            return Err(format!("pr_url has empty branch after head: prefix: {pr_url}"));
+        }
+        return Ok(branch.to_string());
+    }
+    Err(format!("could not resolve branch from pr_url: {pr_url}"))
 }

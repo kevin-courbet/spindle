@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use serde_json::{json, Value};
 use tokio::{
@@ -95,7 +91,10 @@ pub async fn attach(
             } else {
                 let reserved_channel_id = state.alloc_channel_id_with(|candidate| {
                     guard.by_channel.contains_key(&candidate)
-                        || guard.attaching_targets.values().any(|existing| *existing == candidate)
+                        || guard
+                            .attaching_targets
+                            .values()
+                            .any(|existing| *existing == candidate)
                 });
                 guard
                     .attaching_targets
@@ -246,11 +245,23 @@ pub async fn attach(
         }
     };
 
+    let pane_target_for_replay = attachment.pane_target.clone();
+
     {
         let mut guard = connection_state.lock().await;
         guard.attaching_targets.remove(&target_key);
         guard.by_target.insert(target_key, channel_id);
         guard.by_channel.insert(channel_id, attachment);
+    }
+
+    // Replay scrollback so reconnecting clients see recent history
+    if let Ok(scrollback) = capture_pane_scrollback(&pane_target_for_replay).await {
+        if !scrollback.is_empty() {
+            let mut payload = Vec::with_capacity(scrollback.len() + 2);
+            payload.extend_from_slice(&channel_id.to_be_bytes());
+            payload.extend_from_slice(scrollback.as_bytes());
+            let _ = outbound_tx.send(Message::Binary(payload.into()));
+        }
     }
 
     Ok(json!({ "channel_id": channel_id }))
@@ -430,6 +441,23 @@ async fn resolve_pane_tty(pane_target: &str) -> Result<String, String> {
     }
 
     Ok(pane_tty)
+}
+
+async fn capture_pane_scrollback(pane_target: &str) -> Result<String, String> {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", pane_target, "-S", "-1000"])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run tmux capture-pane: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "tmux capture-pane failed for {pane_target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn target_key(thread_id: &str, preset: &str) -> String {

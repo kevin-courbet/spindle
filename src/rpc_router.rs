@@ -7,8 +7,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::{
     protocol::{self, RequestDispatch},
     services::{
-        preset::PresetService, project::ProjectService, terminal, terminal::TerminalConnectionState,
-        thread::ThreadService,
+        preset::PresetService, project::ProjectService, terminal,
+        terminal::TerminalConnectionState, thread::ThreadService,
     },
     AppState,
 };
@@ -26,12 +26,30 @@ pub async fn dispatch_request(
     match request {
         RequestDispatch::Ping(_) => Ok(json!("pong")),
         RequestDispatch::StateSnapshot(_) => {
-            let snapshot = {
+            let (projects, threads) = {
                 let store = state.store.lock().await;
-                store.snapshot(state.state_version())?
+                (
+                    store.data.projects.clone(),
+                    store
+                        .data
+                        .threads
+                        .iter()
+                        .map(crate::state_store::Thread::to_protocol)
+                        .collect::<Vec<_>>(),
+                )
+            };
+
+            let snapshot = protocol::StateSnapshot {
+                state_version: state.state_version(),
+                projects: projects
+                    .into_iter()
+                    .map(|project| project.to_protocol())
+                    .collect::<Result<Vec<_>, _>>()?,
+                threads,
             };
             to_value("state.snapshot", snapshot)
         }
+
         RequestDispatch::ProjectList(_) => {
             let projects = ProjectService::list(state).await?;
             to_value("project.list", projects)

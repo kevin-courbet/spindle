@@ -129,27 +129,29 @@ async fn project_branches_returns_remote_branches() {
         .to_string();
 
     let branches = harness
-        .rpc("project.branches", json!({ "project_id": project_id.clone() }))
+        .rpc(
+            "project.branches",
+            json!({ "project_id": project_id.clone() }),
+        )
         .await
         .expect("list project branches");
     let branches = branches.as_array().expect("project.branches returns array");
 
-    assert!(branches.iter().any(|branch| branch.as_str() == Some("main")));
+    assert!(branches
+        .iter()
+        .any(|branch| branch.as_str() == Some("main")));
     let expected_feature = project
         .feature_branch
         .expect("feature branch exists in test repository");
-    assert!(
-        branches
-            .iter()
-            .any(|branch| branch.as_str() == Some(expected_feature.as_str()))
-    );
+    assert!(branches
+        .iter()
+        .any(|branch| branch.as_str() == Some(expected_feature.as_str())));
 
     harness
         .rpc("project.remove", json!({ "project_id": project_id }))
         .await
         .expect("remove project");
 }
-
 
 #[tokio::test]
 async fn project_clone_registers_project() {
@@ -229,15 +231,11 @@ async fn project_list_returns_presets_from_threadmill_config() {
         .expect("project includes presets array");
 
     assert!(presets.iter().any(|preset| {
-        preset["name"] == "editor"
-            && preset["command"] == "nvim"
-            && preset["cwd"].is_null()
+        preset["name"] == "editor" && preset["command"] == "nvim" && preset["cwd"].is_null()
     }));
 
     assert!(presets.iter().any(|preset| {
-        preset["name"] == "shell"
-            && preset["command"] == "zsh"
-            && preset["cwd"].is_null()
+        preset["name"] == "shell" && preset["command"] == "zsh" && preset["cwd"].is_null()
     }));
 
     assert!(presets.iter().any(|preset| {
