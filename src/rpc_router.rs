@@ -7,7 +7,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::{
     protocol::{self, RequestDispatch},
     services::{
-        preset::PresetService, project::ProjectService, terminal,
+        opencode::OpencodeService, preset::PresetService, project::ProjectService, terminal,
         terminal::TerminalConnectionState, thread::ThreadService,
     },
     AppState,
@@ -50,6 +50,14 @@ pub async fn dispatch_request(
             to_value("state.snapshot", snapshot)
         }
 
+        RequestDispatch::OpencodeStatus(params) => {
+            let status = OpencodeService::status(params).await?;
+            to_value("opencode.status", status)
+        }
+        RequestDispatch::OpencodeEnsure(params) => {
+            let url = OpencodeService::ensure(params).await?;
+            to_value("opencode.ensure", url)
+        }
         RequestDispatch::ProjectList(_) => {
             let projects = ProjectService::list(state).await?;
             to_value("project.list", projects)
@@ -126,6 +134,8 @@ fn normalize_params(method: &str, params: Value) -> Value {
     match method {
         protocol::METHOD_PING
         | protocol::METHOD_STATE_SNAPSHOT
+        | protocol::METHOD_OPENCODE_STATUS
+        | protocol::METHOD_OPENCODE_ENSURE
         | protocol::METHOD_PROJECT_LIST
         | protocol::METHOD_THREAD_LIST => json!({}),
         _ => Value::Null,

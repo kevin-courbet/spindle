@@ -1,3 +1,4 @@
+pub mod opencode;
 pub mod preset;
 pub mod project;
 pub mod terminal;

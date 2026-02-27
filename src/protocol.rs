@@ -209,6 +209,12 @@ pub struct PingParams {}
 pub struct StateSnapshotParams {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct OpencodeStatusParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct OpencodeEnsureParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ProjectListParams {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -316,6 +322,16 @@ pub struct PresetRestartParams {
 
 pub type PingResult = String;
 pub type StateSnapshotResult = StateSnapshot;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OpencodeStatusResult {
+    pub running: bool,
+    pub port: u16,
+    pub url: String,
+}
+
+pub type OpencodeEnsureResult = String;
+
 pub type ProjectListResult = Vec<Project>;
 pub type ProjectAddResult = Project;
 pub type ProjectCloneResult = Project;
@@ -381,6 +397,8 @@ pub struct PresetRestartResult {
 
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
+pub const METHOD_OPENCODE_STATUS: &str = "opencode.status";
+pub const METHOD_OPENCODE_ENSURE: &str = "opencode.ensure";
 pub const METHOD_PROJECT_LIST: &str = "project.list";
 pub const METHOD_PROJECT_ADD: &str = "project.add";
 pub const METHOD_PROJECT_CLONE: &str = "project.clone";
@@ -407,6 +425,10 @@ pub enum RequestDispatch {
     Ping(PingParams),
     #[serde(rename = "state.snapshot")]
     StateSnapshot(StateSnapshotParams),
+    #[serde(rename = "opencode.status")]
+    OpencodeStatus(OpencodeStatusParams),
+    #[serde(rename = "opencode.ensure")]
+    OpencodeEnsure(OpencodeEnsureParams),
     #[serde(rename = "project.list")]
     ProjectList(ProjectListParams),
     #[serde(rename = "project.add")]
@@ -456,6 +478,12 @@ pub fn parse_request_dispatch(
         METHOD_STATE_SNAPSHOT => serde_json::from_value::<StateSnapshotParams>(params)
             .map(RequestDispatch::StateSnapshot)
             .map_err(|err| format!("invalid state.snapshot params: {err}")),
+        METHOD_OPENCODE_STATUS => serde_json::from_value::<OpencodeStatusParams>(params)
+            .map(RequestDispatch::OpencodeStatus)
+            .map_err(|err| format!("invalid opencode.status params: {err}")),
+        METHOD_OPENCODE_ENSURE => serde_json::from_value::<OpencodeEnsureParams>(params)
+            .map(RequestDispatch::OpencodeEnsure)
+            .map_err(|err| format!("invalid opencode.ensure params: {err}")),
         METHOD_PROJECT_LIST => serde_json::from_value::<ProjectListParams>(params)
             .map(RequestDispatch::ProjectList)
             .map_err(|err| format!("invalid project.list params: {err}")),
