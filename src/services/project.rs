@@ -378,7 +378,7 @@ pub fn default_presets() -> Vec<protocol::PresetConfig> {
         },
         protocol::PresetConfig {
             name: "opencode".to_string(),
-            command: "opencode".to_string(),
+            command: "opencode attach http://127.0.0.1:4101 --dir $THREADMILL_WORKTREE".to_string(),
             cwd: None,
         },
     ]

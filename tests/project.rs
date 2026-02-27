@@ -249,3 +249,50 @@ async fn project_list_returns_presets_from_threadmill_config() {
         .await
         .expect("remove project");
 }
+
+#[tokio::test]
+async fn project_list_uses_shared_opencode_attach_preset_by_default() {
+    let mut harness = setup_test_server().await;
+    let project = common::create_git_project(None, true)
+        .await
+        .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+    let project_id = added["id"]
+        .as_str()
+        .expect("project id in add response")
+        .to_string();
+
+    let listed = harness
+        .rpc("project.list", json!({}))
+        .await
+        .expect("list projects");
+    let projects = listed.as_array().expect("project.list returns array");
+    let project_row = projects
+        .iter()
+        .find(|project| project["id"] == project_id)
+        .expect("project present in list");
+
+    let presets = project_row["presets"]
+        .as_array()
+        .expect("project includes presets array");
+
+    assert!(presets.iter().any(|preset| {
+        preset["name"] == "opencode"
+            && preset["command"]
+                == "opencode attach http://127.0.0.1:4101 --dir $THREADMILL_WORKTREE"
+            && preset["cwd"].is_null()
+    }));
+
+    harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await
+        .expect("remove project");
+}
