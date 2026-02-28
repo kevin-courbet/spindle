@@ -1,9 +1,10 @@
 use std::{
     cmp::Ordering,
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+use tokio::fs;
 
 use crate::{protocol, AppState};
 
@@ -17,22 +18,29 @@ impl FileService {
         params: protocol::FileListParams,
     ) -> Result<protocol::FileListResult, String> {
         let directory = resolve_authorized_path(state, &params.path).await?;
-        if !directory.is_dir() {
+        let directory_metadata = fs::metadata(&directory)
+            .await
+            .map_err(|err| format!("failed to inspect {}: {err}", directory.display()))?;
+        if !directory_metadata.is_dir() {
             return Err(format!("path is not a directory: {}", directory.display()));
         }
 
-        let read_dir = fs::read_dir(&directory)
+        let mut read_dir = fs::read_dir(&directory)
+            .await
             .map_err(|err| format!("failed to read {}: {err}", directory.display()))?;
 
         let mut entries = Vec::new();
-        for entry in read_dir {
-            let entry = entry.map_err(|err| format!("failed to read directory entry: {err}"))?;
-            let metadata = entry
-                .metadata()
-                .map_err(|err| format!("failed to inspect {}: {err}", entry.path().display()))?;
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|err| format!("failed to read directory entry: {err}"))?
+        {
+            let full_path = entry.path();
+            let metadata = fs::metadata(&full_path)
+                .await
+                .map_err(|err| format!("failed to inspect {}: {err}", full_path.display()))?;
 
             let is_directory = metadata.is_dir();
-            let full_path = entry.path();
             let full_path_str = full_path
                 .to_str()
                 .ok_or_else(|| format!("invalid utf-8 path: {}", full_path.display()))?
@@ -67,6 +75,7 @@ impl FileService {
     ) -> Result<protocol::FileReadResult, String> {
         let path = resolve_authorized_path(state, &params.path).await?;
         let metadata = fs::metadata(&path)
+            .await
             .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
 
         if !metadata.is_file() {
@@ -82,10 +91,9 @@ impl FileService {
             ));
         }
 
-        let bytes =
-            fs::read(&path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-        let content = String::from_utf8(bytes)
-            .map_err(|_| format!("file is not valid UTF-8: {}", path.display()))?;
+        let content = fs::read_to_string(&path)
+            .await
+            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
 
         Ok(protocol::FileReadResult { content, size })
     }
@@ -105,6 +113,7 @@ async fn resolve_authorized_path(
     }
 
     let canonical_requested = fs::canonicalize(&requested)
+        .await
         .map_err(|err| format!("failed to resolve {}: {err}", requested.display()))?;
     let allowed_roots = allowed_roots(state).await;
 
@@ -126,13 +135,13 @@ async fn allowed_roots(state: Arc<AppState>) -> Vec<PathBuf> {
     let store = state.store.lock().await;
 
     for project in &store.data.projects {
-        if let Ok(path) = fs::canonicalize(&project.path) {
+        if let Ok(path) = fs::canonicalize(&project.path).await {
             roots.push(path);
         }
     }
 
     for thread in &store.data.threads {
-        if let Ok(path) = fs::canonicalize(&thread.worktree_path) {
+        if let Ok(path) = fs::canonicalize(&thread.worktree_path).await {
             roots.push(path);
         }
     }
