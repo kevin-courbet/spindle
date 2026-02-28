@@ -124,3 +124,72 @@ async fn file_list_and_read_enforce_workspace_rules() {
         .rpc("project.remove", json!({ "project_id": project_id }))
         .await;
 }
+
+
+#[tokio::test]
+async fn file_git_status_returns_modified_entries_for_worktree_files() {
+    if !common::tmux_available().await {
+        eprintln!("skipping file_git_status_returns_modified_entries_for_worktree_files: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let project = common::create_git_project(None, false)
+        .await
+        .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+    let project_id = added["id"].as_str().expect("project id").to_string();
+
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("git-status"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create thread");
+
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = created["worktree_path"]
+        .as_str()
+        .expect("thread worktree path")
+        .to_string();
+
+    loop {
+        let event = harness
+            .wait_for_event("thread.progress", std::time::Duration::from_secs(45))
+            .await
+            .expect("thread progress event");
+        if event["params"]["thread_id"] == thread_id && event["params"]["step"] == "ready" {
+            break;
+        }
+    }
+
+    fs::write(
+        std::path::Path::new(&worktree_path).join("README.md"),
+        "spindle integration test\nchanged\n",
+    )
+    .expect("modify tracked file in worktree");
+
+    let status = harness
+        .rpc("file.git_status", json!({ "path": worktree_path }))
+        .await
+        .expect("fetch git status");
+
+    assert_eq!(
+        status["entries"]["README.md"],
+        "modified",
+        "expected modified tracked file status"
+    );
+}

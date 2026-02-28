@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Read,
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
@@ -8,6 +9,7 @@ use std::{
 };
 
 use crate::{protocol, AppState};
+use tokio::process::Command;
 
 const MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -108,6 +110,88 @@ impl FileService {
 
         Ok(protocol::FileReadResult { content, size })
     }
+
+    pub async fn git_status(
+        state: Arc<AppState>,
+        params: protocol::FileGitStatusParams,
+    ) -> Result<protocol::FileGitStatusResult, String> {
+        let authorized = authorize_requested_path(state, &params.path).await?;
+        let metadata = fs::metadata(&authorized.canonical)
+            .map_err(|err| format!("failed to inspect {}: {err}", authorized.canonical.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "path is not a directory: {}",
+                authorized.canonical.display()
+            ));
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&authorized.canonical)
+            .args(["status", "--porcelain=v1", "-uall"])
+            .output()
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to run git status in {}: {err}",
+                    authorized.canonical.display()
+                )
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "git status failed in {}: {stderr}",
+                authorized.canonical.display()
+            ));
+        }
+
+        let stdout = String::from_utf8(output.stdout).map_err(|_| {
+            format!(
+                "git status output is not valid UTF-8 in {}",
+                authorized.canonical.display()
+            )
+        })?;
+
+        let mut entries = HashMap::new();
+        for line in stdout.lines() {
+            if line.len() < 4 {
+                continue;
+            }
+
+            let Some(path) = parse_porcelain_path(line) else {
+                continue;
+            };
+            let Some(status) = map_porcelain_status(&line[0..2]) else {
+                continue;
+            };
+
+            entries.insert(path, status.to_string());
+        }
+
+        Ok(protocol::FileGitStatusResult { entries })
+    }
+}
+
+fn map_porcelain_status(xy: &str) -> Option<&'static str> {
+    match xy {
+        " M" | "M " | "MM" => Some("modified"),
+        "A " => Some("added"),
+        "D " | " D" => Some("deleted"),
+        "R " => Some("renamed"),
+        "??" => Some("untracked"),
+        "UU" | "AA" | "DD" => Some("conflicted"),
+        _ => None,
+    }
+}
+
+fn parse_porcelain_path(line: &str) -> Option<String> {
+    let raw = line.get(3..)?;
+    let path = raw
+        .split_once(" -> ")
+        .map(|(_, renamed_path)| renamed_path)
+        .unwrap_or(raw);
+    Some(path.to_string())
 }
 
 struct AuthorizedPath {

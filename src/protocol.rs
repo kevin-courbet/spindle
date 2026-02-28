@@ -1,6 +1,8 @@
 // Generated from threadmill/protocol/threadmill-rpc.schema.json
 // Manual extensions for Spindle runtime events and sync deltas.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub type StateVersion = u64;
@@ -255,6 +257,11 @@ pub struct FileReadParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileGitStatusParams {
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadCreateParams {
     pub project_id: String,
     pub name: String,
@@ -350,6 +357,11 @@ pub struct FileReadResult {
     pub size: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileGitStatusResult {
+    pub entries: HashMap<String, String>,
+}
+
 pub type PingResult = String;
 pub type StateSnapshotResult = StateSnapshot;
 
@@ -437,6 +449,7 @@ pub const METHOD_PROJECT_BRANCHES: &str = "project.branches";
 pub const METHOD_PROJECT_BROWSE: &str = "project.browse";
 pub const METHOD_FILE_LIST: &str = "file.list";
 pub const METHOD_FILE_READ: &str = "file.read";
+pub const FILE_GIT_STATUS: &str = "file.git_status";
 pub const METHOD_THREAD_CREATE: &str = "thread.create";
 pub const METHOD_THREAD_CLOSE: &str = "thread.close";
 pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
@@ -477,6 +490,8 @@ pub enum RequestDispatch {
     FileList(FileListParams),
     #[serde(rename = "file.read")]
     FileRead(FileReadParams),
+    #[serde(rename = "file.git_status")]
+    FileGitStatus(FileGitStatusParams),
     #[serde(rename = "thread.create")]
     ThreadCreate(ThreadCreateParams),
     #[serde(rename = "thread.close")]
@@ -544,6 +559,9 @@ pub fn parse_request_dispatch(
         METHOD_FILE_READ => serde_json::from_value::<FileReadParams>(params)
             .map(RequestDispatch::FileRead)
             .map_err(|err| format!("invalid file.read params: {err}")),
+        FILE_GIT_STATUS => serde_json::from_value::<FileGitStatusParams>(params)
+            .map(RequestDispatch::FileGitStatus)
+            .map_err(|err| format!("invalid file.git_status params: {err}")),
         METHOD_THREAD_CREATE => serde_json::from_value::<ThreadCreateParams>(params)
             .map(RequestDispatch::ThreadCreate)
             .map_err(|err| format!("invalid thread.create params: {err}")),

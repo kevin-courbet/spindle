@@ -91,6 +91,10 @@ pub async fn dispatch_request(
             let result = FileService::read(state, params).await?;
             to_value("file.read", result)
         }
+        RequestDispatch::FileGitStatus(params) => {
+            let result = FileService::git_status(state, params).await?;
+            to_value("file.git_status", result)
+        }
         RequestDispatch::ThreadCreate(params) => {
             let thread = ThreadService::create(state, params).await?;
             to_value("thread.create", thread)
