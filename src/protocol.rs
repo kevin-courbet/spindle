@@ -245,6 +245,16 @@ pub struct ProjectBrowseParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileListParams {
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileReadParams {
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadCreateParams {
     pub project_id: String,
     pub name: String,
@@ -318,6 +328,26 @@ pub struct PresetStopParams {
 pub struct PresetRestartParams {
     pub thread_id: String,
     pub preset: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "isDirectory")]
+    pub is_directory: bool,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileListResult {
+    pub entries: Vec<FileEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileReadResult {
+    pub content: String,
+    pub size: u64,
 }
 
 pub type PingResult = String;
@@ -405,6 +435,8 @@ pub const METHOD_PROJECT_CLONE: &str = "project.clone";
 pub const METHOD_PROJECT_REMOVE: &str = "project.remove";
 pub const METHOD_PROJECT_BRANCHES: &str = "project.branches";
 pub const METHOD_PROJECT_BROWSE: &str = "project.browse";
+pub const METHOD_FILE_LIST: &str = "file.list";
+pub const METHOD_FILE_READ: &str = "file.read";
 pub const METHOD_THREAD_CREATE: &str = "thread.create";
 pub const METHOD_THREAD_CLOSE: &str = "thread.close";
 pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
@@ -441,6 +473,10 @@ pub enum RequestDispatch {
     ProjectBranches(ProjectBranchesParams),
     #[serde(rename = "project.browse")]
     ProjectBrowse(ProjectBrowseParams),
+    #[serde(rename = "file.list")]
+    FileList(FileListParams),
+    #[serde(rename = "file.read")]
+    FileRead(FileReadParams),
     #[serde(rename = "thread.create")]
     ThreadCreate(ThreadCreateParams),
     #[serde(rename = "thread.close")]
@@ -502,6 +538,12 @@ pub fn parse_request_dispatch(
         METHOD_PROJECT_BROWSE => serde_json::from_value::<ProjectBrowseParams>(params)
             .map(RequestDispatch::ProjectBrowse)
             .map_err(|err| format!("invalid project.browse params: {err}")),
+        METHOD_FILE_LIST => serde_json::from_value::<FileListParams>(params)
+            .map(RequestDispatch::FileList)
+            .map_err(|err| format!("invalid file.list params: {err}")),
+        METHOD_FILE_READ => serde_json::from_value::<FileReadParams>(params)
+            .map(RequestDispatch::FileRead)
+            .map_err(|err| format!("invalid file.read params: {err}")),
         METHOD_THREAD_CREATE => serde_json::from_value::<ThreadCreateParams>(params)
             .map(RequestDispatch::ThreadCreate)
             .map_err(|err| format!("invalid thread.create params: {err}")),

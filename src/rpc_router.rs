@@ -7,8 +7,9 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::{
     protocol::{self, RequestDispatch},
     services::{
-        opencode::OpencodeService, preset::PresetService, project::ProjectService, terminal,
-        terminal::TerminalConnectionState, thread::ThreadService,
+        file::FileService, opencode::OpencodeService, preset::PresetService,
+        project::ProjectService, terminal, terminal::TerminalConnectionState,
+        thread::ThreadService,
     },
     AppState,
 };
@@ -81,6 +82,14 @@ pub async fn dispatch_request(
         RequestDispatch::ProjectBrowse(params) => {
             let entries = ProjectService::browse(params).await?;
             to_value("project.browse", entries)
+        }
+        RequestDispatch::FileList(params) => {
+            let result = FileService::list(state, params).await?;
+            to_value("file.list", result)
+        }
+        RequestDispatch::FileRead(params) => {
+            let result = FileService::read(state, params).await?;
+            to_value("file.read", result)
         }
         RequestDispatch::ThreadCreate(params) => {
             let thread = ThreadService::create(state, params).await?;

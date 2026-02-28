@@ -1,3 +1,4 @@
+pub mod file;
 pub mod opencode;
 pub mod preset;
 pub mod project;
