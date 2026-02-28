@@ -267,5 +267,20 @@ async fn reattach_receives_scrollback_replay() {
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 
-    replay_result.expect("reattach should replay recent scrollback output");
+    let replay_bytes = replay_result.expect("reattach should replay recent scrollback output");
+
+    // Scrollback replay must use CR+LF line endings so terminals render
+    // correctly. Bare LF causes diagonal/staircase text in raw-mode PTYs.
+    for (i, &byte) in replay_bytes.iter().enumerate() {
+        if byte == b'\n' {
+            assert!(
+                i > 0 && replay_bytes[i - 1] == b'\r',
+                "bare LF at byte offset {i} in scrollback replay (expected CR+LF). \
+                 Context: {:?}",
+                String::from_utf8_lossy(
+                    &replay_bytes[i.saturating_sub(20)..replay_bytes.len().min(i + 20)]
+                )
+            );
+        }
+    }
 }

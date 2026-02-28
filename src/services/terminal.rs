@@ -28,7 +28,8 @@ pub struct TerminalConnectionState {
 struct Attachment {
     target: String,
     pane_target: String,
-    fifo_path: String,
+    input_fifo_path: String,
+    output_fifo_path: String,
     input_tx: Option<mpsc::Sender<Vec<u8>>>,
     output_shutdown_tx: Option<oneshot::Sender<()>>,
     input_task: JoinHandle<()>,
@@ -111,25 +112,34 @@ pub async fn attach(
 
     let attach_result = async {
         let pane_target = resolve_pane_target(&thread.tmux_session, &params.preset).await?;
-        let pane_tty = resolve_pane_tty(&pane_target).await?;
-        let fifo_path = format!("/tmp/threadmill-pipe-{channel_id}-{}", Uuid::new_v4());
+        let uuid = Uuid::new_v4();
+        let input_fifo_path = format!("/tmp/threadmill-in-{channel_id}-{uuid}");
+        let output_fifo_path = format!("/tmp/threadmill-out-{channel_id}-{uuid}");
 
-        match std::fs::remove_file(&fifo_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("failed to clear stale fifo {fifo_path}: {err}")),
+        // Clean up any stale FIFOs
+        for path in [&input_fifo_path, &output_fifo_path] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("failed to clear stale fifo {path}: {err}")),
+            }
         }
 
-        let mkfifo_output = Command::new("mkfifo")
-            .arg(&fifo_path)
-            .output()
-            .await
-            .map_err(|err| format!("failed to run mkfifo for {fifo_path}: {err}"))?;
-        if !mkfifo_output.status.success() {
-            return Err(format!(
-                "mkfifo failed for {fifo_path}: {}",
-                String::from_utf8_lossy(&mkfifo_output.stderr).trim()
-            ));
+        // Create both FIFOs
+        for path in [&input_fifo_path, &output_fifo_path] {
+            let mkfifo_output = Command::new("mkfifo")
+                .arg(path)
+                .output()
+                .await
+                .map_err(|err| format!("failed to run mkfifo for {path}: {err}"))?;
+            if !mkfifo_output.status.success() {
+                let _ = std::fs::remove_file(&input_fifo_path);
+                let _ = std::fs::remove_file(&output_fifo_path);
+                return Err(format!(
+                    "mkfifo failed for {path}: {}",
+                    String::from_utf8_lossy(&mkfifo_output.stderr).trim()
+                ));
+            }
         }
 
         let clear_pipe_output = Command::new("tmux")
@@ -138,21 +148,27 @@ pub async fn attach(
             .await
             .map_err(|err| format!("failed to clear existing tmux pipe-pane: {err}"))?;
         if !clear_pipe_output.status.success() {
-            let _ = std::fs::remove_file(&fifo_path);
+            let _ = std::fs::remove_file(&input_fifo_path);
+            let _ = std::fs::remove_file(&output_fifo_path);
             return Err(format!(
                 "tmux pipe-pane clear failed for {target_key}: {}",
                 String::from_utf8_lossy(&clear_pipe_output.stderr).trim()
             ));
         }
 
-        let pipe_command = format!("cat > {fifo_path}");
+        // -I: pipe-pane connects the command's stdout to pane input (typed keys)
+        // -O: pipe-pane connects pane output to the command's stdin
+        let pipe_command = format!(
+            "sh -c 'cat <{input_fifo_path} & cat >{output_fifo_path}; wait'"
+        );
         let pipe_output = Command::new("tmux")
-            .args(["pipe-pane", "-t", &pane_target, "-O", &pipe_command])
+            .args(["pipe-pane", "-t", &pane_target, "-IO", &pipe_command])
             .output()
             .await
             .map_err(|err| format!("failed to run tmux pipe-pane: {err}"))?;
         if !pipe_output.status.success() {
-            let _ = std::fs::remove_file(&fifo_path);
+            let _ = std::fs::remove_file(&input_fifo_path);
+            let _ = std::fs::remove_file(&output_fifo_path);
             return Err(format!(
                 "tmux pipe-pane failed for {target_key}: {}",
                 String::from_utf8_lossy(&pipe_output.stderr).trim()
@@ -161,12 +177,12 @@ pub async fn attach(
 
         let (output_shutdown_tx, mut output_shutdown_rx) = oneshot::channel();
         let output_tx = outbound_tx.clone();
-        let fifo_path_for_task = fifo_path.clone();
+        let output_fifo_for_task = output_fifo_path.clone();
         let output_task = tokio::spawn(async move {
-            let mut reader = match OpenOptions::new().read(true).open(&fifo_path_for_task).await {
+            let mut reader = match OpenOptions::new().read(true).open(&output_fifo_for_task).await {
                 Ok(reader) => reader,
                 Err(err) => {
-                    warn!(fifo = %fifo_path_for_task, error = %err, "failed to open tmux fifo");
+                    warn!(fifo = %output_fifo_for_task, error = %err, "failed to open output fifo");
                     return;
                 }
             };
@@ -188,7 +204,7 @@ pub async fn attach(
                             }
                             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(err) => {
-                                warn!(fifo = %fifo_path_for_task, error = %err, "failed to read tmux fifo");
+                                warn!(fifo = %output_fifo_for_task, error = %err, "failed to read output fifo");
                                 break;
                             }
                         }
@@ -198,11 +214,13 @@ pub async fn attach(
         });
 
         let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(INPUT_CHANNEL_CAPACITY);
+        let input_fifo_for_task = input_fifo_path.clone();
         let input_task = tokio::spawn(async move {
-            let mut writer = match OpenOptions::new().write(true).open(&pane_tty).await {
+            // Open write-side of input FIFO; data flows to pipe-pane's -I stdout → pane
+            let mut writer = match OpenOptions::new().write(true).open(&input_fifo_for_task).await {
                 Ok(writer) => writer,
                 Err(err) => {
-                    warn!(tty = %pane_tty, error = %err, "failed to open pane tty for input");
+                    warn!(fifo = %input_fifo_for_task, error = %err, "failed to open input fifo");
                     return;
                 }
             };
@@ -213,12 +231,12 @@ pub async fn attach(
                 }
 
                 if let Err(err) = writer.write_all(&batch).await {
-                    warn!(tty = %pane_tty, error = %err, "failed to write pane input");
+                    warn!(fifo = %input_fifo_for_task, error = %err, "failed to write input fifo");
                     break;
                 }
 
                 if let Err(err) = writer.flush().await {
-                    warn!(tty = %pane_tty, error = %err, "failed to flush pane input");
+                    warn!(fifo = %input_fifo_for_task, error = %err, "failed to flush input fifo");
                     break;
                 }
             }
@@ -227,7 +245,8 @@ pub async fn attach(
         Ok::<Attachment, String>(Attachment {
             target: target_key.clone(),
             pane_target,
-            fifo_path,
+            input_fifo_path,
+            output_fifo_path,
             input_tx: Some(input_tx),
             output_shutdown_tx: Some(output_shutdown_tx),
             input_task,
@@ -259,7 +278,9 @@ pub async fn attach(
         if !scrollback.is_empty() {
             let mut payload = Vec::with_capacity(scrollback.len() + 2);
             payload.extend_from_slice(&channel_id.to_be_bytes());
-            payload.extend_from_slice(scrollback.as_bytes());
+            // tmux capture-pane outputs bare LF; terminals need CR+LF
+            let normalized = scrollback.replace("\n", "\r\n");
+            payload.extend_from_slice(normalized.as_bytes());
             let _ = outbound_tx.send(Message::Binary(payload.into()));
         }
     }
@@ -389,9 +410,11 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
         }
     }
 
-    if let Err(err) = std::fs::remove_file(&attachment.fifo_path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            warn!(fifo = %attachment.fifo_path, error = %err, "failed to remove tmux fifo");
+    for path in [&attachment.input_fifo_path, &attachment.output_fifo_path] {
+        if let Err(err) = std::fs::remove_file(path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(fifo = %path, error = %err, "failed to remove fifo");
+            }
         }
     }
 }
@@ -419,28 +442,6 @@ async fn resolve_pane_target(session: &str, preset: &str) -> Result<String, Stri
         .to_string();
 
     Ok(pane)
-}
-
-async fn resolve_pane_tty(pane_target: &str) -> Result<String, String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", "-t", pane_target, "#{pane_tty}"])
-        .output()
-        .await
-        .map_err(|err| format!("failed to run tmux display-message: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "tmux display-message failed for {pane_target}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let pane_tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if pane_tty.is_empty() {
-        return Err(format!("tmux returned empty pane tty for {pane_target}"));
-    }
-
-    Ok(pane_tty)
 }
 
 async fn capture_pane_scrollback(pane_target: &str) -> Result<String, String> {
