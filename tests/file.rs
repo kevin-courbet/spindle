@@ -74,6 +74,21 @@ async fn file_list_and_read_enforce_workspace_rules() {
     assert_eq!(read_text["content"], "alpha\n");
     assert_eq!(read_text["size"], 6);
 
+    let symlink_path = fixture_path.join("a-link.txt");
+    std::os::unix::fs::symlink(fixture_path.join("a.txt"), &symlink_path)
+        .expect("create symlink fixture");
+    let symlink_error = harness
+        .rpc_expect_error(
+            "file.read",
+            json!({ "path": symlink_path.to_string_lossy() }),
+        )
+        .await;
+    assert!(
+        symlink_error.to_lowercase().contains("symbolic link")
+            || symlink_error.to_lowercase().contains("symlink"),
+        "expected symlink rejection, got: {symlink_error}"
+    );
+
     let binary_error = harness
         .rpc_expect_error(
             "file.read",

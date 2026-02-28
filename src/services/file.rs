@@ -1,10 +1,11 @@
 use std::{
     cmp::Ordering,
+    fs::{self, OpenOptions},
+    io::Read,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-use tokio::fs;
 
 use crate::{protocol, AppState};
 
@@ -17,30 +18,31 @@ impl FileService {
         state: Arc<AppState>,
         params: protocol::FileListParams,
     ) -> Result<protocol::FileListResult, String> {
-        let directory = resolve_authorized_path(state, &params.path).await?;
-        let directory_metadata = fs::metadata(&directory)
-            .await
-            .map_err(|err| format!("failed to inspect {}: {err}", directory.display()))?;
-        if !directory_metadata.is_dir() {
-            return Err(format!("path is not a directory: {}", directory.display()));
+        let authorized = authorize_requested_path(state, &params.path).await?;
+        let opened = open_authorized_path(&authorized)?;
+        let metadata = opened
+            .file
+            .metadata()
+            .map_err(|err| format!("failed to inspect {}: {err}", opened.canonical.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "path is not a directory: {}",
+                opened.canonical.display()
+            ));
         }
 
-        let mut read_dir = fs::read_dir(&directory)
-            .await
-            .map_err(|err| format!("failed to read {}: {err}", directory.display()))?;
+        let read_dir = fs::read_dir(proc_fd_path(&opened.file))
+            .map_err(|err| format!("failed to read {}: {err}", opened.canonical.display()))?;
 
         let mut entries = Vec::new();
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|err| format!("failed to read directory entry: {err}"))?
-        {
-            let full_path = entry.path();
-            let metadata = fs::metadata(&full_path)
-                .await
-                .map_err(|err| format!("failed to inspect {}: {err}", full_path.display()))?;
+        for entry in read_dir {
+            let entry = entry.map_err(|err| format!("failed to read directory entry: {err}"))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|err| format!("failed to inspect {}: {err}", entry.path().display()))?;
 
             let is_directory = metadata.is_dir();
+            let full_path = opened.canonical.join(entry.file_name());
             let full_path_str = full_path
                 .to_str()
                 .ok_or_else(|| format!("invalid utf-8 path: {}", full_path.display()))?
@@ -73,13 +75,18 @@ impl FileService {
         state: Arc<AppState>,
         params: protocol::FileReadParams,
     ) -> Result<protocol::FileReadResult, String> {
-        let path = resolve_authorized_path(state, &params.path).await?;
-        let metadata = fs::metadata(&path)
-            .await
-            .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+        let authorized = authorize_requested_path(state, &params.path).await?;
+        let mut opened = open_authorized_path(&authorized)?;
+        let metadata = opened
+            .file
+            .metadata()
+            .map_err(|err| format!("failed to inspect {}: {err}", opened.canonical.display()))?;
 
         if !metadata.is_file() {
-            return Err(format!("path is not a file: {}", path.display()));
+            return Err(format!(
+                "path is not a file: {}",
+                opened.canonical.display()
+            ));
         }
 
         let size = metadata.len();
@@ -87,22 +94,37 @@ impl FileService {
             return Err(format!(
                 "file is larger than 5MB: {} bytes ({})",
                 size,
-                path.display()
+                opened.canonical.display()
             ));
         }
 
-        let content = fs::read_to_string(&path)
-            .await
-            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        let mut bytes = Vec::with_capacity(size as usize);
+        opened
+            .file
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("failed to read {}: {err}", opened.canonical.display()))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| format!("file is not valid UTF-8: {}", opened.canonical.display()))?;
 
         Ok(protocol::FileReadResult { content, size })
     }
 }
 
-async fn resolve_authorized_path(
+struct AuthorizedPath {
+    requested: PathBuf,
+    canonical: PathBuf,
+    allowed_roots: Vec<PathBuf>,
+}
+
+struct OpenedAuthorizedPath {
+    file: fs::File,
+    canonical: PathBuf,
+}
+
+async fn authorize_requested_path(
     state: Arc<AppState>,
     requested_path: &str,
-) -> Result<PathBuf, String> {
+) -> Result<AuthorizedPath, String> {
     if requested_path.trim().is_empty() {
         return Err("path must not be empty".to_string());
     }
@@ -112,22 +134,73 @@ async fn resolve_authorized_path(
         return Err("path must be absolute".to_string());
     }
 
-    let canonical_requested = fs::canonicalize(&requested)
-        .await
+    let canonical = fs::canonicalize(&requested)
         .map_err(|err| format!("failed to resolve {}: {err}", requested.display()))?;
     let allowed_roots = allowed_roots(state).await;
 
-    if allowed_roots
+    if !allowed_roots
         .iter()
-        .any(|root| path_is_within(&canonical_requested, root))
+        .any(|root| path_is_within(&canonical, root))
     {
-        return Ok(canonical_requested);
+        return Err(format!(
+            "path is outside known project/worktree roots: {}",
+            canonical.display()
+        ));
     }
 
-    Err(format!(
-        "path is outside known project/worktree roots: {}",
-        canonical_requested.display()
-    ))
+    Ok(AuthorizedPath {
+        requested,
+        canonical,
+        allowed_roots,
+    })
+}
+
+fn open_authorized_path(authorized: &AuthorizedPath) -> Result<OpenedAuthorizedPath, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&authorized.requested)
+        .map_err(|err| format!("failed to open {}: {err}", authorized.requested.display()))?;
+
+    let opened_canonical = canonicalize_open_file(&file)?;
+    if !authorized
+        .allowed_roots
+        .iter()
+        .any(|root| path_is_within(&opened_canonical, root))
+    {
+        return Err(format!(
+            "path is outside known project/worktree roots: {}",
+            opened_canonical.display()
+        ));
+    }
+
+    let recanonicalized = fs::canonicalize(&authorized.requested).map_err(|err| {
+        format!(
+            "failed to re-resolve {} after open: {err}",
+            authorized.requested.display()
+        )
+    })?;
+
+    if recanonicalized != authorized.canonical || opened_canonical != recanonicalized {
+        return Err(format!(
+            "path changed during access; refusing to read {}",
+            authorized.requested.display()
+        ));
+    }
+
+    Ok(OpenedAuthorizedPath {
+        file,
+        canonical: opened_canonical,
+    })
+}
+
+fn canonicalize_open_file(file: &fs::File) -> Result<PathBuf, String> {
+    fs::canonicalize(proc_fd_path(file))
+        .map_err(|err| format!("failed to resolve opened file descriptor: {err}"))
+}
+
+fn proc_fd_path(file: &fs::File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 async fn allowed_roots(state: Arc<AppState>) -> Vec<PathBuf> {
@@ -135,13 +208,13 @@ async fn allowed_roots(state: Arc<AppState>) -> Vec<PathBuf> {
     let store = state.store.lock().await;
 
     for project in &store.data.projects {
-        if let Ok(path) = fs::canonicalize(&project.path).await {
+        if let Ok(path) = fs::canonicalize(&project.path) {
             roots.push(path);
         }
     }
 
     for thread in &store.data.threads {
-        if let Ok(path) = fs::canonicalize(&thread.worktree_path).await {
+        if let Ok(path) = fs::canonicalize(&thread.worktree_path) {
             roots.push(path);
         }
     }

@@ -849,6 +849,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",
