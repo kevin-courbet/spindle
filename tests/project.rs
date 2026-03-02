@@ -1,5 +1,7 @@
 mod common;
 
+use std::time::Duration;
+
 use serde_json::json;
 
 async fn setup_test_server() -> common::TestHarness {
@@ -49,6 +51,92 @@ async fn project_add_list_remove_lifecycle() {
             .is_empty(),
         "project list should be empty after removing the only project"
     );
+}
+
+#[tokio::test]
+async fn project_add_auto_creates_main_checkout_thread() {
+    if !common::tmux_available().await {
+        eprintln!("skipping project_add_auto_creates_main_checkout_thread: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let project = common::create_git_project(None, true)
+        .await
+        .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+    let project_id = added["id"].as_str().expect("project id").to_string();
+    let project_path = added["path"].as_str().expect("project path").to_string();
+    let default_branch = added["default_branch"]
+        .as_str()
+        .expect("default branch")
+        .to_string();
+
+    let created = harness
+        .wait_for_event("thread.created", Duration::from_secs(45))
+        .await
+        .expect("wait for thread.created event");
+    let thread = &created["params"]["thread"];
+    let thread_id = thread["id"].as_str().expect("thread id").to_string();
+
+    assert_eq!(thread["project_id"], project_id);
+    assert_eq!(thread["name"], "main");
+    assert_eq!(thread["branch"], default_branch);
+    assert_eq!(thread["source_type"], "main_checkout");
+    assert_eq!(thread["worktree_path"], project_path);
+
+    loop {
+        let event = harness
+            .wait_for_event("thread.progress", Duration::from_secs(45))
+            .await
+            .expect("wait for thread.progress");
+        let params = &event["params"];
+        if params["thread_id"] != thread_id {
+            continue;
+        }
+
+        if let Some(error) = params["error"].as_str() {
+            panic!("default thread creation failed: {error}");
+        }
+
+        if params["step"] == "ready" {
+            break;
+        }
+    }
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
+        .await
+        .expect("list threads");
+    let listed_thread = listed
+        .as_array()
+        .expect("thread.list returns array")
+        .iter()
+        .find(|entry| entry["id"] == thread_id)
+        .expect("auto-created thread listed");
+
+    assert_eq!(listed_thread["status"], "active");
+    assert_eq!(listed_thread["worktree_path"], project_path);
+
+    harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": thread_id, "mode": "close" }),
+        )
+        .await
+        .expect("close auto-created thread");
+    harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await
+        .expect("remove project");
 }
 
 #[tokio::test]

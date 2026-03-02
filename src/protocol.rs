@@ -64,6 +64,8 @@ pub enum SourceType {
     ExistingBranch,
     #[serde(rename = "pull_request")]
     PullRequest,
+    #[serde(rename = "main_checkout")]
+    MainCheckout,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

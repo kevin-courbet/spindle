@@ -80,11 +80,14 @@ impl ThreadService {
 
             let thread_name = sanitize_name(&params.name);
             let branch = resolve_branch(&params, &thread_name)?;
-            let worktree_path = format!(
-                "/home/wsl/dev/.threadmill/{}/{}",
-                sanitize_name(&project.name),
-                thread_name
-            );
+            let worktree_path = match &params.source_type {
+                protocol::SourceType::MainCheckout => project.path.clone(),
+                _ => format!(
+                    "/home/wsl/dev/.threadmill/{}/{}",
+                    sanitize_name(&project.name),
+                    thread_name
+                ),
+            };
             let tmux_session = format!(
                 "tm_{}_{}",
                 short_id(&project.id),
@@ -252,7 +255,7 @@ impl ThreadService {
             port_base,
         )
         .await?;
-        remove_worktree(&project_path, &thread.worktree_path).await?;
+        remove_worktree(&project_path, &thread.worktree_path, &thread.source_type).await?;
 
         {
             let mut store = state.store.lock().await;
@@ -536,7 +539,7 @@ impl ThreadService {
         );
 
         let _ = tmux::kill_session(&thread.tmux_session).await;
-        let _ = remove_worktree(&project_path, &thread.worktree_path).await;
+        let _ = remove_worktree(&project_path, &thread.worktree_path, &thread.source_type).await;
         Ok(())
     }
 
@@ -650,6 +653,16 @@ async fn create_worktree(
     default_branch: &str,
     thread: &Thread,
 ) -> Result<(), String> {
+    if thread.source_type == protocol::SourceType::MainCheckout {
+        if !Path::new(&thread.worktree_path).exists() {
+            return Err(format!(
+                "main checkout path does not exist: {}",
+                thread.worktree_path
+            ));
+        }
+        return Ok(());
+    }
+
     let worktree_parent = Path::new(&thread.worktree_path)
         .parent()
         .ok_or_else(|| format!("invalid worktree path: {}", thread.worktree_path))?;
@@ -711,12 +724,25 @@ async fn create_worktree(
                 .await?;
             }
         }
+        protocol::SourceType::MainCheckout => {}
     }
 
     Ok(())
 }
 
-async fn remove_worktree(project_path: &str, worktree_path: &str) -> Result<(), String> {
+async fn remove_worktree(
+    project_path: &str,
+    worktree_path: &str,
+    source_type: &protocol::SourceType,
+) -> Result<(), String> {
+    if *source_type == protocol::SourceType::MainCheckout {
+        return Ok(());
+    }
+
+    if project_path == worktree_path {
+        return Ok(());
+    }
+
     if !Path::new(worktree_path).exists() {
         return Ok(());
     }
@@ -738,6 +764,10 @@ fn copy_from_main(main_path: &str, worktree_path: &str, relative: &str) -> Resul
     }
 
     let destination = Path::new(worktree_path).join(relative);
+    if source == destination {
+        return Ok(());
+    }
+
     copy_path(&source, &destination)
 }
 

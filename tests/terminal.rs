@@ -69,7 +69,11 @@ async fn wait_for_thread_ready(harness: &mut common::TestHarness, thread_id: &st
     }
 }
 
-async fn cleanup_thread_project(harness: &mut common::TestHarness, thread_id: &str, project_id: &str) {
+async fn cleanup_thread_project(
+    harness: &mut common::TestHarness,
+    thread_id: &str,
+    project_id: &str,
+) {
     let _ = harness
         .rpc(
             "thread.close",

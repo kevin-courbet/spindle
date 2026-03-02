@@ -116,8 +116,12 @@ impl FileService {
         params: protocol::FileGitStatusParams,
     ) -> Result<protocol::FileGitStatusResult, String> {
         let authorized = authorize_requested_path(state, &params.path).await?;
-        let metadata = fs::metadata(&authorized.canonical)
-            .map_err(|err| format!("failed to inspect {}: {err}", authorized.canonical.display()))?;
+        let metadata = fs::metadata(&authorized.canonical).map_err(|err| {
+            format!(
+                "failed to inspect {}: {err}",
+                authorized.canonical.display()
+            )
+        })?;
         if !metadata.is_dir() {
             return Err(format!(
                 "path is not a directory: {}",

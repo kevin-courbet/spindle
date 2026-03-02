@@ -125,7 +125,6 @@ async fn file_list_and_read_enforce_workspace_rules() {
         .await;
 }
 
-
 #[tokio::test]
 async fn file_git_status_returns_modified_entries_for_worktree_files() {
     if !common::tmux_available().await {
@@ -188,8 +187,7 @@ async fn file_git_status_returns_modified_entries_for_worktree_files() {
         .expect("fetch git status");
 
     assert_eq!(
-        status["entries"]["README.md"],
-        "modified",
+        status["entries"]["README.md"], "modified",
         "expected modified tracked file status"
     );
 }

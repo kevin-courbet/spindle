@@ -11,7 +11,7 @@ use tokio::{io::AsyncReadExt, process::Command};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{protocol, state_store::Project, AppState};
+use crate::{protocol, services::thread::ThreadService, state_store::Project, AppState};
 
 pub struct ProjectService;
 
@@ -79,6 +79,26 @@ impl ProjectService {
             state.emit_state_delta(vec![protocol::StateDeltaChange::ProjectAdded {
                 project: protocol_project.clone(),
             }]);
+
+            let state_for_thread = Arc::clone(&state);
+            let project_id = project.id.clone();
+            let default_branch = project.default_branch.clone();
+            tokio::spawn(async move {
+                if let Err(err) = ThreadService::create(
+                    state_for_thread,
+                    protocol::ThreadCreateParams {
+                        project_id: project_id.clone(),
+                        name: "main".to_string(),
+                        source_type: protocol::SourceType::MainCheckout,
+                        branch: Some(default_branch),
+                        pr_url: None,
+                    },
+                )
+                .await
+                {
+                    warn!(project_id = %project_id, error = %err, "failed to create default main thread");
+                }
+            });
         }
 
         Ok(protocol_project)

@@ -262,6 +262,57 @@ async fn thread_close_marks_thread_closed_or_removed() {
 }
 
 #[tokio::test]
+async fn thread_close_main_checkout_keeps_project_root() {
+    if !common::tmux_available().await {
+        eprintln!("skipping thread_close_main_checkout_keeps_project_root: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_project(&mut harness).await;
+
+    let created = harness
+        .wait_for_event("thread.created", Duration::from_secs(45))
+        .await
+        .expect("wait for thread.created event");
+    let thread = &created["params"]["thread"];
+    assert_eq!(thread["name"], "main");
+    assert_eq!(thread["source_type"], "main_checkout");
+    let thread_id = thread["id"].as_str().expect("thread id").to_string();
+
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let project_path = project.repo_path.to_string_lossy().to_string();
+    assert!(Path::new(&project_path).exists());
+
+    harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": thread_id.clone(), "mode": "close" }),
+        )
+        .await
+        .expect("close main-checkout thread");
+
+    assert!(Path::new(&project_path).exists());
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
+        .await
+        .expect("list threads");
+    let listed_thread = listed
+        .as_array()
+        .expect("thread.list returns array")
+        .iter()
+        .find(|entry| entry["id"] == thread_id)
+        .expect("main-checkout thread listed");
+    assert_eq!(listed_thread["status"], "closed");
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
+}
+
+#[tokio::test]
 async fn thread_hide_marks_thread_hidden() {
     if !common::tmux_available().await {
         eprintln!("skipping thread_hide_marks_thread_hidden: tmux unavailable");
@@ -453,12 +504,17 @@ async fn thread_cancel_inflight_creation_marks_failed_and_cleans_worktree() {
         .expect("cancel creating thread");
     assert_eq!(cancelled["status"], "failed");
 
-    let status_event = harness
-        .wait_for_event("thread.status_changed", Duration::from_secs(45))
-        .await
-        .expect("wait for thread.status_changed");
-    assert_eq!(status_event["params"]["thread_id"], thread_id);
-    assert_eq!(status_event["params"]["new"], "failed");
+    loop {
+        let status_event = harness
+            .wait_for_event("thread.status_changed", Duration::from_secs(45))
+            .await
+            .expect("wait for thread.status_changed");
+        if status_event["params"]["thread_id"] != thread_id {
+            continue;
+        }
+        assert_eq!(status_event["params"]["new"], "failed");
+        break;
+    }
 
     let listed = harness
         .rpc("thread.list", json!({ "project_id": project_id.clone() }))
