@@ -118,7 +118,7 @@ impl ThreadService {
         state.emit_thread_created(protocol::ThreadCreatedEvent {
             thread: protocol_thread.clone(),
         });
-        state.emit_state_delta(vec![protocol::StateDeltaChange::ThreadCreated {
+        state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ThreadCreated {
             thread: protocol_thread.clone(),
         }]);
 
@@ -392,29 +392,31 @@ impl ThreadService {
             (thread, project)
         };
 
-        if has_origin_remote(&project.path).await? {
+        if thread.source_type != protocol::SourceType::MainCheckout {
+            if has_origin_remote(&project.path).await? {
+                Self::emit_progress(
+                    &state,
+                    protocol::ThreadProgress {
+                        thread_id: thread.id.clone(),
+                        step: protocol::ThreadProgressStep::Fetching,
+                        message: Some("Fetching origin".to_string()),
+                        error: None,
+                    },
+                );
+                git(&project.path, &["fetch", "origin"]).await?;
+            }
+
             Self::emit_progress(
                 &state,
                 protocol::ThreadProgress {
                     thread_id: thread.id.clone(),
-                    step: protocol::ThreadProgressStep::Fetching,
-                    message: Some("Fetching origin".to_string()),
+                    step: protocol::ThreadProgressStep::CreatingWorktree,
+                    message: Some("Creating git worktree".to_string()),
                     error: None,
                 },
             );
-            git(&project.path, &["fetch", "origin"]).await?;
+            create_worktree(&project.path, &project.default_branch, &thread).await?;
         }
-
-        Self::emit_progress(
-            &state,
-            protocol::ThreadProgress {
-                thread_id: thread.id.clone(),
-                step: protocol::ThreadProgressStep::CreatingWorktree,
-                message: Some("Creating git worktree".to_string()),
-                error: None,
-            },
-        );
-        create_worktree(&project.path, &project.default_branch, &thread).await?;
 
         let config = load_threadmill_config(&thread.worktree_path, &project.path)?;
 
@@ -560,11 +562,13 @@ impl ThreadService {
             old: previous.clone(),
             new: next.clone(),
         });
-        state.emit_state_delta(vec![protocol::StateDeltaChange::ThreadStatusChanged {
-            thread_id: thread_id.to_string(),
-            old: previous,
-            new: next,
-        }]);
+        state.emit_state_delta(vec![
+            protocol::StateDeltaOperationPayload::ThreadStatusChanged {
+                thread_id: thread_id.to_string(),
+                old: previous,
+                new: next,
+            },
+        ]);
         Ok(())
     }
 

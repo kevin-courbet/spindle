@@ -1,7 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+const PROTOCOL_VERSION: &str = "2026-03-17";
 
 #[tokio::test]
 async fn ping_returns_pong() {
@@ -40,6 +42,115 @@ async fn ping_returns_pong() {
     assert_eq!(value["jsonrpc"], "2.0");
     assert_eq!(value["id"], 1);
     assert_eq!(value["result"], "pong");
+
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("join daemon task");
+}
+
+#[tokio::test]
+async fn session_hello_negotiates_protocol_capabilities() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("read listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server_task = tokio::spawn(async move {
+        spindle::serve_listener(listener, shutdown_rx).await;
+    });
+
+    let url = format!("ws://{addr}");
+    let (mut socket, _) = connect_async(url).await.expect("connect websocket");
+
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session.hello",
+        "params": {
+            "client": { "name": "spindle-tests", "version": "dev" },
+            "protocol_version": PROTOCOL_VERSION,
+            "capabilities": [
+                "state.delta.operations.v1",
+                "preset.output.v1",
+                "unknown.capability"
+            ]
+        }
+    });
+
+    socket
+        .send(Message::Text(payload.to_string().into()))
+        .await
+        .expect("send session.hello");
+
+    let text = loop {
+        let frame = socket
+            .next()
+            .await
+            .expect("expected websocket frame")
+            .expect("expected successful websocket frame");
+        if let Message::Text(text) = frame {
+            break text.to_string();
+        }
+    };
+
+    let value: Value = serde_json::from_str(&text).expect("parse json-rpc response");
+    assert_eq!(value["id"], 1);
+    let result = &value["result"];
+    assert!(result["session_id"].is_string());
+    assert_eq!(result["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(
+        result["capabilities"],
+        json!(["state.delta.operations.v1", "preset.output.v1"])
+    );
+    assert!(result["state_version"].is_u64());
+
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("join daemon task");
+}
+
+#[tokio::test]
+async fn request_before_session_hello_returns_structured_error() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("read listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server_task = tokio::spawn(async move {
+        spindle::serve_listener(listener, shutdown_rx).await;
+    });
+
+    let url = format!("ws://{addr}");
+    let (mut socket, _) = connect_async(url).await.expect("connect websocket");
+
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "project.list",
+        "params": {}
+    });
+
+    socket
+        .send(Message::Text(payload.to_string().into()))
+        .await
+        .expect("send project.list");
+
+    let text = loop {
+        let frame = socket
+            .next()
+            .await
+            .expect("expected websocket frame")
+            .expect("expected successful websocket frame");
+        if let Message::Text(text) = frame {
+            break text.to_string();
+        }
+    };
+
+    let value: Value = serde_json::from_str(&text).expect("parse json-rpc response");
+    assert_eq!(value["id"], 1);
+    assert_eq!(value["error"]["code"], -32000);
+    assert_eq!(value["error"]["data"]["kind"], "session.not_initialized");
+    assert_eq!(value["error"]["data"]["retryable"], false);
 
     let _ = shutdown_tx.send(());
     server_task.await.expect("join daemon task");

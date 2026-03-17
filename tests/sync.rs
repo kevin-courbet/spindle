@@ -121,14 +121,20 @@ async fn thread_create_emits_state_delta_with_incremented_version() {
         .expect("state.delta version");
     assert!(delta_version > base_version);
 
-    let changes = delta_event["params"]["changes"]
+    let operations = delta_event["params"]["operations"]
         .as_array()
-        .expect("state.delta changes array");
+        .expect("state.delta operations array");
     assert!(
-        changes.iter().any(|change| {
-            change["type"] == "thread.created" && change["thread"]["id"] == thread_id
+        operations.iter().any(|operation| {
+            operation["type"] == "thread.created" && operation["thread"]["id"] == thread_id
         }),
         "expected thread.created delta for new thread"
+    );
+    assert!(
+        operations
+            .iter()
+            .all(|operation| operation["op_id"].as_str().is_some()),
+        "all operations must include op_id"
     );
 
     wait_for_thread_ready(&mut harness, &thread_id).await;

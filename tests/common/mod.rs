@@ -21,6 +21,13 @@ use uuid::Uuid;
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+const TEST_PROTOCOL_VERSION: &str = "2026-03-17";
+const TEST_CAPABILITIES: &[&str] = &[
+    "state.delta.operations.v1",
+    "preset.output.v1",
+    "rpc.errors.structured.v1",
+];
+
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn test_mutex() -> &'static Mutex<()> {
@@ -34,9 +41,16 @@ pub struct TestHarness {
     next_id: u64,
     events: VecDeque<Value>,
     binaries: VecDeque<Vec<u8>>,
+    last_error_response: Option<Value>,
     cleanup_paths: Vec<PathBuf>,
     previous_config_home: Option<OsString>,
     _guard: MutexGuard<'static, ()>,
+}
+
+pub struct RpcFailure {
+    pub code: i64,
+    pub message: String,
+    pub data: Value,
 }
 
 impl TestHarness {
@@ -57,6 +71,7 @@ impl TestHarness {
             .map_err(|err| format!("failed to send {method}: {err}"))?;
 
         let deadline = Instant::now() + Duration::from_secs(25);
+        self.last_error_response = None;
         loop {
             let frame = self.next_frame(deadline).await?;
             match frame {
@@ -68,6 +83,7 @@ impl TestHarness {
                             return Ok(result.clone());
                         }
                         if let Some(error) = value.get("error") {
+                            self.last_error_response = Some(value.clone());
                             let message = error
                                 .get("message")
                                 .and_then(Value::as_str)
@@ -95,9 +111,34 @@ impl TestHarness {
     }
 
     pub async fn rpc_expect_error(&mut self, method: &str, params: Value) -> String {
+        self.rpc_expect_error_response(method, params).await.message
+    }
+
+    pub async fn rpc_expect_error_response(&mut self, method: &str, params: Value) -> RpcFailure {
         match self.rpc(method, params).await {
             Ok(result) => panic!("expected error from {method}, got result {result}"),
-            Err(message) => message,
+            Err(message) => {
+                let code = self
+                    .last_error_response
+                    .as_ref()
+                    .and_then(|response| response.get("error"))
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                let data = self
+                    .last_error_response
+                    .as_ref()
+                    .and_then(|response| response.get("error"))
+                    .and_then(|error| error.get("data"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+
+                RpcFailure {
+                    code,
+                    message,
+                    data,
+                }
+            }
         }
     }
 
@@ -353,17 +394,36 @@ pub async fn setup_test_server() -> TestHarness {
     let url = format!("ws://{addr}");
     let (socket, _) = connect_async(url).await.expect("connect websocket");
 
-    TestHarness {
+    let mut harness = TestHarness {
         socket,
         shutdown_tx: Some(shutdown_tx),
         server_task,
         next_id: 1,
         events: VecDeque::new(),
         binaries: VecDeque::new(),
+        last_error_response: None,
         cleanup_paths: vec![config_home],
         previous_config_home,
         _guard: guard,
-    }
+    };
+
+    let hello = harness
+        .rpc(
+            "session.hello",
+            json!({
+                "client": {
+                    "name": "spindle-tests",
+                    "version": "dev",
+                },
+                "protocol_version": TEST_PROTOCOL_VERSION,
+                "capabilities": TEST_CAPABILITIES,
+            }),
+        )
+        .await
+        .expect("session.hello");
+    assert!(hello["session_id"].is_string());
+
+    harness
 }
 
 pub async fn tmux_available() -> bool {

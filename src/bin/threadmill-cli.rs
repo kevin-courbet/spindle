@@ -7,6 +7,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_WS_URL: &str = "ws://127.0.0.1:19990";
 const REQUEST_ID: u64 = 1;
+const HELLO_REQUEST_ID: u64 = 0;
+const PROTOCOL_VERSION: &str = "2026-03-17";
+const PROTOCOL_CAPABILITIES: &[&str] = &[
+    "state.delta.operations.v1",
+    "preset.output.v1",
+    "rpc.errors.structured.v1",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "threadmill-cli")]
@@ -258,6 +265,27 @@ async fn rpc_request(
         .await
         .map_err(|err| CliError::connection(format!("failed to connect to {ws_url}: {err}")))?;
 
+    let hello_request = json!({
+        "jsonrpc": "2.0",
+        "id": HELLO_REQUEST_ID,
+        "method": "session.hello",
+        "params": {
+            "client": {
+                "name": "threadmill-cli",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "protocol_version": PROTOCOL_VERSION,
+            "capabilities": PROTOCOL_CAPABILITIES,
+        },
+    });
+
+    socket
+        .send(Message::Text(hello_request.to_string().into()))
+        .await
+        .map_err(|err| CliError::connection(format!("failed to send session.hello: {err}")))?;
+
+    let _ = read_response_by_id(&mut socket, HELLO_REQUEST_ID, "session.hello").await?;
+
     let mut request = json!({
         "jsonrpc": "2.0",
         "id": REQUEST_ID,
@@ -273,6 +301,16 @@ async fn rpc_request(
         .await
         .map_err(|err| CliError::connection(format!("failed to send {method}: {err}")))?;
 
+    read_response_by_id(&mut socket, REQUEST_ID, method).await
+}
+
+async fn read_response_by_id(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    expected_id: u64,
+    method: &str,
+) -> Result<Value, CliError> {
     while let Some(frame) = socket.next().await {
         let frame =
             frame.map_err(|err| CliError::connection(format!("failed to read response: {err}")))?;
@@ -282,7 +320,7 @@ async fn rpc_request(
                 let value: Value = serde_json::from_str(text.as_ref())
                     .map_err(|err| CliError::error(format!("invalid JSON response: {err}")))?;
 
-                if value.get("id") != Some(&json!(REQUEST_ID)) {
+                if value.get("id") != Some(&json!(expected_id)) {
                     continue;
                 }
 

@@ -36,6 +36,7 @@ pub struct AppState {
     events_tx: broadcast::Sender<ServerEvent>,
     next_channel_id: Arc<AtomicU16>,
     state_version: Arc<AtomicU64>,
+    next_operation_id: Arc<AtomicU64>,
     pub store: Arc<Mutex<StateStore>>,
     pub create_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
@@ -53,6 +54,7 @@ impl AppState {
             events_tx,
             next_channel_id: Arc::new(AtomicU16::new(1)),
             state_version: Arc::new(AtomicU64::new(0)),
+            next_operation_id: Arc::new(AtomicU64::new(1)),
             store: Arc::new(Mutex::new(store)),
             create_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -121,17 +123,32 @@ impl AppState {
         self.emit_event("preset.process_event", event);
     }
 
-    pub fn emit_state_delta(&self, changes: Vec<protocol::StateDeltaChange>) {
-        if changes.is_empty() {
+    pub fn emit_preset_output(&self, event: protocol::PresetOutputEvent) {
+        self.emit_event("preset.output", event);
+    }
+
+    pub fn emit_state_delta(&self, operations: Vec<protocol::StateDeltaOperationPayload>) {
+        if operations.is_empty() {
             return;
         }
+
+        let operations = operations
+            .into_iter()
+            .map(|payload| protocol::StateDeltaOperation {
+                op_id: format!(
+                    "op-{}",
+                    self.next_operation_id.fetch_add(1, Ordering::Relaxed)
+                ),
+                payload,
+            })
+            .collect();
 
         let state_version = self.state_version.fetch_add(1, Ordering::Relaxed) + 1;
         self.emit_event(
             "state.delta",
             protocol::StateDeltaEvent {
                 state_version,
-                changes,
+                operations,
             },
         );
     }
@@ -180,6 +197,10 @@ pub async fn serve_listener(listener: TcpListener, mut shutdown_rx: oneshot::Rec
         warn!(error = %err, "failed to persist reconciled state");
     }
 
+    // Start opencode serve if not already running
+    if let Err(err) = services::opencode::ensure_running().await {
+        warn!(error = %err, "failed to start opencode serve at startup");
+    }
     let state = Arc::new(AppState::new(store));
     let local_addr = match listener.local_addr() {
         Ok(addr) => addr,
@@ -245,6 +266,112 @@ impl From<tokio_tungstenite::tungstenite::Error> for ConnectionError {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionSessionState {
+    pub session_id: Option<String>,
+    pub protocol_version: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+impl ConnectionSessionState {
+    pub fn is_initialized(&self) -> bool {
+        self.session_id.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+    pub data: Option<protocol::RpcErrorData>,
+}
+
+impl RpcError {
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    pub fn with_data(mut self, data: protocol::RpcErrorData) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    pub fn parse_error(message: impl Into<String>) -> Self {
+        Self::new(-32700, message).with_data(protocol::RpcErrorData {
+            kind: Some("rpc.parse_error".to_string()),
+            retryable: Some(false),
+            details: None,
+        })
+    }
+
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(-32600, message).with_data(protocol::RpcErrorData {
+            kind: Some("rpc.invalid_request".to_string()),
+            retryable: Some(false),
+            details: None,
+        })
+    }
+
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self::new(-32602, message).with_data(protocol::RpcErrorData {
+            kind: Some("rpc.invalid_params".to_string()),
+            retryable: Some(false),
+            details: None,
+        })
+    }
+
+    pub fn method_not_found(method: &str) -> Self {
+        Self::new(-32601, format!("Method not found: {method}")).with_data(protocol::RpcErrorData {
+            kind: Some("rpc.method_not_found".to_string()),
+            retryable: Some(false),
+            details: Some(json!({ "method": method })),
+        })
+    }
+
+    pub fn session_not_initialized(method: &str) -> Self {
+        Self::new(
+            -32000,
+            format!("session.hello required before calling {method}"),
+        )
+        .with_data(protocol::RpcErrorData {
+            kind: Some("session.not_initialized".to_string()),
+            retryable: Some(false),
+            details: Some(json!({ "method": method })),
+        })
+    }
+
+    pub fn not_found(kind: &str, message: impl Into<String>) -> Self {
+        Self::new(-32004, message).with_data(protocol::RpcErrorData {
+            kind: Some(kind.to_string()),
+            retryable: Some(false),
+            details: None,
+        })
+    }
+
+    pub fn terminal_session_missing(
+        message: impl Into<String>,
+        details: Option<serde_json::Value>,
+    ) -> Self {
+        Self::new(-32041, message).with_data(protocol::RpcErrorData {
+            kind: Some("terminal.session_missing".to_string()),
+            retryable: Some(false),
+            details,
+        })
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(-32001, message).with_data(protocol::RpcErrorData {
+            kind: Some("rpc.internal".to_string()),
+            retryable: Some(false),
+            details: None,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct JsonRpcRequest {
     jsonrpc: String,
@@ -265,6 +392,7 @@ async fn handle_connection(
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
     let connection_state = Arc::new(Mutex::new(TerminalConnectionState::default()));
+    let session_state = Arc::new(Mutex::new(ConnectionSessionState::default()));
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
 
     let writer_task = tokio::spawn(async move {
@@ -316,6 +444,7 @@ async fn handle_connection(
 
                 let outbound_tx = outbound_tx.clone();
                 let connection_state = Arc::clone(&connection_state);
+                let session_state = Arc::clone(&session_state);
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -323,6 +452,7 @@ async fn handle_connection(
                         text.to_string(),
                         state,
                         connection_state,
+                        session_state,
                         outbound_tx.clone(),
                     )
                     .await
@@ -365,17 +495,24 @@ async fn handle_text_message(
     text: String,
     state: Arc<AppState>,
     connection_state: Arc<Mutex<TerminalConnectionState>>,
+    session_state: Arc<Mutex<ConnectionSessionState>>,
     outbound_tx: mpsc::UnboundedSender<Message>,
 ) -> Option<Message> {
     let request: JsonRpcRequest = match serde_json::from_str(&text) {
         Ok(request) => request,
         Err(err) => {
-            return Some(error_response(None, -1, format!("invalid JSON: {err}")));
+            return Some(error_response(
+                None,
+                RpcError::parse_error(format!("invalid JSON: {err}")),
+            ));
         }
     };
 
     if request.jsonrpc != "2.0" {
-        return Some(error_response(request.id, -1, "jsonrpc must be '2.0'"));
+        return Some(error_response(
+            request.id,
+            RpcError::invalid_request("jsonrpc must be '2.0'"),
+        ));
     }
 
     let id = request.id.clone();
@@ -384,16 +521,22 @@ async fn handle_text_message(
         request.params,
         state,
         connection_state,
+        session_state,
         outbound_tx,
     )
     .await;
 
     match (id, result) {
         (Some(id), Ok(result)) => Some(success_response(id, result)),
-        (Some(id), Err(message)) => Some(error_response(Some(id), -1, message)),
+        (Some(id), Err(error)) => Some(error_response(Some(id), error)),
         (None, Ok(_)) => None,
-        (None, Err(message)) => {
-            warn!(error = %message, "notification failed");
+        (None, Err(error)) => {
+            let kind = error
+                .data
+                .as_ref()
+                .and_then(|data| data.kind.as_deref())
+                .unwrap_or("unknown");
+            warn!(code = error.code, kind, error = %error.message, "notification failed");
             None
         }
     }
@@ -411,15 +554,26 @@ fn success_response(id: Value, result: Value) -> Message {
     )
 }
 
-fn error_response(id: Option<Value>, code: i64, message: impl Into<String>) -> Message {
+fn error_response(id: Option<Value>, error: RpcError) -> Message {
+    let mut error_payload = json!({
+        "code": error.code,
+        "message": error.message,
+    });
+
+    if let Some(data) = error.data {
+        if let Some(object) = error_payload.as_object_mut() {
+            object.insert(
+                "data".to_string(),
+                serde_json::to_value(data).unwrap_or(json!({})),
+            );
+        }
+    }
+
     Message::Text(
         json!({
             "jsonrpc": "2.0",
             "id": id.unwrap_or(Value::Null),
-            "error": {
-                "code": code,
-                "message": message.into(),
-            }
+            "error": error_payload,
         })
         .to_string()
         .into(),

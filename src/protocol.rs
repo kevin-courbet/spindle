@@ -4,8 +4,26 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub type StateVersion = u64;
+
+pub const PROTOCOL_VERSION: &str = "2026-03-17";
+pub const SUPPORTED_CAPABILITIES: &[&str] = &[
+    "state.delta.operations.v1",
+    "preset.output.v1",
+    "rpc.errors.structured.v1",
+];
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RpcErrorData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PresetConfig {
@@ -136,6 +154,55 @@ pub struct PresetProcessEvent {
     pub event: PresetProcessKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crash_context: Option<PresetCrashContext>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PresetCrashContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_output: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum PresetOutputStream {
+    #[serde(rename = "stdout")]
+    Stdout,
+    #[serde(rename = "stderr")]
+    Stderr,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PresetOutputEvent {
+    pub thread_id: String,
+    pub preset: String,
+    pub stream: PresetOutputStream,
+    pub chunk: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionHelloClient {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionHelloParams {
+    pub client: SessionHelloClient,
+    pub protocol_version: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionHelloResult {
+    pub session_id: String,
+    pub protocol_version: String,
+    pub capabilities: Vec<String>,
+    pub state_version: StateVersion,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -147,7 +214,7 @@ pub struct StateSnapshot {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
-pub enum StateDeltaChange {
+pub enum StateDeltaOperationPayload {
     #[serde(rename = "project.added")]
     ProjectAdded { project: Project },
     #[serde(rename = "project.removed")]
@@ -169,13 +236,29 @@ pub enum StateDeltaChange {
         event: PresetProcessKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crash_context: Option<PresetCrashContext>,
     },
+    #[serde(rename = "preset.output")]
+    PresetOutput {
+        thread_id: String,
+        preset: String,
+        stream: PresetOutputStream,
+        chunk: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StateDeltaOperation {
+    pub op_id: String,
+    #[serde(flatten)]
+    pub payload: StateDeltaOperationPayload,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StateDeltaEvent {
     pub state_version: StateVersion,
-    pub changes: Vec<StateDeltaChange>,
+    pub operations: Vec<StateDeltaOperation>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -439,6 +522,7 @@ pub struct PresetRestartResult {
     pub ok: bool,
 }
 
+pub const METHOD_SESSION_HELLO: &str = "session.hello";
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
 pub const METHOD_OPENCODE_STATUS: &str = "opencode.status";
@@ -449,6 +533,21 @@ pub const METHOD_PROJECT_CLONE: &str = "project.clone";
 pub const METHOD_PROJECT_REMOVE: &str = "project.remove";
 pub const METHOD_PROJECT_BRANCHES: &str = "project.branches";
 pub const METHOD_PROJECT_BROWSE: &str = "project.browse";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectLookupParams {
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectLookupResult {
+    pub exists: bool,
+    pub is_git_repo: bool,
+    pub project_id: Option<String>,
+}
+
+pub const METHOD_PROJECT_LOOKUP: &str = "project.lookup";
+
 pub const METHOD_FILE_LIST: &str = "file.list";
 pub const METHOD_FILE_READ: &str = "file.read";
 pub const FILE_GIT_STATUS: &str = "file.git_status";
@@ -466,8 +565,33 @@ pub const METHOD_PRESET_STOP: &str = "preset.stop";
 pub const METHOD_PRESET_RESTART: &str = "preset.restart";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SystemStatsParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SystemCleanupParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SystemStatsResult {
+    pub load_avg_1m: f64,
+    pub memory_total_mb: u32,
+    pub memory_used_mb: u32,
+    pub opencode_instances: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SystemCleanupResult {
+    pub cleaned: bool,
+    pub message: String,
+}
+
+pub const METHOD_SYSTEM_STATS: &str = "system.stats";
+pub const METHOD_SYSTEM_CLEANUP: &str = "system.cleanup";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "method", content = "params")]
 pub enum RequestDispatch {
+    #[serde(rename = "session.hello")]
+    SessionHello(SessionHelloParams),
     #[serde(rename = "ping")]
     Ping(PingParams),
     #[serde(rename = "state.snapshot")]
@@ -488,6 +612,8 @@ pub enum RequestDispatch {
     ProjectBranches(ProjectBranchesParams),
     #[serde(rename = "project.browse")]
     ProjectBrowse(ProjectBrowseParams),
+    #[serde(rename = "project.lookup")]
+    ProjectLookup(ProjectLookupParams),
     #[serde(rename = "file.list")]
     FileList(FileListParams),
     #[serde(rename = "file.read")]
@@ -518,6 +644,10 @@ pub enum RequestDispatch {
     PresetStop(PresetStopParams),
     #[serde(rename = "preset.restart")]
     PresetRestart(PresetRestartParams),
+    #[serde(rename = "system.stats")]
+    SystemStats(SystemStatsParams),
+    #[serde(rename = "system.cleanup")]
+    SystemCleanup(SystemCleanupParams),
 }
 
 pub fn parse_request_dispatch(
@@ -525,6 +655,9 @@ pub fn parse_request_dispatch(
     params: serde_json::Value,
 ) -> Result<RequestDispatch, String> {
     match method {
+        METHOD_SESSION_HELLO => serde_json::from_value::<SessionHelloParams>(params)
+            .map(RequestDispatch::SessionHello)
+            .map_err(|err| format!("invalid session.hello params: {err}")),
         METHOD_PING => serde_json::from_value::<PingParams>(params)
             .map(RequestDispatch::Ping)
             .map_err(|err| format!("invalid ping params: {err}")),
@@ -555,6 +688,9 @@ pub fn parse_request_dispatch(
         METHOD_PROJECT_BROWSE => serde_json::from_value::<ProjectBrowseParams>(params)
             .map(RequestDispatch::ProjectBrowse)
             .map_err(|err| format!("invalid project.browse params: {err}")),
+        METHOD_PROJECT_LOOKUP => serde_json::from_value::<ProjectLookupParams>(params)
+            .map(RequestDispatch::ProjectLookup)
+            .map_err(|err| format!("invalid project.lookup params: {err}")),
         METHOD_FILE_LIST => serde_json::from_value::<FileListParams>(params)
             .map(RequestDispatch::FileList)
             .map_err(|err| format!("invalid file.list params: {err}")),
@@ -600,6 +736,12 @@ pub fn parse_request_dispatch(
         METHOD_PRESET_RESTART => serde_json::from_value::<PresetRestartParams>(params)
             .map(RequestDispatch::PresetRestart)
             .map_err(|err| format!("invalid preset.restart params: {err}")),
+        METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
+            .map(RequestDispatch::SystemStats)
+            .map_err(|err| format!("invalid system.stats params: {err}")),
+        METHOD_SYSTEM_CLEANUP => serde_json::from_value::<SystemCleanupParams>(params)
+            .map(RequestDispatch::SystemCleanup)
+            .map_err(|err| format!("invalid system.cleanup params: {err}")),
         _ => Err(format!("unknown method '{method}'")),
     }
 }

@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
+use tokio::process::Command;
 use tokio::time::sleep;
 
 use crate::{
@@ -13,6 +14,11 @@ use crate::{
 };
 
 pub struct PresetService;
+
+const PRESET_MONITOR_POLL: Duration = Duration::from_secs(1);
+const PRESET_CAPTURE_LINES: &str = "-200";
+const PRESET_MAX_CHUNK_BYTES: usize = 8 * 1024;
+const PRESET_MAX_LAST_OUTPUT: usize = 20;
 
 impl PresetService {
     pub async fn start(
@@ -63,6 +69,14 @@ impl PresetService {
             &params.preset,
             protocol::PresetProcessKind::Started,
             None,
+            None,
+        );
+        emit_preset_output(
+            &state,
+            &params.thread_id,
+            &params.preset,
+            protocol::PresetOutputStream::Stdout,
+            format!("{} started", params.preset),
         );
         spawn_preset_monitor(
             Arc::clone(&state),
@@ -96,6 +110,7 @@ impl PresetService {
             &params.thread_id,
             &params.preset,
             protocol::PresetProcessKind::Exited,
+            None,
             None,
         );
 
@@ -180,8 +195,23 @@ async fn start_legacy_preset(
 
 fn spawn_preset_monitor(state: Arc<AppState>, thread_id: String, preset: String, session: String) {
     tokio::spawn(async move {
+        let mut latest_capture = String::new();
         loop {
-            sleep(Duration::from_secs(2)).await;
+            sleep(PRESET_MONITOR_POLL).await;
+
+            if let Ok(capture) = capture_preset_output(&session, &preset).await {
+                if let Some(chunk) = capture_new_chunk(&latest_capture, &capture) {
+                    emit_preset_output(
+                        &state,
+                        &thread_id,
+                        &preset,
+                        protocol::PresetOutputStream::Stdout,
+                        chunk,
+                    );
+                }
+                latest_capture = capture;
+            }
+
             match tmux::window_exists(&session, &preset).await {
                 Ok(true) => continue,
                 Ok(false) => {
@@ -191,16 +221,22 @@ fn spawn_preset_monitor(state: Arc<AppState>, thread_id: String, preset: String,
                         &preset,
                         protocol::PresetProcessKind::Exited,
                         None,
+                        None,
                     );
                     break;
                 }
-                Err(_) => {
+                Err(err) => {
                     emit_preset_event(
                         &state,
                         &thread_id,
                         &preset,
                         protocol::PresetProcessKind::Crashed,
                         None,
+                        Some(protocol::PresetCrashContext {
+                            signal: None,
+                            reason: Some(err),
+                            last_output: tail_lines(&latest_capture, PRESET_MAX_LAST_OUTPUT),
+                        }),
                     );
                     break;
                 }
@@ -215,17 +251,119 @@ fn emit_preset_event(
     preset: &str,
     event: protocol::PresetProcessKind,
     exit_code: Option<i64>,
+    crash_context: Option<protocol::PresetCrashContext>,
 ) {
     state.emit_preset_process_event(protocol::PresetProcessEvent {
         thread_id: thread_id.to_string(),
         preset: preset.to_string(),
         event: event.clone(),
         exit_code,
+        crash_context: crash_context.clone(),
     });
-    state.emit_state_delta(vec![protocol::StateDeltaChange::PresetProcessEvent {
+    state.emit_state_delta(vec![
+        protocol::StateDeltaOperationPayload::PresetProcessEvent {
+            thread_id: thread_id.to_string(),
+            preset: preset.to_string(),
+            event,
+            exit_code,
+            crash_context,
+        },
+    ]);
+}
+
+fn emit_preset_output(
+    state: &AppState,
+    thread_id: &str,
+    preset: &str,
+    stream: protocol::PresetOutputStream,
+    chunk: String,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+
+    state.emit_preset_output(protocol::PresetOutputEvent {
         thread_id: thread_id.to_string(),
         preset: preset.to_string(),
-        event,
-        exit_code,
+        stream: stream.clone(),
+        chunk: chunk.clone(),
+    });
+
+    state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::PresetOutput {
+        thread_id: thread_id.to_string(),
+        preset: preset.to_string(),
+        stream,
+        chunk,
     }]);
+}
+
+async fn capture_preset_output(session: &str, preset: &str) -> Result<String, String> {
+    let target = format!("{session}:{preset}");
+    let output = Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-p",
+            "-t",
+            &target,
+            "-S",
+            PRESET_CAPTURE_LINES,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run tmux capture-pane: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "tmux capture-pane failed for {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut capture = String::from_utf8_lossy(&output.stdout).to_string();
+    if capture.len() > PRESET_MAX_CHUNK_BYTES {
+        let start = capture.len().saturating_sub(PRESET_MAX_CHUNK_BYTES);
+        capture = capture[start..].to_string();
+    }
+    Ok(capture)
+}
+
+fn capture_new_chunk(previous: &str, current: &str) -> Option<String> {
+    if current.is_empty() || current == previous {
+        return None;
+    }
+
+    if !previous.is_empty() && current.starts_with(previous) {
+        let chunk = current[previous.len()..].trim().to_string();
+        if chunk.is_empty() {
+            None
+        } else {
+            Some(chunk)
+        }
+    } else {
+        let chunk = current.trim().to_string();
+        if chunk.is_empty() {
+            None
+        } else {
+            Some(chunk)
+        }
+    }
+}
+
+fn tail_lines(input: &str, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<String>>();
+
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+
+    lines
 }

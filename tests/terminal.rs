@@ -152,13 +152,15 @@ async fn terminal_attach_nonexistent_thread_returns_error() {
     let mut harness = setup_test_server().await;
 
     let error = harness
-        .rpc_expect_error(
+        .rpc_expect_error_response(
             "terminal.attach",
             json!({ "thread_id": "missing", "preset": "terminal" }),
         )
         .await;
 
-    assert!(error.contains("thread not found"), "{error}");
+    assert_eq!(error.code, -32041);
+    assert_eq!(error.data["kind"], "terminal.session_missing");
+    assert!(error.message.contains("thread") || error.message.contains("tmux"));
 }
 
 #[tokio::test]

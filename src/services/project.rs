@@ -11,7 +11,7 @@ use tokio::{io::AsyncReadExt, process::Command};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{protocol, services::thread::ThreadService, state_store::Project, AppState};
+use crate::{protocol, state_store::Project, AppState};
 
 pub struct ProjectService;
 
@@ -28,7 +28,7 @@ impl ProjectService {
             return Err("path does not exist".to_string());
         }
 
-        ensure_git_repo(&path).await?;
+        let is_git_repo = ensure_git_repo(&path).await.is_ok();
 
         let canonical = std::fs::canonicalize(&path)
             .map_err(|err| format!("failed to canonicalize {}: {err}", path.display()))?;
@@ -46,7 +46,11 @@ impl ProjectService {
                 )
             })?
             .to_string();
-        let default_branch = detect_default_branch(&canonical_str).await?;
+        let default_branch = if is_git_repo {
+            detect_default_branch(&canonical_str).await?
+        } else {
+            "main".to_string()
+        };
 
         let (project, is_new) = {
             let mut store = state.store.lock().await;
@@ -76,29 +80,9 @@ impl ProjectService {
             state.emit_project_added(protocol::ProjectAddedEvent {
                 project: protocol_project.clone(),
             });
-            state.emit_state_delta(vec![protocol::StateDeltaChange::ProjectAdded {
+            state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ProjectAdded {
                 project: protocol_project.clone(),
             }]);
-
-            let state_for_thread = Arc::clone(&state);
-            let project_id = project.id.clone();
-            let default_branch = project.default_branch.clone();
-            tokio::spawn(async move {
-                if let Err(err) = ThreadService::create(
-                    state_for_thread,
-                    protocol::ThreadCreateParams {
-                        project_id: project_id.clone(),
-                        name: "main".to_string(),
-                        source_type: protocol::SourceType::MainCheckout,
-                        branch: Some(default_branch),
-                        pr_url: None,
-                    },
-                )
-                .await
-                {
-                    warn!(project_id = %project_id, error = %err, "failed to create default main thread");
-                }
-            });
         }
 
         Ok(protocol_project)
@@ -209,7 +193,7 @@ impl ProjectService {
             state.emit_project_removed(protocol::ProjectRemovedEvent {
                 project_id: params.project_id.clone(),
             });
-            state.emit_state_delta(vec![protocol::StateDeltaChange::ProjectRemoved {
+            state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ProjectRemoved {
                 project_id: params.project_id,
             }]);
         }
@@ -284,6 +268,47 @@ impl ProjectService {
 
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
+    }
+
+    pub async fn lookup(
+        state: Arc<AppState>,
+        params: protocol::ProjectLookupParams,
+    ) -> Result<protocol::ProjectLookupResult, String> {
+        let path = PathBuf::from(&params.path);
+        if !path.is_absolute() {
+            return Err("lookup path must be absolute".to_string());
+        }
+
+        let exists = path.exists();
+        let is_git_repo = if exists && path.is_dir() {
+            is_git_repo_dir(&path)
+        } else {
+            false
+        };
+
+        let project_id = if exists {
+            let canonical = std::fs::canonicalize(&path).ok();
+            let canonical_str = canonical.as_ref().and_then(|candidate| candidate.to_str());
+            if let Some(canonical_str) = canonical_str {
+                let store = state.store.lock().await;
+                store
+                    .data
+                    .projects
+                    .iter()
+                    .find(|project| project.path == canonical_str)
+                    .map(|project| project.id.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(protocol::ProjectLookupResult {
+            exists,
+            is_git_repo,
+            project_id,
+        })
     }
 }
 

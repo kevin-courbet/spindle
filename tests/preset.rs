@@ -114,6 +114,27 @@ async fn preset_start_stop_restart_lifecycle() {
         .expect("start preset");
     assert_eq!(started["ok"], true);
 
+    loop {
+        let output_event = harness
+            .wait_for_event("preset.output", Duration::from_secs(10))
+            .await
+            .expect("wait for preset.output");
+        if output_event["params"]["thread_id"] != thread_id
+            || output_event["params"]["preset"] != "watch"
+        {
+            continue;
+        }
+
+        assert_eq!(output_event["params"]["stream"], "stdout");
+        assert!(
+            output_event["params"]["chunk"]
+                .as_str()
+                .map(|chunk| !chunk.is_empty())
+                .unwrap_or(false)
+        );
+        break;
+    }
+
     let attached = harness
         .rpc(
             "terminal.attach",
