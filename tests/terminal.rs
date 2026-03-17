@@ -158,9 +158,9 @@ async fn terminal_attach_nonexistent_thread_returns_error() {
         )
         .await;
 
-    assert_eq!(error.code, -32041);
-    assert_eq!(error.data["kind"], "terminal.session_missing");
-    assert!(error.message.contains("thread") || error.message.contains("tmux"));
+    assert_eq!(error.code, -32004);
+    assert_eq!(error.data["kind"], "resource.not_found");
+    assert!(error.message.contains("thread not found"));
 }
 
 #[tokio::test]

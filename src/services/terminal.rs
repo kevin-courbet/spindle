@@ -198,7 +198,7 @@ pub async fn attach(
                                 let mut payload = Vec::with_capacity(read_len + 2);
                                 payload.extend_from_slice(&channel_id.to_be_bytes());
                                 payload.extend_from_slice(&buf[..read_len]);
-                                if output_tx.send(Message::Binary(payload.into())).is_err() {
+                                if output_tx.send(Message::Binary(payload)).is_err() {
                                     break;
                                 }
                             }
@@ -281,7 +281,7 @@ pub async fn attach(
             // tmux capture-pane outputs bare LF; terminals need CR+LF
             let normalized = scrollback.replace("\n", "\r\n");
             payload.extend_from_slice(normalized.as_bytes());
-            let _ = outbound_tx.send(Message::Binary(payload.into()));
+            let _ = outbound_tx.send(Message::Binary(payload));
         }
     }
 

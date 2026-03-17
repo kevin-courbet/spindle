@@ -23,13 +23,17 @@ pub async fn dispatch_request(
     session_state: Arc<Mutex<ConnectionSessionState>>,
     outbound_tx: mpsc::UnboundedSender<Message>,
 ) -> Result<Value, RpcError> {
-    if method != protocol::METHOD_SESSION_HELLO && method != protocol::METHOD_PING {
-        let initialized = session_state.lock().await.is_initialized();
-        if !initialized {
-            return Err(RpcError::session_not_initialized(method));
-        }
+    let (handshake_started, initialized) = {
+        let guard = session_state.lock().await;
+        (guard.is_handshake_started(), guard.is_initialized())
+    };
+    if method == protocol::METHOD_SESSION_HELLO && handshake_started {
+        return Err(RpcError::session_already_initialized());
     }
 
+    if method != protocol::METHOD_SESSION_HELLO && method != protocol::METHOD_PING && !initialized {
+        return Err(RpcError::session_not_initialized(method));
+    }
     let params = normalize_params(method, params);
     let request = protocol::parse_request_dispatch(method, params).map_err(|err| {
         if err.starts_with("unknown method") {
@@ -41,32 +45,71 @@ pub async fn dispatch_request(
 
     match request {
         RequestDispatch::SessionHello(params) => {
+            if params.protocol_version != protocol::PROTOCOL_VERSION {
+                return Err(RpcError::session_protocol_mismatch(
+                    &params.protocol_version,
+                    protocol::PROTOCOL_VERSION,
+                ));
+            }
+
+            let required_server_capabilities = if params.required_capabilities.is_empty() {
+                params.capabilities.clone()
+            } else {
+                params.required_capabilities.clone()
+            };
+            let missing_capabilities = required_server_capabilities
+                .iter()
+                .filter(|required| !protocol::SUPPORTED_CAPABILITIES.contains(&required.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing_capabilities.is_empty() {
+                return Err(RpcError::session_missing_capabilities(
+                    &missing_capabilities,
+                ));
+            }
+
+            let missing_client_capabilities = protocol::REQUIRED_CLIENT_CAPABILITIES
+                .iter()
+                .filter(|required| !params.capabilities.iter().any(|cap| cap == **required))
+                .map(|required| (*required).to_string())
+                .collect::<Vec<_>>();
+            if !missing_client_capabilities.is_empty() {
+                return Err(RpcError::session_missing_capabilities(
+                    &missing_client_capabilities,
+                ));
+            }
+
             let negotiated = params
                 .capabilities
                 .into_iter()
                 .filter(|cap| protocol::SUPPORTED_CAPABILITIES.contains(&cap.as_str()))
                 .collect::<Vec<_>>();
+            let required_client_capabilities = protocol::REQUIRED_CLIENT_CAPABILITIES
+                .iter()
+                .map(|cap| (*cap).to_string())
+                .collect::<Vec<_>>();
 
-            let protocol_version = if params.protocol_version == protocol::PROTOCOL_VERSION {
-                params.protocol_version
-            } else {
-                protocol::PROTOCOL_VERSION.to_string()
-            };
-
-            let session_id = format!("session-{}", Uuid::new_v4().simple());
-            {
+            let session_id = {
                 let mut guard = session_state.lock().await;
+                if guard.is_handshake_started() {
+                    return Err(RpcError::session_already_initialized());
+                }
+
+                let session_id = format!("session-{}", Uuid::new_v4().simple());
                 guard.session_id = Some(session_id.clone());
-                guard.protocol_version = Some(protocol_version.clone());
+                guard.protocol_version = Some(protocol::PROTOCOL_VERSION.to_string());
                 guard.capabilities = negotiated.clone();
-            }
+                guard.hello_acknowledged = false;
+                session_id
+            };
 
             to_value(
                 "session.hello",
                 protocol::SessionHelloResult {
                     session_id,
-                    protocol_version,
+                    protocol_version: protocol::PROTOCOL_VERSION.to_string(),
                     capabilities: negotiated,
+                    required_capabilities: required_client_capabilities,
                     state_version: state.state_version(),
                 },
             )
@@ -303,7 +346,52 @@ fn terminal_attach_session_missing(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::map_service_error;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio::sync::{mpsc, Mutex};
+
+    use super::{dispatch_request, map_service_error};
+    use crate::{
+        protocol,
+        services::terminal::TerminalConnectionState,
+        state_store::{AppData, StateStore},
+        AppState, ConnectionSessionState,
+    };
+
+    #[tokio::test]
+    async fn session_hello_stays_pending_until_acknowledged() {
+        let state = Arc::new(AppState::new(StateStore {
+            path: std::env::temp_dir().join("threadmill-session-hello-state.json"),
+            data: AppData::default(),
+        }));
+        let connection_state = Arc::new(Mutex::new(TerminalConnectionState::default()));
+        let session_state = Arc::new(Mutex::new(ConnectionSessionState::default()));
+        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+
+        let result = dispatch_request(
+            protocol::METHOD_SESSION_HELLO,
+            json!({
+                "client": { "name": "spindle-tests", "version": "dev" },
+                "protocol_version": protocol::PROTOCOL_VERSION,
+                "capabilities": protocol::SUPPORTED_CAPABILITIES,
+            }),
+            state,
+            connection_state,
+            Arc::clone(&session_state),
+            outbound_tx,
+        )
+        .await
+        .expect("session.hello should negotiate successfully");
+
+        let guard = session_state.lock().await;
+        assert_eq!(guard.session_id.as_deref(), result["session_id"].as_str());
+        assert!(guard.is_handshake_started());
+        assert!(
+            !guard.is_initialized(),
+            "session.hello should stay pending until its success response is queued"
+        );
+    }
 
     #[test]
     fn terminal_attach_missing_session_maps_to_terminal_session_missing() {

@@ -271,11 +271,25 @@ pub struct ConnectionSessionState {
     pub session_id: Option<String>,
     pub protocol_version: Option<String>,
     pub capabilities: Vec<String>,
+    pub hello_acknowledged: bool,
 }
 
 impl ConnectionSessionState {
     pub fn is_initialized(&self) -> bool {
+        self.hello_acknowledged && self.session_id.is_some()
+    }
+
+    pub fn is_handshake_started(&self) -> bool {
         self.session_id.is_some()
+    }
+
+    pub fn mark_hello_acknowledged(&mut self) -> bool {
+        if self.session_id.is_none() || self.hello_acknowledged {
+            return false;
+        }
+
+        self.hello_acknowledged = true;
+        true
     }
 }
 
@@ -344,6 +358,49 @@ impl RpcError {
         })
     }
 
+    pub fn session_already_initialized() -> Self {
+        Self::new(
+            -32600,
+            "session.hello may only be called once per connection",
+        )
+        .with_data(protocol::RpcErrorData {
+            kind: Some("session.already_initialized".to_string()),
+            retryable: Some(false),
+            details: None,
+        })
+    }
+
+    pub fn session_protocol_mismatch(client_version: &str, expected_version: &str) -> Self {
+        Self::new(
+            -32602,
+            format!(
+                "unsupported protocol_version '{client_version}', expected '{expected_version}'"
+            ),
+        )
+        .with_data(protocol::RpcErrorData {
+            kind: Some("session.protocol_mismatch".to_string()),
+            retryable: Some(false),
+            details: Some(json!({
+                "client_protocol_version": client_version,
+                "expected_protocol_version": expected_version,
+            })),
+        })
+    }
+
+    pub fn session_missing_capabilities(missing: &[String]) -> Self {
+        Self::new(
+            -32602,
+            format!("missing required capabilities: {}", missing.join(", ")),
+        )
+        .with_data(protocol::RpcErrorData {
+            kind: Some("session.missing_capabilities".to_string()),
+            retryable: Some(false),
+            details: Some(json!({
+                "missing": missing,
+            })),
+        })
+    }
+
     pub fn not_found(kind: &str, message: impl Into<String>) -> Self {
         Self::new(-32004, message).with_data(protocol::RpcErrorData {
             kind: Some(kind.to_string()),
@@ -403,34 +460,8 @@ async fn handle_connection(
         }
     });
 
-    let events_task = {
-        let outbound_tx = outbound_tx.clone();
-        let mut events_rx = state.events_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match events_rx.recv().await {
-                    Ok(event) => {
-                        let message = Message::Text(
-                            json!({
-                                "jsonrpc": "2.0",
-                                "method": event.method,
-                                "params": event.params,
-                            })
-                            .to_string()
-                            .into(),
-                        );
-                        if outbound_tx.send(message).is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "event subscriber lagged");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
-    };
+    let deferred_events_rx = Arc::new(Mutex::new(Some(state.events_tx.subscribe())));
+    let events_task = Arc::new(Mutex::new(None::<JoinHandle<()>>));
 
     info!(%connection_id, %peer_addr, "client connected");
 
@@ -446,18 +477,29 @@ async fn handle_connection(
                 let connection_state = Arc::clone(&connection_state);
                 let session_state = Arc::clone(&session_state);
                 let state = Arc::clone(&state);
+                let deferred_events_rx = Arc::clone(&deferred_events_rx);
+                let events_task = Arc::clone(&events_task);
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Some(response) = handle_text_message(
                         text.to_string(),
                         state,
                         connection_state,
-                        session_state,
+                        session_state.clone(),
                         outbound_tx.clone(),
                     )
                     .await
                     {
-                        let _ = outbound_tx.send(response);
+                        let activate_events = response.activate_events;
+                        if outbound_tx.send(response.message).is_ok() && activate_events {
+                            activate_session_events(
+                                session_state,
+                                deferred_events_rx,
+                                events_task,
+                                outbound_tx,
+                            )
+                            .await;
+                        }
                     }
                 });
             }
@@ -483,12 +525,68 @@ async fn handle_connection(
     }
 
     terminal::cleanup_connection(Arc::clone(&connection_state)).await;
-    events_task.abort();
+    if let Some(events_task) = events_task.lock().await.take() {
+        events_task.abort();
+        let _ = events_task.await;
+    }
     writer_task.abort();
-    let _ = events_task.await;
     let _ = writer_task.await;
     info!(%connection_id, "client disconnected");
     Ok(())
+}
+
+struct TextMessageResponse {
+    message: Message,
+    activate_events: bool,
+}
+
+async fn activate_session_events(
+    session_state: Arc<Mutex<ConnectionSessionState>>,
+    deferred_events_rx: Arc<Mutex<Option<broadcast::Receiver<ServerEvent>>>>,
+    events_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    outbound_tx: mpsc::UnboundedSender<Message>,
+) {
+    let should_activate = {
+        let mut guard = session_state.lock().await;
+        guard.mark_hello_acknowledged()
+    };
+    if !should_activate {
+        return;
+    }
+
+    let Some(mut events_rx) = deferred_events_rx.lock().await.take() else {
+        return;
+    };
+
+    let task = tokio::spawn(async move {
+        loop {
+            match events_rx.recv().await {
+                Ok(event) => {
+                    let message = Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": event.method,
+                            "params": event.params,
+                        })
+                        .to_string(),
+                    );
+                    if outbound_tx.send(message).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "event subscriber lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let mut task_slot = events_task.lock().await;
+    if let Some(existing_task) = task_slot.replace(task) {
+        existing_task.abort();
+        let _ = existing_task.await;
+    }
 }
 
 async fn handle_text_message(
@@ -497,22 +595,28 @@ async fn handle_text_message(
     connection_state: Arc<Mutex<TerminalConnectionState>>,
     session_state: Arc<Mutex<ConnectionSessionState>>,
     outbound_tx: mpsc::UnboundedSender<Message>,
-) -> Option<Message> {
+) -> Option<TextMessageResponse> {
     let request: JsonRpcRequest = match serde_json::from_str(&text) {
         Ok(request) => request,
         Err(err) => {
-            return Some(error_response(
-                None,
-                RpcError::parse_error(format!("invalid JSON: {err}")),
-            ));
+            return Some(TextMessageResponse {
+                message: error_response(
+                    None,
+                    RpcError::parse_error(format!("invalid JSON: {err}")),
+                ),
+                activate_events: false,
+            });
         }
     };
 
     if request.jsonrpc != "2.0" {
-        return Some(error_response(
-            request.id,
-            RpcError::invalid_request("jsonrpc must be '2.0'"),
-        ));
+        return Some(TextMessageResponse {
+            message: error_response(
+                request.id,
+                RpcError::invalid_request("jsonrpc must be '2.0'"),
+            ),
+            activate_events: false,
+        });
     }
 
     let id = request.id.clone();
@@ -526,9 +630,16 @@ async fn handle_text_message(
     )
     .await;
 
+    let activate_events = request.method == protocol::METHOD_SESSION_HELLO;
     match (id, result) {
-        (Some(id), Ok(result)) => Some(success_response(id, result)),
-        (Some(id), Err(error)) => Some(error_response(Some(id), error)),
+        (Some(id), Ok(result)) => Some(TextMessageResponse {
+            message: success_response(id, result),
+            activate_events,
+        }),
+        (Some(id), Err(error)) => Some(TextMessageResponse {
+            message: error_response(Some(id), error),
+            activate_events: false,
+        }),
         (None, Ok(_)) => None,
         (None, Err(error)) => {
             let kind = error
@@ -549,8 +660,7 @@ fn success_response(id: Value, result: Value) -> Message {
             "id": id,
             "result": result,
         })
-        .to_string()
-        .into(),
+        .to_string(),
     )
 }
 
@@ -575,7 +685,6 @@ fn error_response(id: Option<Value>, error: RpcError) -> Message {
             "id": id.unwrap_or(Value::Null),
             "error": error_payload,
         })
-        .to_string()
-        .into(),
+        .to_string(),
     )
 }

@@ -126,12 +126,10 @@ async fn preset_start_stop_restart_lifecycle() {
         }
 
         assert_eq!(output_event["params"]["stream"], "stdout");
-        assert!(
-            output_event["params"]["chunk"]
-                .as_str()
-                .map(|chunk| !chunk.is_empty())
-                .unwrap_or(false)
-        );
+        assert!(output_event["params"]["chunk"]
+            .as_str()
+            .map(|chunk| !chunk.is_empty())
+            .unwrap_or(false));
         break;
     }
 

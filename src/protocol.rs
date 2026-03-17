@@ -15,6 +15,12 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "rpc.errors.structured.v1",
 ];
 
+pub const REQUIRED_CLIENT_CAPABILITIES: &[&str] = &[
+    "state.delta.operations.v1",
+    "preset.output.v1",
+    "rpc.errors.structured.v1",
+];
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct RpcErrorData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +201,8 @@ pub struct SessionHelloParams {
     pub client: SessionHelloClient,
     pub protocol_version: String,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -202,6 +210,7 @@ pub struct SessionHelloResult {
     pub session_id: String,
     pub protocol_version: String,
     pub capabilities: Vec<String>,
+    pub required_capabilities: Vec<String>,
     pub state_version: StateVersion,
 }
 

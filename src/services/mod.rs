@@ -39,3 +39,4 @@ pub fn sanitize_name(value: &str) -> String {
 pub fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
 }
+pub mod system;

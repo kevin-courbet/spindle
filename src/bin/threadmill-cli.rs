@@ -280,7 +280,7 @@ async fn rpc_request(
     });
 
     socket
-        .send(Message::Text(hello_request.to_string().into()))
+        .send(Message::Text(hello_request.to_string()))
         .await
         .map_err(|err| CliError::connection(format!("failed to send session.hello: {err}")))?;
 
@@ -297,7 +297,7 @@ async fn rpc_request(
     }
 
     socket
-        .send(Message::Text(request.to_string().into()))
+        .send(Message::Text(request.to_string()))
         .await
         .map_err(|err| CliError::connection(format!("failed to send {method}: {err}")))?;
 
