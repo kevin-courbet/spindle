@@ -288,13 +288,6 @@ fn emit_preset_output(
         stream: stream.clone(),
         chunk: chunk.clone(),
     });
-
-    state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::PresetOutput {
-        thread_id: thread_id.to_string(),
-        preset: preset.to_string(),
-        stream,
-        chunk,
-    }]);
 }
 
 async fn capture_preset_output(session: &str, preset: &str) -> Result<String, String> {
@@ -320,11 +313,21 @@ async fn capture_preset_output(session: &str, preset: &str) -> Result<String, St
     }
 
     let mut capture = String::from_utf8_lossy(&output.stdout).to_string();
-    if capture.len() > PRESET_MAX_CHUNK_BYTES {
-        let start = capture.len().saturating_sub(PRESET_MAX_CHUNK_BYTES);
-        capture = capture[start..].to_string();
-    }
+    truncate_utf8_tail(&mut capture, PRESET_MAX_CHUNK_BYTES);
     Ok(capture)
+}
+
+fn truncate_utf8_tail(input: &mut String, max_bytes: usize) {
+    if input.len() <= max_bytes {
+        return;
+    }
+
+    let mut start = input.len().saturating_sub(max_bytes);
+    while start < input.len() && !input.is_char_boundary(start) {
+        start += 1;
+    }
+
+    input.drain(..start);
 }
 
 fn capture_new_chunk(previous: &str, current: &str) -> Option<String> {
@@ -332,21 +335,30 @@ fn capture_new_chunk(previous: &str, current: &str) -> Option<String> {
         return None;
     }
 
-    if !previous.is_empty() && current.starts_with(previous) {
-        let chunk = current[previous.len()..].trim().to_string();
-        if chunk.is_empty() {
-            None
-        } else {
-            Some(chunk)
-        }
+    let overlap = suffix_prefix_overlap(previous, current);
+    let chunk = current[overlap..].trim().to_string();
+    if chunk.is_empty() {
+        None
     } else {
-        let chunk = current.trim().to_string();
-        if chunk.is_empty() {
-            None
-        } else {
-            Some(chunk)
+        Some(chunk)
+    }
+}
+
+fn suffix_prefix_overlap(previous: &str, current: &str) -> usize {
+    let max_overlap = previous.len().min(current.len());
+
+    for overlap in (1..=max_overlap).rev() {
+        let previous_start = previous.len() - overlap;
+        if !previous.is_char_boundary(previous_start) || !current.is_char_boundary(overlap) {
+            continue;
+        }
+
+        if previous[previous_start..] == current[..overlap] {
+            return overlap;
         }
     }
+
+    0
 }
 
 fn tail_lines(input: &str, max_lines: usize) -> Vec<String> {
@@ -366,4 +378,29 @@ fn tail_lines(input: &str, max_lines: usize) -> Vec<String> {
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture_new_chunk, truncate_utf8_tail};
+
+    #[test]
+    fn capture_new_chunk_only_emits_new_tail_after_rollover() {
+        let previous = "line1\nline2\nline3\n";
+        let current = "line2\nline3\nline4\n";
+
+        assert_eq!(
+            capture_new_chunk(previous, current),
+            Some("line4".to_string())
+        );
+    }
+
+    #[test]
+    fn truncate_utf8_tail_drops_partial_leading_scalar() {
+        let mut capture = "ab🙂cd".to_string();
+
+        truncate_utf8_tail(&mut capture, 5);
+
+        assert_eq!(capture, "cd");
+    }
 }

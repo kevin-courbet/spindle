@@ -568,9 +568,6 @@ pub const METHOD_PRESET_RESTART: &str = "preset.restart";
 pub struct SystemStatsParams {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SystemCleanupParams {}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsResult {
     pub load_avg_1m: f64,
     pub memory_total_mb: u32,
@@ -578,14 +575,7 @@ pub struct SystemStatsResult {
     pub opencode_instances: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SystemCleanupResult {
-    pub cleaned: bool,
-    pub message: String,
-}
-
 pub const METHOD_SYSTEM_STATS: &str = "system.stats";
-pub const METHOD_SYSTEM_CLEANUP: &str = "system.cleanup";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "method", content = "params")]
@@ -646,8 +636,6 @@ pub enum RequestDispatch {
     PresetRestart(PresetRestartParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
-    #[serde(rename = "system.cleanup")]
-    SystemCleanup(SystemCleanupParams),
 }
 
 pub fn parse_request_dispatch(
@@ -739,9 +727,6 @@ pub fn parse_request_dispatch(
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),
-        METHOD_SYSTEM_CLEANUP => serde_json::from_value::<SystemCleanupParams>(params)
-            .map(RequestDispatch::SystemCleanup)
-            .map_err(|err| format!("invalid system.cleanup params: {err}")),
         _ => Err(format!("unknown method '{method}'")),
     }
 }

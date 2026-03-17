@@ -78,12 +78,6 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("system.stats", message))?;
             to_value("system.stats", stats)
         }
-        RequestDispatch::SystemCleanup(params) => {
-            let result = SystemService::cleanup(params)
-                .await
-                .map_err(|message| map_service_error("system.cleanup", message))?;
-            to_value("system.cleanup", result)
-        }
         RequestDispatch::StateSnapshot(_) => {
             let (projects, threads) = {
                 let store = state.store.lock().await;
@@ -262,8 +256,7 @@ fn normalize_params(method: &str, params: Value) -> Value {
         | protocol::METHOD_OPENCODE_ENSURE
         | protocol::METHOD_PROJECT_LIST
         | protocol::METHOD_THREAD_LIST
-        | protocol::METHOD_SYSTEM_STATS
-        | protocol::METHOD_SYSTEM_CLEANUP => json!({}),
+        | protocol::METHOD_SYSTEM_STATS => json!({}),
         _ => Value::Null,
     }
 }
@@ -274,7 +267,7 @@ fn to_value<T: serde::Serialize>(method: &str, value: T) -> Result<Value, RpcErr
 }
 
 fn map_service_error(method: &str, message: String) -> RpcError {
-    if method == "terminal.attach" {
+    if method == "terminal.attach" && terminal_attach_session_missing(&message) {
         return RpcError::terminal_session_missing(message, Some(json!({ "method": method })));
     }
 
@@ -299,4 +292,44 @@ fn map_service_error(method: &str, message: String) -> RpcError {
     }
 
     RpcError::internal(message)
+}
+
+fn terminal_attach_session_missing(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("tmux session not running")
+        || message.contains("can't find session")
+        || message.contains("no such session")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_service_error;
+
+    #[test]
+    fn terminal_attach_missing_session_maps_to_terminal_session_missing() {
+        let error = map_service_error(
+            "terminal.attach",
+            "tmux list-panes failed for tm_thread:terminal: can't find session: tm_thread"
+                .to_string(),
+        );
+
+        assert_eq!(error.code, -32041);
+        let data = error
+            .data
+            .expect("terminal attach missing-session error should include data");
+        assert_eq!(data.kind.as_deref(), Some("terminal.session_missing"));
+    }
+
+    #[test]
+    fn terminal_attach_infra_failure_stays_internal() {
+        let error = map_service_error(
+            "terminal.attach",
+            "failed to run mkfifo for /tmp/threadmill-in: Resource temporarily unavailable"
+                .to_string(),
+        );
+
+        assert_eq!(error.code, -32001);
+        let data = error.data.expect("internal errors should include data");
+        assert_eq!(data.kind.as_deref(), Some("rpc.internal"));
+    }
 }
