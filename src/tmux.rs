@@ -41,7 +41,7 @@ pub async fn set_session_environment(
 }
 
 pub async fn create_session(name: &str, cwd: &str, env: &[(String, String)]) -> Result<(), String> {
-    tmux_run(&["new-session", "-d", "-s", name, "-c", cwd]).await?;
+    tmux_run(&["new-session", "-d", "-s", name, "-n", "terminal", "-c", cwd]).await?;
     set_session_environment(name, env).await
 }
 

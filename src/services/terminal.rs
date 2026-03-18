@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, sync::Arc, time::Duration};
 
 use serde_json::{json, Value};
 use tokio::{
@@ -23,6 +23,7 @@ pub struct TerminalConnectionState {
     by_channel: HashMap<u16, Attachment>,
     by_target: HashMap<String, u16>,
     attaching_targets: HashMap<String, u16>,
+    replayable_targets: HashSet<String>,
 }
 
 struct Attachment {
@@ -265,23 +266,29 @@ pub async fn attach(
     };
 
     let pane_target_for_replay = attachment.pane_target.clone();
-
-    {
+    let should_replay = {
         let mut guard = connection_state.lock().await;
+        let should_replay =
+            should_replay_scrollback(&params.preset, guard.replayable_targets.contains(&target_key));
         guard.attaching_targets.remove(&target_key);
-        guard.by_target.insert(target_key, channel_id);
+        guard.by_target.insert(target_key.clone(), channel_id);
         guard.by_channel.insert(channel_id, attachment);
-    }
+        guard.replayable_targets.insert(target_key.clone());
+        should_replay
+    };
 
-    // Replay scrollback so reconnecting clients see recent history
-    if let Ok(scrollback) = capture_pane_scrollback(&pane_target_for_replay).await {
-        if !scrollback.is_empty() {
-            let mut payload = Vec::with_capacity(scrollback.len() + 2);
-            payload.extend_from_slice(&channel_id.to_be_bytes());
-            // tmux capture-pane outputs bare LF; terminals need CR+LF
-            let normalized = scrollback.replace("\n", "\r\n");
-            payload.extend_from_slice(normalized.as_bytes());
-            let _ = outbound_tx.send(Message::Binary(payload));
+    if should_replay {
+        if let Ok(scrollback) = capture_pane_scrollback(&pane_target_for_replay).await {
+            if !scrollback.is_empty() {
+                let mut payload = Vec::with_capacity(scrollback.len() + 2);
+                payload.extend_from_slice(&channel_id.to_be_bytes());
+                // tmux capture-pane outputs bare LF; terminals need CR+LF
+                let normalized = scrollback.replace("
+", "
+");
+                payload.extend_from_slice(normalized.as_bytes());
+                let _ = outbound_tx.send(Message::Binary(payload));
+            }
         }
     }
 
@@ -420,7 +427,22 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
 }
 
 async fn resolve_pane_target(session: &str, preset: &str) -> Result<String, String> {
-    let target = format!("{session}:{preset}");
+    let windows_output = Command::new("tmux")
+        .args(["list-windows", "-t", session, "-F", "#{window_index}	#{window_name}"])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run tmux list-windows: {err}"))?;
+
+    if !windows_output.status.success() {
+        return Err(format!(
+            "tmux list-windows failed for {session}: {}",
+            String::from_utf8_lossy(&windows_output.stderr).trim()
+        ));
+    }
+
+    let windows = String::from_utf8_lossy(&windows_output.stdout);
+    let target = select_window_target(session, preset, &windows)
+        .ok_or_else(|| format!("no window available for {session}:{preset}"))?;
     let output = Command::new("tmux")
         .args(["list-panes", "-t", &target, "-F", "#{pane_id}"])
         .output()
@@ -444,9 +466,40 @@ async fn resolve_pane_target(session: &str, preset: &str) -> Result<String, Stri
     Ok(pane)
 }
 
+fn select_window_target(session: &str, preset: &str, windows: &str) -> Option<String> {
+    let mut matching_indices: Vec<u32> = windows
+        .lines()
+        .filter_map(|line| {
+            let (index, name) = line.split_once('\t')?;
+            let parsed = index.trim().parse::<u32>().ok()?;
+            if name.trim() == preset {
+                Some(parsed)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    matching_indices.sort_unstable();
+    if let Some(index) = matching_indices.first() {
+        return Some(format!("{session}:{index}"));
+    }
+
+    if preset == "terminal" {
+        let first_index = windows
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter_map(|(index, _)| index.trim().parse::<u32>().ok())
+            .min()?;
+        return Some(format!("{session}:{first_index}"));
+    }
+
+    None
+}
+
 async fn capture_pane_scrollback(pane_target: &str) -> Result<String, String> {
     let output = Command::new("tmux")
-        .args(["capture-pane", "-p", "-t", pane_target, "-S", "-1000"])
+        .args(["capture-pane", "-e", "-p", "-J", "-t", pane_target, "-S", "-200"])
         .output()
         .await
         .map_err(|err| format!("failed to run tmux capture-pane: {err}"))?;
@@ -458,9 +511,67 @@ async fn capture_pane_scrollback(pane_target: &str) -> Result<String, String> {
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(sanitize_scrollback(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn should_replay_scrollback(preset: &str, target_seen_before: bool) -> bool {
+    target_seen_before || preset != "terminal"
+}
+
+fn sanitize_scrollback(scrollback: &str) -> String {
+    let lines: Vec<&str> = scrollback.lines().collect();
+    let Some(start) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let Some(end) = lines.iter().rposition(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+
+    lines[start..=end].join("
+")
 }
 
 fn target_key(thread_id: &str, preset: &str) -> String {
     format!("{thread_id}:{preset}")
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_scrollback, should_replay_scrollback};
+
+    #[test]
+    fn sanitize_scrollback_trims_leading_and_trailing_blank_lines() {
+        let input = "
+
+first prompt
+
+
+second line
+
+";
+        assert_eq!(sanitize_scrollback(input), "first prompt
+
+
+second line");
+    }
+
+    #[test]
+    fn first_terminal_attach_skips_scrollback_replay() {
+        assert!(!should_replay_scrollback("terminal", false));
+        assert!(should_replay_scrollback("terminal", true));
+        assert!(should_replay_scrollback("dev-server", false));
+    }
+
+    #[test]
+    fn select_window_target_prefers_named_terminal_window_then_falls_back() {
+        let windows = "1	zsh
+2	terminal
+3	terminal
+";
+        assert_eq!(super::select_window_target("sess", "terminal", windows).as_deref(), Some("sess:2"));
+        assert_eq!(super::select_window_target("sess", "dev-server", windows), None);
+        assert_eq!(super::select_window_target("sess", "terminal", "1	zsh
+").as_deref(), Some("sess:1"));
+    }
 }

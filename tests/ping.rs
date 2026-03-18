@@ -732,7 +732,7 @@ async fn uninitialized_connection_does_not_receive_events() {
         .await
         .expect("send project.add");
 
-    let _project_add_response = loop {
+    let project_add_response = loop {
         let frame = initialized_socket
             .next()
             .await
@@ -746,9 +746,13 @@ async fn uninitialized_connection_does_not_receive_events() {
         }
     };
     assert!(
-        _project_add_response["result"].is_object(),
+        project_add_response["result"].is_object(),
         "project.add should succeed before checking event leakage"
     );
+    let project_id = project_add_response["result"]["id"]
+        .as_str()
+        .expect("project.add should return project id")
+        .to_string();
 
     let leaked_event = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
@@ -763,6 +767,32 @@ async fn uninitialized_connection_does_not_receive_events() {
         }
     })
     .await;
+
+    let remove_payload = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "project.remove",
+        "params": {
+            "project_id": project_id,
+        }
+    });
+    initialized_socket
+        .send(Message::Text(remove_payload.to_string()))
+        .await
+        .expect("send project.remove");
+    let _project_remove_response = loop {
+        let frame = initialized_socket
+            .next()
+            .await
+            .expect("expected websocket frame")
+            .expect("expected successful websocket frame");
+        if let Message::Text(text) = frame {
+            let value: Value = serde_json::from_str(&text).expect("parse project.remove response");
+            if value["id"] == 3 {
+                break value;
+            }
+        }
+    };
 
     let _ = fs::remove_dir_all(&repo_path);
 
