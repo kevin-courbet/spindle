@@ -166,7 +166,8 @@ async fn preset_start_stop_restart_lifecycle() {
         )
         .await;
     assert!(
-        attach_error.contains("tmux list-panes failed"),
+        attach_error.contains("tmux list-panes failed")
+            || attach_error.contains("no window available"),
         "{attach_error}"
     );
 

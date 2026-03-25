@@ -26,6 +26,8 @@ pub struct ThreadmillConfig {
     #[serde(default)]
     pub presets: HashMap<String, PresetDefinition>,
     #[serde(default)]
+    pub agents: HashMap<String, AgentDefinition>,
+    #[serde(default)]
     pub ports: PortsConfig,
 }
 
@@ -64,6 +66,14 @@ pub struct PresetDefinition {
     pub parallel: bool,
     #[serde(default)]
     pub autostart: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AgentDefinition {
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl ThreadService {
@@ -170,18 +180,17 @@ impl ThreadService {
     ) -> Result<protocol::ThreadCancelResult, String> {
         {
             let store = state.store.lock().await;
-            let thread = store
+            store
                 .thread_by_id(&params.thread_id)
                 .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
-            if thread.status != protocol::ThreadStatus::Creating {
-                return Err(format!("thread {} is not creating", params.thread_id));
-            }
         }
 
         let handle = {
             let mut create_tasks = state.create_tasks.lock().await;
             create_tasks.remove(&params.thread_id)
         };
+
+
         if let Some(handle) = handle {
             handle.abort();
         }
@@ -354,6 +363,7 @@ impl ThreadService {
                     protocol::PresetStartParams {
                         thread_id: thread.id.clone(),
                         preset: preset_name.clone(),
+                        session_id: None,
                     },
                 )
                 .await;
@@ -475,6 +485,7 @@ impl ThreadService {
                     protocol::PresetStartParams {
                         thread_id: thread.id.clone(),
                         preset: preset_name.clone(),
+                        session_id: None,
                     },
                 )
                 .await?;
@@ -483,6 +494,15 @@ impl ThreadService {
 
         {
             let mut store = state.store.lock().await;
+            let status = store
+                .thread_by_id(&thread.id)
+                .ok_or_else(|| format!("thread not found: {}", thread.id))?
+                .status
+                .clone();
+            if status != protocol::ThreadStatus::Creating {
+                return Ok(());
+            }
+
             Self::set_status_locked(
                 &state,
                 &mut store,
@@ -628,6 +648,7 @@ fn default_threadmill_config() -> ThreadmillConfig {
         teardown: Vec::new(),
         copy_from_main: Vec::new(),
         presets,
+        agents: HashMap::new(),
         ports: PortsConfig::default(),
     }
 }

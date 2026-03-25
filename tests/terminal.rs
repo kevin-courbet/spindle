@@ -290,3 +290,115 @@ async fn reattach_receives_scrollback_replay() {
         }
     }
 }
+
+/// First terminal attach must deliver scrollback containing the shell prompt
+/// without any user input. Previously, first attach used capture_pane_visible
+/// instead of scrollback, so the prompt was missing until Enter was pressed.
+#[tokio::test]
+async fn first_terminal_attach_delivers_prompt_without_input() {
+    if !common::tmux_available().await {
+        eprintln!("skipping first_terminal_attach_delivers_prompt_without_input: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    // Give the shell a moment to render its prompt in the tmux pane
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let attach_result = harness
+        .rpc(
+            "terminal.attach",
+            json!({ "thread_id": thread_id, "preset": "terminal" }),
+        )
+        .await
+        .expect("attach terminal");
+    let channel_id = attach_result["channel_id"]
+        .as_u64()
+        .expect("channel id in attach response") as u16;
+    assert!(channel_id > 0);
+
+    // Collect binary output without sending any input.
+    // The scrollback replay must include non-empty content (shell login text
+    // or prompt). Every scrollback replay contains at least one CR+LF.
+    let replay_bytes = harness
+        .wait_for_channel_output_contains(channel_id, b"\r\n", Duration::from_secs(5))
+        .await;
+
+    let _ = harness
+        .rpc(
+            "terminal.detach",
+            json!({ "thread_id": thread_id, "preset": "terminal" }),
+        )
+        .await;
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+
+    let replay = replay_bytes.expect(
+        "first terminal attach must deliver scrollback containing the shell prompt \
+         without any user input"
+    );
+
+    let replay_str = String::from_utf8_lossy(&replay);
+    assert!(
+        !replay_str.trim().is_empty(),
+        "first attach scrollback replay was empty — prompt not delivered"
+    );
+}
+
+/// Scrollback replay must end with CR+LF so the cursor lands on the line
+/// below the prompt, not on the prompt line itself.
+#[tokio::test]
+async fn scrollback_replay_ends_with_trailing_crlf() {
+    if !common::tmux_available().await {
+        eprintln!("skipping scrollback_replay_ends_with_trailing_crlf: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    // Let shell fully render its prompt
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let attach_result = harness
+        .rpc(
+            "terminal.attach",
+            json!({ "thread_id": thread_id, "preset": "terminal" }),
+        )
+        .await
+        .expect("attach terminal");
+    let channel_id = attach_result["channel_id"]
+        .as_u64()
+        .expect("channel id in attach response") as u16;
+
+    // Collect the scrollback replay — any non-trivial content contains CR+LF
+    let replay_bytes = harness
+        .wait_for_channel_output_contains(channel_id, b"\r\n", Duration::from_secs(5))
+        .await
+        .expect("should receive scrollback replay with content");
+
+    let _ = harness
+        .rpc(
+            "terminal.detach",
+            json!({ "thread_id": thread_id, "preset": "terminal" }),
+        )
+        .await;
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+
+    // The replay must end with \r\n so the cursor is positioned below the prompt.
+    // Previously sanitize_scrollback stripped the trailing newline, putting the
+    // cursor ON the prompt line.
+    assert!(
+        replay_bytes.ends_with(b"\r\n"),
+        "scrollback replay must end with CR+LF for correct cursor positioning. \
+         Last 20 bytes: {:?}",
+        String::from_utf8_lossy(
+            &replay_bytes[replay_bytes.len().saturating_sub(20)..]
+        )
+    );
+}

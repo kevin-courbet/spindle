@@ -40,6 +40,14 @@ pub struct PresetConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -47,6 +55,8 @@ pub struct Project {
     pub default_branch: String,
     #[serde(default)]
     pub presets: Vec<PresetConfig>,
+    #[serde(default)]
+    pub agents: Vec<AgentConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -188,6 +198,26 @@ pub struct PresetOutputEvent {
     pub preset: String,
     pub stream: PresetOutputStream,
     pub chunk: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum AgentProcessKind {
+    #[serde(rename = "started")]
+    Started,
+    #[serde(rename = "exited")]
+    Exited,
+    #[serde(rename = "crashed")]
+    Crashed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentStatusChanged {
+    pub channel_id: u16,
+    pub project_id: String,
+    pub agent_name: String,
+    pub event: AgentProcessKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -397,18 +427,21 @@ pub struct ThreadListParams {
 pub struct TerminalAttachParams {
     pub thread_id: String,
     pub preset: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalDetachParams {
     pub thread_id: String,
     pub preset: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalResizeParams {
     pub thread_id: String,
     pub preset: String,
+    pub session_id: Option<String>,
     pub cols: u32,
     pub rows: u32,
 }
@@ -417,18 +450,31 @@ pub struct TerminalResizeParams {
 pub struct PresetStartParams {
     pub thread_id: String,
     pub preset: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PresetStopParams {
     pub thread_id: String,
     pub preset: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PresetRestartParams {
     pub thread_id: String,
     pub preset: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentStartParams {
+    pub project_id: String,
+    pub agent_name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentStopParams {
+    pub channel_id: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -531,6 +577,14 @@ pub struct PresetRestartResult {
     pub ok: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentStartResult {
+    pub channel_id: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AgentStopResult {}
+
 pub const METHOD_SESSION_HELLO: &str = "session.hello";
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
@@ -572,6 +626,8 @@ pub const METHOD_TERMINAL_RESIZE: &str = "terminal.resize";
 pub const METHOD_PRESET_START: &str = "preset.start";
 pub const METHOD_PRESET_STOP: &str = "preset.stop";
 pub const METHOD_PRESET_RESTART: &str = "preset.restart";
+pub const METHOD_AGENT_START: &str = "agent.start";
+pub const METHOD_AGENT_STOP: &str = "agent.stop";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -643,6 +699,10 @@ pub enum RequestDispatch {
     PresetStop(PresetStopParams),
     #[serde(rename = "preset.restart")]
     PresetRestart(PresetRestartParams),
+    #[serde(rename = "agent.start")]
+    AgentStart(AgentStartParams),
+    #[serde(rename = "agent.stop")]
+    AgentStop(AgentStopParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
 }
@@ -733,6 +793,12 @@ pub fn parse_request_dispatch(
         METHOD_PRESET_RESTART => serde_json::from_value::<PresetRestartParams>(params)
             .map(RequestDispatch::PresetRestart)
             .map_err(|err| format!("invalid preset.restart params: {err}")),
+        METHOD_AGENT_START => serde_json::from_value::<AgentStartParams>(params)
+            .map(RequestDispatch::AgentStart)
+            .map_err(|err| format!("invalid agent.start params: {err}")),
+        METHOD_AGENT_STOP => serde_json::from_value::<AgentStopParams>(params)
+            .map(RequestDispatch::AgentStop)
+            .map_err(|err| format!("invalid agent.stop params: {err}")),
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),

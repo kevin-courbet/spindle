@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use serde_json::{json, Value};
 use tokio::{
@@ -13,20 +13,20 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::{protocol, AppState};
+use crate::{protocol, services::agent::{self, AgentAttachment}, AppState};
 
 const INPUT_CHANNEL_CAPACITY: usize = 256;
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(15);
 
 #[derive(Default)]
 pub struct TerminalConnectionState {
-    by_channel: HashMap<u16, Attachment>,
-    by_target: HashMap<String, u16>,
-    attaching_targets: HashMap<String, u16>,
-    replayable_targets: HashSet<String>,
+    pub(crate) by_channel: HashMap<u16, Attachment>,
+    pub(crate) by_agent_channel: HashMap<u16, AgentAttachment>,
+    pub(crate) by_target: HashMap<String, u16>,
+    pub(crate) attaching_targets: HashMap<String, u16>,
 }
 
-struct Attachment {
+pub(crate) struct Attachment {
     target: String,
     pane_target: String,
     input_fifo_path: String,
@@ -50,15 +50,21 @@ pub async fn handle_binary_frame(
 
     let input_tx = {
         let guard = connection_state.lock().await;
-        let attachment = guard
-            .by_channel
-            .get(&channel_id)
-            .ok_or_else(|| format!("unknown channel {channel_id}"))?;
-        attachment
-            .input_tx
-            .as_ref()
-            .ok_or_else(|| format!("channel {channel_id} is closed"))?
-            .clone()
+        if let Some(attachment) = guard.by_channel.get(&channel_id) {
+            attachment
+                .input_tx
+                .as_ref()
+                .ok_or_else(|| format!("channel {channel_id} is closed"))?
+                .clone()
+        } else if let Some(attachment) = guard.by_agent_channel.get(&channel_id) {
+            attachment
+                .input_tx
+                .as_ref()
+                .ok_or_else(|| format!("agent channel {channel_id} is closed"))?
+                .clone()
+        } else {
+            return Err(format!("unknown channel {channel_id}"));
+        }
     };
 
     input_tx
@@ -72,6 +78,10 @@ pub async fn attach(
     connection_state: Arc<Mutex<TerminalConnectionState>>,
     outbound_tx: mpsc::UnboundedSender<Message>,
 ) -> Result<Value, String> {
+    let effective_id = params
+        .session_id
+        .clone()
+        .unwrap_or_else(|| params.preset.clone());
     let thread = {
         let store = state.store.lock().await;
         store
@@ -80,7 +90,7 @@ pub async fn attach(
             .clone()
     };
 
-    let target_key = target_key(&params.thread_id, &params.preset);
+    let target_key = target_key(&params.thread_id, &effective_id);
     let channel_id = loop {
         let maybe_channel = {
             let mut guard = connection_state.lock().await;
@@ -93,6 +103,7 @@ pub async fn attach(
             } else {
                 let reserved_channel_id = state.alloc_channel_id_with(|candidate| {
                     guard.by_channel.contains_key(&candidate)
+                        || guard.by_agent_channel.contains_key(&candidate)
                         || guard
                             .attaching_targets
                             .values()
@@ -112,7 +123,7 @@ pub async fn attach(
     };
 
     let attach_result = async {
-        let pane_target = resolve_pane_target(&thread.tmux_session, &params.preset).await?;
+        let pane_target = resolve_pane_target(&thread.tmux_session, &effective_id).await?;
         let uuid = Uuid::new_v4();
         let input_fifo_path = format!("/tmp/threadmill-in-{channel_id}-{uuid}");
         let output_fifo_path = format!("/tmp/threadmill-out-{channel_id}-{uuid}");
@@ -159,8 +170,11 @@ pub async fn attach(
 
         // -I: pipe-pane connects the command's stdout to pane input (typed keys)
         // -O: pipe-pane connects pane output to the command's stdin
+        // -u: disable stdio buffering so data flows immediately through FIFOs.
+        // Without -u, macOS BSD cat uses full buffering for non-terminal stdout,
+        // causing the shell prompt to sit in a 4KB buffer indefinitely.
         let pipe_command = format!(
-            "sh -c 'cat <{input_fifo_path} & cat >{output_fifo_path}; wait'"
+            "sh -c 'cat -u <{input_fifo_path} & cat -u >{output_fifo_path}; wait'"
         );
         let pipe_output = Command::new("tmux")
             .args(["pipe-pane", "-t", &pane_target, "-IO", &pipe_command])
@@ -243,6 +257,7 @@ pub async fn attach(
             }
         });
 
+
         Ok::<Attachment, String>(Attachment {
             target: target_key.clone(),
             pane_target,
@@ -266,29 +281,29 @@ pub async fn attach(
     };
 
     let pane_target_for_replay = attachment.pane_target.clone();
-    let should_replay = {
+    {
         let mut guard = connection_state.lock().await;
-        let should_replay =
-            should_replay_scrollback(&params.preset, guard.replayable_targets.contains(&target_key));
         guard.attaching_targets.remove(&target_key);
         guard.by_target.insert(target_key.clone(), channel_id);
         guard.by_channel.insert(channel_id, attachment);
-        guard.replayable_targets.insert(target_key.clone());
-        should_replay
-    };
+    }
 
-    if should_replay {
-        if let Ok(scrollback) = capture_pane_scrollback(&pane_target_for_replay).await {
-            if !scrollback.is_empty() {
-                let mut payload = Vec::with_capacity(scrollback.len() + 2);
-                payload.extend_from_slice(&channel_id.to_be_bytes());
-                // tmux capture-pane outputs bare LF; terminals need CR+LF
-                let normalized = scrollback.replace("
-", "
-");
-                payload.extend_from_slice(normalized.as_bytes());
-                let _ = outbound_tx.send(Message::Binary(payload));
-            }
+    // Give the shell time to finish initializing and draw its prompt.
+    // Without this, capture_pane_scrollback runs before the prompt is in
+    // the pane buffer for freshly created terminals (zsh+starship can take
+    // 200-500ms). The 150ms delay combined with the time already spent
+    // during the attach flow (~50-100ms) covers most shells.
+    sleep(Duration::from_millis(150)).await;
+
+    // Always send recent scrollback so the prompt is visible immediately.
+    if let Ok(content) = capture_pane_scrollback(&pane_target_for_replay).await {
+        if !content.is_empty() {
+            let mut payload = Vec::with_capacity(content.len() + 2);
+            payload.extend_from_slice(&channel_id.to_be_bytes());
+            // tmux capture-pane outputs bare LF; terminals need CR+LF
+            let normalized = content.replace("\n", "\r\n");
+            payload.extend_from_slice(normalized.as_bytes());
+            let _ = outbound_tx.send(Message::Binary(payload));
         }
     }
 
@@ -299,7 +314,11 @@ pub async fn detach(
     params: protocol::TerminalDetachParams,
     connection_state: Arc<Mutex<TerminalConnectionState>>,
 ) -> Result<Value, String> {
-    let target = target_key(&params.thread_id, &params.preset);
+    let effective_id = params
+        .session_id
+        .clone()
+        .unwrap_or_else(|| params.preset.clone());
+    let target = target_key(&params.thread_id, &effective_id);
     let detached = detach_by_target(&target, connection_state).await?;
     Ok(json!({ "detached": detached }))
 }
@@ -308,7 +327,11 @@ pub async fn resize(
     params: protocol::TerminalResizeParams,
     connection_state: Arc<Mutex<TerminalConnectionState>>,
 ) -> Result<Value, String> {
-    let target = target_key(&params.thread_id, &params.preset);
+    let effective_id = params
+        .session_id
+        .clone()
+        .unwrap_or_else(|| params.preset.clone());
+    let target = target_key(&params.thread_id, &effective_id);
     let pane_target = {
         let guard = connection_state.lock().await;
         let channel_id = *guard
@@ -348,15 +371,22 @@ pub async fn resize(
 }
 
 pub async fn cleanup_connection(connection_state: Arc<Mutex<TerminalConnectionState>>) {
-    let attachments = {
+    let (attachments, agent_attachments) = {
         let mut guard = connection_state.lock().await;
         guard.by_target.clear();
         guard.attaching_targets.clear();
-        std::mem::take(&mut guard.by_channel)
+        (
+            std::mem::take(&mut guard.by_channel),
+            std::mem::take(&mut guard.by_agent_channel),
+        )
     };
 
     for (_, mut attachment) in attachments {
         cleanup_attachment(&mut attachment).await;
+    }
+
+    for (_, mut attachment) in agent_attachments {
+        agent::cleanup_agent_attachment(&mut attachment).await;
     }
 }
 
@@ -514,10 +544,6 @@ async fn capture_pane_scrollback(pane_target: &str) -> Result<String, String> {
     Ok(sanitize_scrollback(&String::from_utf8_lossy(&output.stdout)))
 }
 
-fn should_replay_scrollback(preset: &str, target_seen_before: bool) -> bool {
-    target_seen_before || preset != "terminal"
-}
-
 fn sanitize_scrollback(scrollback: &str) -> String {
     let lines: Vec<&str> = scrollback.lines().collect();
     let Some(start) = lines.iter().position(|line| !line.trim().is_empty()) else {
@@ -527,8 +553,11 @@ fn sanitize_scrollback(scrollback: &str) -> String {
         return String::new();
     };
 
-    lines[start..=end].join("
-")
+    // Preserve one trailing newline so the cursor lands on the line below
+    // the last content (below the shell prompt), not on the prompt itself.
+    let mut result = lines[start..=end].join("\n");
+    result.push('\n');
+    result
 }
 
 fn target_key(thread_id: &str, preset: &str) -> String {
@@ -538,10 +567,10 @@ fn target_key(thread_id: &str, preset: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_scrollback, should_replay_scrollback};
+    use super::sanitize_scrollback;
 
     #[test]
-    fn sanitize_scrollback_trims_leading_and_trailing_blank_lines() {
+    fn sanitize_scrollback_trims_leading_blank_lines_and_excess_trailing() {
         let input = "
 
 first prompt
@@ -550,17 +579,29 @@ first prompt
 second line
 
 ";
+        // Must strip leading blank lines and excess trailing blank lines,
+        // but preserve exactly one trailing newline so the cursor lands on
+        // the line below the last content (e.g. below the shell prompt).
         assert_eq!(sanitize_scrollback(input), "first prompt
 
 
-second line");
+second line
+");
     }
 
     #[test]
-    fn first_terminal_attach_skips_scrollback_replay() {
-        assert!(!should_replay_scrollback("terminal", false));
-        assert!(should_replay_scrollback("terminal", true));
-        assert!(should_replay_scrollback("dev-server", false));
+    fn sanitize_scrollback_preserves_trailing_newline_after_prompt() {
+        // Simulates a shell that just printed its prompt: the cursor sits
+        // on the blank line after the prompt. Stripping that newline places
+        // the cursor ON the prompt line — which is the bug.
+        let input = "user@host:~$ \n\n\n";
+        assert_eq!(sanitize_scrollback(input), "user@host:~$ \n");
+    }
+
+    #[test]
+    fn sanitize_scrollback_all_blank_returns_empty() {
+        assert_eq!(sanitize_scrollback("\n\n\n"), "");
+        assert_eq!(sanitize_scrollback("   \n  \n"), "");
     }
 
     #[test]

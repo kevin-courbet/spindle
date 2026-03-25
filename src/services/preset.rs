@@ -19,12 +19,18 @@ const PRESET_MONITOR_POLL: Duration = Duration::from_secs(1);
 const PRESET_CAPTURE_LINES: &str = "-200";
 const PRESET_MAX_CHUNK_BYTES: usize = 8 * 1024;
 const PRESET_MAX_LAST_OUTPUT: usize = 20;
+const PRESET_STOP_WAIT_ATTEMPTS: usize = 20;
+const PRESET_STOP_WAIT_DELAY: Duration = Duration::from_millis(25);
 
 impl PresetService {
     pub async fn start(
         state: Arc<AppState>,
         params: protocol::PresetStartParams,
     ) -> Result<protocol::PresetStartResult, String> {
+        let effective_id = params
+            .session_id
+            .clone()
+            .unwrap_or_else(|| params.preset.clone());
         let (thread, project) = {
             let store = state.store.lock().await;
             let thread = store
@@ -39,10 +45,15 @@ impl PresetService {
         };
 
         if !tmux::session_exists(&thread.tmux_session).await? {
-            return Err(format!("tmux session not running: {}", thread.tmux_session));
+            // Tmux session died (beast reboot, manual kill, etc.) — recreate it.
+            // Same logic as StateStore startup reconciliation.
+            let config = load_threadmill_config(&thread.worktree_path, &project.path)?;
+            let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
+            let env = thread_env(&project, &thread, port_base);
+            tmux::create_session(&thread.tmux_session, &thread.worktree_path, &env).await?;
         }
 
-        if tmux::window_exists(&thread.tmux_session, &params.preset).await? {
+        if tmux::window_exists(&thread.tmux_session, &effective_id).await? {
             return Ok(protocol::PresetStartResult { ok: true });
         }
 
@@ -52,15 +63,14 @@ impl PresetService {
         tmux::set_session_environment(&thread.tmux_session, &env).await?;
 
         let project_presets = load_project_presets(&project.path)?;
-        if let Some(preset) = project_presets
-            .into_iter()
-            .find(|preset| preset.name == params.preset)
-        {
+        let preset_config = project_presets.iter().find(|p| p.name == params.preset);
+
+        if let Some(preset) = preset_config {
             let cwd = resolve_preset_cwd(&thread.worktree_path, preset.cwd.as_deref())?;
-            tmux::create_window(&thread.tmux_session, &params.preset, &preset.command, &cwd)
+            tmux::create_window(&thread.tmux_session, &effective_id, &preset.command, &cwd)
                 .await?;
         } else {
-            start_legacy_preset(&thread, &params.preset, &project.path).await?;
+            start_legacy_preset(&thread, &params.preset, &effective_id, &project.path).await?;
         }
 
         emit_preset_event(
@@ -82,6 +92,7 @@ impl PresetService {
             Arc::clone(&state),
             params.thread_id.clone(),
             params.preset.clone(),
+            effective_id,
             thread.tmux_session.clone(),
         );
 
@@ -92,6 +103,10 @@ impl PresetService {
         state: Arc<AppState>,
         params: protocol::PresetStopParams,
     ) -> Result<protocol::PresetStopResult, String> {
+        let effective_id = params
+            .session_id
+            .clone()
+            .unwrap_or_else(|| params.preset.clone());
         let thread = {
             let store = state.store.lock().await;
             store
@@ -100,11 +115,18 @@ impl PresetService {
                 .clone()
         };
 
-        if !tmux::window_exists(&thread.tmux_session, &params.preset).await? {
+        if !tmux::window_exists(&thread.tmux_session, &effective_id).await? {
             return Ok(protocol::PresetStopResult { ok: false });
         }
 
-        tmux::kill_window(&thread.tmux_session, &params.preset).await?;
+        tmux::kill_window(&thread.tmux_session, &effective_id).await?;
+        for _ in 0..PRESET_STOP_WAIT_ATTEMPTS {
+            match tmux::window_exists(&thread.tmux_session, &effective_id).await {
+                Ok(false) => break,
+                Ok(true) => sleep(PRESET_STOP_WAIT_DELAY).await,
+                Err(_) => break,
+            }
+        }
         emit_preset_event(
             &state,
             &params.thread_id,
@@ -126,6 +148,7 @@ impl PresetService {
             protocol::PresetStopParams {
                 thread_id: params.thread_id.clone(),
                 preset: params.preset.clone(),
+                session_id: None,
             },
         )
         .await;
@@ -135,6 +158,7 @@ impl PresetService {
             protocol::PresetStartParams {
                 thread_id: params.thread_id,
                 preset: params.preset,
+                session_id: None,
             },
         )
         .await?;
@@ -146,6 +170,7 @@ impl PresetService {
 async fn start_legacy_preset(
     thread: &Thread,
     preset_name: &str,
+    window_name: &str,
     project_path: &str,
 ) -> Result<(), String> {
     let config = load_threadmill_config(&thread.worktree_path, project_path)?;
@@ -162,7 +187,7 @@ async fn start_legacy_preset(
     if preset.parallel && preset.commands.len() > 1 {
         tmux::create_window(
             &thread.tmux_session,
-            preset_name,
+            window_name,
             &preset.commands[0],
             &thread.worktree_path,
         )
@@ -171,19 +196,19 @@ async fn start_legacy_preset(
         for command in preset.commands.iter().skip(1) {
             tmux::split_window(
                 &thread.tmux_session,
-                preset_name,
+                window_name,
                 command,
                 &thread.worktree_path,
             )
             .await?;
         }
 
-        tmux::select_layout(&thread.tmux_session, preset_name, "tiled").await?;
+        tmux::select_layout(&thread.tmux_session, window_name, "tiled").await?;
     } else {
         let command = preset.commands.join(" && ");
         tmux::create_window(
             &thread.tmux_session,
-            preset_name,
+            window_name,
             &command,
             &thread.worktree_path,
         )
@@ -193,13 +218,19 @@ async fn start_legacy_preset(
     Ok(())
 }
 
-fn spawn_preset_monitor(state: Arc<AppState>, thread_id: String, preset: String, session: String) {
+fn spawn_preset_monitor(
+    state: Arc<AppState>,
+    thread_id: String,
+    preset: String,
+    window_name: String,
+    session: String,
+) {
     tokio::spawn(async move {
         let mut latest_capture = String::new();
         loop {
             sleep(PRESET_MONITOR_POLL).await;
 
-            if let Ok(capture) = capture_preset_output(&session, &preset).await {
+            if let Ok(capture) = capture_preset_output(&session, &window_name).await {
                 if let Some(chunk) = capture_new_chunk(&latest_capture, &capture) {
                     emit_preset_output(
                         &state,
@@ -212,7 +243,7 @@ fn spawn_preset_monitor(state: Arc<AppState>, thread_id: String, preset: String,
                 latest_capture = capture;
             }
 
-            match tmux::window_exists(&session, &preset).await {
+            match tmux::window_exists(&session, &window_name).await {
                 Ok(true) => continue,
                 Ok(false) => {
                     emit_preset_event(
