@@ -53,6 +53,22 @@ for raw in sys.stdin.buffer:
             "models": {"availableModels": [], "currentModelId": None},
             "configOptions": [],
         }
+    elif method == "threadmill/testUpdate":
+        marker = (msg.get("params") or {}).get("marker", "")
+        update = {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "acp-session-1",
+                "update": {
+                    "kind": "agent_message_chunk",
+                    "content": marker,
+                },
+            },
+        }
+        sys.stdout.write(json.dumps(update) + "\n")
+        sys.stdout.flush()
+        result = {"ok": True}
     else:
         result = {}
 
@@ -197,6 +213,30 @@ async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str,
             }
         }
     }
+}
+
+async fn send_test_update(harness: &mut common::TestHarness, channel_id: u16, marker: &str) {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "threadmill/testUpdate",
+        "params": {
+            "marker": marker,
+        }
+    });
+    harness
+        .send_binary(channel_id, format!("{}\n", request).as_bytes())
+        .await
+        .expect("send test update request");
+}
+
+fn chat_history_path(thread_id: &str, session_id: &str) -> std::path::PathBuf {
+    let config_home = std::env::var("XDG_CONFIG_HOME").expect("XDG_CONFIG_HOME set by harness");
+    std::path::Path::new(&config_home)
+        .join("threadmill")
+        .join("chat")
+        .join(thread_id)
+        .join(format!("{session_id}.jsonl"))
 }
 
 #[tokio::test]
@@ -406,6 +446,173 @@ async fn chat_load_restarts_archived_session() {
     wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn chat_history_persists_session_updates_with_cursor_pagination() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping chat_history_persists_session_updates_with_cursor_pagination: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({"thread_id": thread_id, "agent_name": "mock"}),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel_id") as u16;
+
+    for idx in 0..105 {
+        let marker = format!("history-marker-{idx}");
+        send_test_update(&mut harness, channel_id, &marker).await;
+    }
+
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-marker-104",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for history marker output");
+
+    let first_page = harness
+        .rpc(
+            "chat.history",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.history first page");
+    let first_updates = first_page["updates"].as_array().expect("updates array");
+    assert_eq!(first_updates.len(), 100);
+    assert_eq!(first_page["next_cursor"], 100);
+
+    let second_page = harness
+        .rpc(
+            "chat.history",
+            json!({"thread_id": thread_id, "session_id": session_id, "cursor": 100}),
+        )
+        .await
+        .expect("chat.history second page");
+    let second_updates = second_page["updates"].as_array().expect("updates array");
+    assert_eq!(second_updates.len(), 5);
+    assert!(second_page["next_cursor"].is_null());
+    let last_content = second_updates
+        .last()
+        .and_then(|entry| entry["update"]["content"].as_str())
+        .expect("last update content");
+    assert_eq!(last_content, "history-marker-104");
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn chat_history_nonexistent_session_returns_empty() {
+    if !common::tmux_available().await {
+        eprintln!("skipping chat_history_nonexistent_session_returns_empty: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let history = harness
+        .rpc(
+            "chat.history",
+            json!({
+                "thread_id": thread_id,
+                "session_id": "does-not-exist",
+            }),
+        )
+        .await
+        .expect("chat.history for missing session");
+    assert!(history["updates"].as_array().expect("updates array").is_empty());
+    assert!(history["next_cursor"].is_null());
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn thread_close_removes_chat_history_files() {
+    if !common::tmux_available().await {
+        eprintln!("skipping thread_close_removes_chat_history_files: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({"thread_id": thread_id, "agent_name": "mock"}),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel_id") as u16;
+
+    send_test_update(&mut harness, channel_id, "persisted-before-close").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"persisted-before-close",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for persisted marker output");
+
+    let history_path = chat_history_path(&thread_id, &session_id);
+    assert!(history_path.exists(), "history file should exist before close");
+
+    harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": thread_id, "mode": "close" }),
+        )
+        .await
+        .expect("thread.close");
+
+    assert!(
+        !history_path.exists(),
+        "history file should be removed when thread closes"
+    );
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
 }
 
 #[tokio::test]

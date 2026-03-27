@@ -336,6 +336,12 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("chat.detach", message))?;
             to_value("chat.detach", result)
         }
+        RequestDispatch::ChatHistory(params) => {
+            let result = ChatService::history(state, params)
+                .await
+                .map_err(|message| map_service_error("chat.history", message))?;
+            to_value("chat.history", result)
+        }
     }
 }
 

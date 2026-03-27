@@ -586,6 +586,14 @@ pub struct ChatDetachParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatHistoryParams {
+    pub thread_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
     pub name: String,
     pub path: String,
@@ -718,6 +726,13 @@ pub struct ChatDetachResult {
     pub detached: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatHistoryResult {
+    pub updates: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u64>,
+}
+
 pub const METHOD_SESSION_HELLO: &str = "session.hello";
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
@@ -767,6 +782,7 @@ pub const METHOD_CHAT_STOP: &str = "chat.stop";
 pub const METHOD_CHAT_LIST: &str = "chat.list";
 pub const METHOD_CHAT_ATTACH: &str = "chat.attach";
 pub const METHOD_CHAT_DETACH: &str = "chat.detach";
+pub const METHOD_CHAT_HISTORY: &str = "chat.history";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -854,6 +870,8 @@ pub enum RequestDispatch {
     ChatAttach(ChatAttachParams),
     #[serde(rename = "chat.detach")]
     ChatDetach(ChatDetachParams),
+    #[serde(rename = "chat.history")]
+    ChatHistory(ChatHistoryParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
 }
@@ -968,6 +986,9 @@ pub fn parse_request_dispatch(
         METHOD_CHAT_DETACH => serde_json::from_value::<ChatDetachParams>(params)
             .map(RequestDispatch::ChatDetach)
             .map_err(|err| format!("invalid chat.detach params: {err}")),
+        METHOD_CHAT_HISTORY => serde_json::from_value::<ChatHistoryParams>(params)
+            .map(RequestDispatch::ChatHistory)
+            .map_err(|err| format!("invalid chat.history params: {err}")),
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),

@@ -51,13 +51,18 @@ struct ServerEvent {
 impl AppState {
     pub fn new(store: StateStore) -> Self {
         let (events_tx, _) = broadcast::channel(256);
+        let history_root = store
+            .path
+            .parent()
+            .map(|parent| parent.join("chat"))
+            .unwrap_or_else(|| std::path::PathBuf::from("chat"));
         Self {
             events_tx,
             next_channel_id: Arc::new(AtomicU16::new(1)),
             state_version: Arc::new(AtomicU64::new(0)),
             next_operation_id: Arc::new(AtomicU64::new(1)),
             store: Arc::new(Mutex::new(store)),
-            chat: Arc::new(Mutex::new(services::chat::ChatState::default())),
+            chat: Arc::new(Mutex::new(services::chat::ChatState::new(history_root))),
             create_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -224,6 +229,9 @@ pub async fn serve_listener(listener: TcpListener, mut shutdown_rx: oneshot::Rec
         warn!(error = %err, "failed to start opencode serve at startup");
     }
     let state = Arc::new(AppState::new(store));
+    if let Err(err) = services::chat::ChatService::recover_persisted_sessions(Arc::clone(&state)).await {
+        warn!(error = %err, "failed to recover persisted chat sessions");
+    }
     let local_addr = match listener.local_addr() {
         Ok(addr) => addr,
         Err(err) => {

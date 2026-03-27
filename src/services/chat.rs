@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -26,6 +28,8 @@ const CHAT_INPUT_CHANNEL_CAPACITY: usize = 256;
 const CHAT_IO_CHUNK_SIZE: usize = 8192;
 const CHAT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(35);
+const CHAT_HISTORY_BATCH_SIZE: usize = 100;
+const CHAT_UPDATE_METHOD: &str = "session/update";
 
 pub struct ChatService;
 
@@ -35,6 +39,7 @@ pub struct ChatState {
     sessions_by_thread: HashMap<String, Vec<String>>,
     channel_to_session: HashMap<u16, String>,
     channel_outbound: HashMap<u16, mpsc::UnboundedSender<Message>>,
+    history_root: PathBuf,
 }
 
 struct ChatSessionRuntime {
@@ -46,6 +51,20 @@ struct ChatSessionRuntime {
     stop_tx: Option<oneshot::Sender<()>>,
     status_notify: Arc<Notify>,
     ended_emitted: bool,
+    history_path: PathBuf,
+    output_buffer: Vec<u8>,
+}
+
+impl ChatState {
+    pub fn new(history_root: PathBuf) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            sessions_by_thread: HashMap::new(),
+            channel_to_session: HashMap::new(),
+            channel_outbound: HashMap::new(),
+            history_root,
+        }
+    }
 }
 
 struct HandshakeResult {
@@ -68,6 +87,7 @@ impl ChatService {
         let created_at = Utc::now().to_rfc3339();
         {
             let mut chat = state.chat.lock().await;
+            let history_path = history_path_for_session(&chat.history_root, &params.thread_id, &session_id);
             let runtime = ChatSessionRuntime {
                 summary: protocol::ChatSessionSummary {
                     session_id: session_id.clone(),
@@ -84,6 +104,8 @@ impl ChatService {
                 stop_tx: None,
                 status_notify: Arc::new(Notify::new()),
                 ended_emitted: false,
+                history_path,
+                output_buffer: Vec::new(),
             };
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -187,6 +209,65 @@ impl ChatService {
         params: protocol::ChatListParams,
     ) -> Result<protocol::ChatListResult, String> {
         Ok(chat_session_summaries_for_thread(&state, &params.thread_id).await)
+    }
+
+    pub async fn history(
+        state: Arc<AppState>,
+        params: protocol::ChatHistoryParams,
+    ) -> Result<protocol::ChatHistoryResult, String> {
+        if !is_safe_history_component(&params.thread_id)
+            || !is_safe_history_component(&params.session_id)
+        {
+            return Ok(protocol::ChatHistoryResult {
+                updates: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root.clone()
+        };
+        let history_path = history_path_for_session(&history_root, &params.thread_id, &params.session_id);
+        read_history_page(&history_path, params.cursor)
+    }
+
+    pub async fn recover_persisted_sessions(state: Arc<AppState>) -> Result<(), String> {
+        let known_threads = {
+            let store = state.store.lock().await;
+            store
+                .data
+                .threads
+                .iter()
+                .map(|thread| thread.id.clone())
+                .collect::<HashSet<_>>()
+        };
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root.clone()
+        };
+
+        let recovered = discover_history_sessions(&history_root, &known_threads)?;
+        if recovered.is_empty() {
+            return Ok(());
+        }
+
+        let mut chat = state.chat.lock().await;
+        for recovered in recovered {
+            if chat.sessions.contains_key(&recovered.summary.session_id) {
+                continue;
+            }
+
+            let session_id = recovered.summary.session_id.clone();
+            let thread_id = recovered.thread_id.clone();
+            chat.sessions.insert(session_id.clone(), recovered);
+            chat.sessions_by_thread
+                .entry(thread_id)
+                .or_default()
+                .push(session_id);
+        }
+
+        Ok(())
     }
 
     pub async fn attach(
@@ -331,6 +412,16 @@ impl ChatService {
 
         for session_id in session_ids {
             stop_session_internal(Arc::clone(&state), thread_id, &session_id, reason, purge).await?;
+        }
+
+        if purge {
+            let history_root = {
+                let chat = state.chat.lock().await;
+                chat.history_root.clone()
+            };
+            if let Err(error) = remove_thread_history_dir(&history_root, thread_id) {
+                warn!(thread_id, error = %error, "failed to remove thread chat history directory");
+            }
         }
 
         Ok(())
@@ -664,14 +755,21 @@ async fn next_json_line(
 }
 
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
-    let targets = {
-        let chat = state.chat.lock().await;
-        let Some(session) = chat.sessions.get(session_id) else {
+    let (targets, history_path, updates) = {
+        let mut chat = state.chat.lock().await;
+        let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
-        session
+        let updates = extract_session_update_params(&mut session.output_buffer, payload);
+        let history_path = session.history_path.clone();
+        let attached_channels = session
             .attached_channels
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+
+        let targets = attached_channels
             .iter()
             .filter_map(|channel_id| {
                 chat.channel_outbound
@@ -679,8 +777,21 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
                     .cloned()
                     .map(|outbound| (*channel_id, outbound))
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+
+        (targets, history_path, updates)
     };
+
+    if !updates.is_empty() {
+        if let Err(error) = append_updates_to_history(&history_path, &updates) {
+            warn!(
+                session_id,
+                path = %history_path.display(),
+                error = %error,
+                "failed to persist chat session/update payload"
+            );
+        }
+    }
 
     let mut dead_channels = Vec::new();
     for (channel_id, outbound) in targets {
@@ -809,7 +920,7 @@ async fn stop_session_internal(
 }
 
 async fn purge_session(state: Arc<AppState>, thread_id: &str, session_id: &str) {
-    let removed_channels = {
+    let (removed_channels, history_path) = {
         let mut chat = state.chat.lock().await;
         let Some(mut session) = chat.sessions.remove(session_id) else {
             return;
@@ -827,11 +938,20 @@ async fn purge_session(state: Arc<AppState>, thread_id: &str, session_id: &str) 
             chat.channel_to_session.remove(channel_id);
             chat.channel_outbound.remove(channel_id);
         }
-        channels
+        (channels, session.history_path)
     };
 
     if !removed_channels.is_empty() {
         detach_channels(Arc::clone(&state), removed_channels).await;
+    }
+
+    if let Err(error) = remove_history_file(&history_path) {
+        warn!(
+            session_id,
+            path = %history_path.display(),
+            error = %error,
+            "failed to remove chat history file during purge"
+        );
     }
 
     state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ChatSessionRemoved {
@@ -913,6 +1033,225 @@ fn chat_status_name(status: &protocol::ChatSessionStatus) -> &'static str {
     }
 }
 
+fn history_path_for_session(history_root: &Path, thread_id: &str, session_id: &str) -> PathBuf {
+    history_root.join(thread_id).join(format!("{session_id}.jsonl"))
+}
+
+fn is_safe_history_component(value: &str) -> bool {
+    !value.is_empty() && !value.contains('/') && !value.contains('\\') && !value.contains("..")
+}
+
+fn extract_session_update_params(output_buffer: &mut Vec<u8>, payload: &[u8]) -> Vec<Value> {
+    output_buffer.extend_from_slice(payload);
+    let mut updates = Vec::new();
+
+    while let Some(newline_idx) = output_buffer.iter().position(|byte| *byte == b'\n') {
+        let line = output_buffer[..newline_idx].to_vec();
+        output_buffer.drain(..=newline_idx);
+        if line.is_empty() {
+            continue;
+        }
+
+        let parsed = match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(error = %error, "failed to parse chat agent output as JSON line");
+                continue;
+            }
+        };
+
+        if parsed
+            .get("method")
+            .and_then(Value::as_str)
+            .map(|method| method == CHAT_UPDATE_METHOD)
+            .unwrap_or(false)
+        {
+            if let Some(params) = parsed.get("params") {
+                updates.push(params.clone());
+            }
+        }
+    }
+
+    updates
+}
+
+fn append_updates_to_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let parent = history_path
+        .parent()
+        .ok_or_else(|| format!("invalid chat history path: {}", history_path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path)
+        .map_err(|err| format!("failed to open {}: {err}", history_path.display()))?;
+
+    for update in updates {
+        serde_json::to_writer(&mut file, update)
+            .map_err(|err| format!("failed to encode history update: {err}"))?;
+        file.write_all(b"\n")
+            .map_err(|err| format!("failed to append newline to {}: {err}", history_path.display()))?;
+    }
+
+    file.sync_data()
+        .map_err(|err| format!("failed to fsync {}: {err}", history_path.display()))
+}
+
+fn read_history_page(
+    history_path: &Path,
+    cursor: Option<u64>,
+) -> Result<protocol::ChatHistoryResult, String> {
+    if !history_path.exists() {
+        return Ok(protocol::ChatHistoryResult {
+            updates: Vec::new(),
+            next_cursor: None,
+        });
+    }
+
+    let start_idx = cursor.unwrap_or(0) as usize;
+    let file = fs::File::open(history_path)
+        .map_err(|err| format!("failed to open {}: {err}", history_path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut updates = Vec::new();
+    let mut line_index = 0_usize;
+    let mut has_more = false;
+
+    for line in reader.lines() {
+        let line =
+            line.map_err(|err| format!("failed to read {}: {err}", history_path.display()))?;
+        if line_index < start_idx {
+            line_index += 1;
+            continue;
+        }
+
+        if updates.len() >= CHAT_HISTORY_BATCH_SIZE {
+            has_more = true;
+            break;
+        }
+
+        match serde_json::from_str::<Value>(&line) {
+            Ok(value) => updates.push(value),
+            Err(error) => {
+                warn!(
+                    path = %history_path.display(),
+                    line_index,
+                    error = %error,
+                    "failed to parse chat history line"
+                );
+            }
+        }
+        line_index += 1;
+    }
+
+    let next_cursor = if has_more {
+        Some(start_idx as u64 + CHAT_HISTORY_BATCH_SIZE as u64)
+    } else {
+        None
+    };
+
+    Ok(protocol::ChatHistoryResult {
+        updates,
+        next_cursor,
+    })
+}
+
+fn discover_history_sessions(
+    history_root: &Path,
+    known_threads: &HashSet<String>,
+) -> Result<Vec<ChatSessionRuntime>, String> {
+    if !history_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut recovered = Vec::new();
+    let thread_dirs = fs::read_dir(history_root)
+        .map_err(|err| format!("failed to read {}: {err}", history_root.display()))?;
+
+    for thread_dir in thread_dirs {
+        let thread_dir =
+            thread_dir.map_err(|err| format!("failed to read chat thread dir entry: {err}"))?;
+        let file_type = thread_dir
+            .file_type()
+            .map_err(|err| format!("failed to inspect {}: {err}", thread_dir.path().display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let thread_id = thread_dir.file_name().to_string_lossy().to_string();
+        if !known_threads.contains(&thread_id) {
+            continue;
+        }
+
+        let entries = fs::read_dir(thread_dir.path())
+            .map_err(|err| format!("failed to read {}: {err}", thread_dir.path().display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("failed to read chat history file entry: {err}"))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let created_at = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(chrono::DateTime::<Utc>::from)
+                .unwrap_or_else(Utc::now)
+                .to_rfc3339();
+
+            recovered.push(ChatSessionRuntime {
+                summary: protocol::ChatSessionSummary {
+                    session_id: stem.to_string(),
+                    agent_type: "unknown".to_string(),
+                    status: protocol::ChatSessionStatus::Ended,
+                    title: None,
+                    model_id: None,
+                    created_at,
+                },
+                thread_id: thread_id.clone(),
+                acp_session_id: Some(stem.to_string()),
+                attached_channels: HashSet::new(),
+                input_tx: None,
+                stop_tx: None,
+                status_notify: Arc::new(Notify::new()),
+                ended_emitted: true,
+                history_path: path,
+                output_buffer: Vec::new(),
+            });
+        }
+    }
+
+    Ok(recovered)
+}
+
+fn remove_history_file(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    fs::remove_file(path).map_err(|err| format!("failed to remove {}: {err}", path.display()))
+}
+
+fn remove_thread_history_dir(history_root: &Path, thread_id: &str) -> Result<(), String> {
+    let thread_dir = history_root.join(thread_id);
+    if !thread_dir.exists() {
+        return Ok(());
+    }
+
+    fs::remove_dir_all(&thread_dir)
+        .map_err(|err| format!("failed to remove {}: {err}", thread_dir.display()))
+}
+
 async fn resolve_agent_launch(
     state: &Arc<AppState>,
     thread_id: &str,
@@ -965,4 +1304,90 @@ fn resolve_agent_cwd(project_path: &str, cwd: Option<&str>) -> Result<String, St
         .to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| format!("invalid utf-8 agent cwd: {}", resolved.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_store::{AppData, Project, StateStore, Thread};
+
+    #[tokio::test]
+    async fn recovers_sessions_from_persisted_history_files() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "spindle-chat-recovery-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_dir = temp_root.join("threadmill");
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let thread_id = "thread-recovery".to_string();
+        let session_id = "session-recovery".to_string();
+
+        let history_path = history_path_for_session(&state_dir.join("chat"), &thread_id, &session_id);
+        fs::create_dir_all(
+            history_path
+                .parent()
+                .expect("history path should have parent"),
+        )
+        .expect("create history parent dir");
+        fs::write(
+            &history_path,
+            "{\"sessionId\":\"acp-session-1\",\"update\":{\"kind\":\"agent_message_chunk\",\"content\":\"hello\"}}\n",
+        )
+        .expect("write persisted history");
+
+        let state = Arc::new(AppState::new(StateStore {
+            path: state_dir.join("threads.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: thread_id.clone(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Closed,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }));
+
+        ChatService::recover_persisted_sessions(Arc::clone(&state))
+            .await
+            .expect("recover persisted sessions");
+
+        let listed = ChatService::list(
+            Arc::clone(&state),
+            protocol::ChatListParams {
+                thread_id: thread_id.clone(),
+            },
+        )
+        .await
+        .expect("chat.list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].status, protocol::ChatSessionStatus::Ended);
+
+        let history = ChatService::history(
+            Arc::clone(&state),
+            protocol::ChatHistoryParams {
+                thread_id: thread_id.clone(),
+                session_id: listed[0].session_id.clone(),
+                cursor: None,
+            },
+        )
+        .await
+        .expect("chat.history");
+        assert_eq!(history.updates.len(), 1);
+        assert!(history.next_cursor.is_none());
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
 }
