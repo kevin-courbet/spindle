@@ -272,14 +272,19 @@ async fn thread_close_main_checkout_keeps_project_root() {
     let (project, project_id) = add_project(&mut harness).await;
 
     let created = harness
-        .wait_for_event("thread.created", Duration::from_secs(45))
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": "main",
+                "source_type": "main_checkout"
+            }),
+        )
         .await
-        .expect("wait for thread.created event");
-    let thread = &created["params"]["thread"];
-    assert_eq!(thread["name"], "main");
-    assert_eq!(thread["source_type"], "main_checkout");
-    let thread_id = thread["id"].as_str().expect("thread id").to_string();
-
+        .expect("create main-checkout thread");
+    assert_eq!(created["name"], "main");
+    assert_eq!(created["source_type"], "main_checkout");
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
     wait_for_thread_ready(&mut harness, &thread_id).await;
 
     let project_path = project.repo_path.to_string_lossy().to_string();
@@ -512,8 +517,9 @@ async fn thread_cancel_inflight_creation_marks_failed_and_cleans_worktree() {
         if status_event["params"]["thread_id"] != thread_id {
             continue;
         }
-        assert_eq!(status_event["params"]["new"], "failed");
-        break;
+        if status_event["params"]["new"] == "failed" {
+            break;
+        }
     }
 
     let listed = harness

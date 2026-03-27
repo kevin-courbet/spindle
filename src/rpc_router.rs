@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::{
     protocol::{self, RequestDispatch},
     services::{
-        file::FileService, opencode::OpencodeService, preset::PresetService,
-        project::ProjectService, system::SystemService, terminal,
+        agent::AgentService, chat::ChatService, file::FileService, opencode::OpencodeService,
+        preset::PresetService, project::ProjectService, system::SystemService, terminal,
         terminal::TerminalConnectionState, thread::ThreadService,
     },
     AppState, ConnectionSessionState, RpcError,
@@ -122,7 +122,7 @@ pub async fn dispatch_request(
             to_value("system.stats", stats)
         }
         RequestDispatch::StateSnapshot(_) => {
-            let (projects, threads) = {
+            let (projects, mut threads) = {
                 let store = state.store.lock().await;
                 (
                     store.data.projects.clone(),
@@ -134,6 +134,11 @@ pub async fn dispatch_request(
                         .collect::<Vec<_>>(),
                 )
             };
+
+            for thread in &mut threads {
+                thread.chat_sessions =
+                    ChatService::thread_chat_sessions(Arc::clone(&state), &thread.id).await;
+            }
 
             let snapshot = protocol::StateSnapshot {
                 state_version: state.state_version(),
@@ -283,6 +288,54 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("preset.restart", message))?;
             to_value("preset.restart", result)
         }
+        RequestDispatch::AgentStart(params) => {
+            let result = AgentService::start(state, params, connection_state, outbound_tx)
+                .await
+                .map_err(|message| map_service_error("agent.start", message))?;
+            to_value("agent.start", result)
+        }
+        RequestDispatch::AgentStop(params) => {
+            let result = AgentService::stop(params, connection_state)
+                .await
+                .map_err(|message| map_service_error("agent.stop", message))?;
+            to_value("agent.stop", result)
+        }
+        RequestDispatch::ChatStart(params) => {
+            let result = ChatService::start(state, params)
+                .await
+                .map_err(|message| map_service_error("chat.start", message))?;
+            to_value("chat.start", result)
+        }
+        RequestDispatch::ChatLoad(params) => {
+            let result = ChatService::load(state, params)
+                .await
+                .map_err(|message| map_service_error("chat.load", message))?;
+            to_value("chat.load", result)
+        }
+        RequestDispatch::ChatStop(params) => {
+            let result = ChatService::stop(state, params)
+                .await
+                .map_err(|message| map_service_error("chat.stop", message))?;
+            to_value("chat.stop", result)
+        }
+        RequestDispatch::ChatList(params) => {
+            let result = ChatService::list(state, params)
+                .await
+                .map_err(|message| map_service_error("chat.list", message))?;
+            to_value("chat.list", result)
+        }
+        RequestDispatch::ChatAttach(params) => {
+            let result = ChatService::attach(params, state, connection_state, outbound_tx)
+                .await
+                .map_err(|message| map_service_error("chat.attach", message))?;
+            to_value("chat.attach", result)
+        }
+        RequestDispatch::ChatDetach(params) => {
+            let result = ChatService::detach(params, state, connection_state)
+                .await
+                .map_err(|message| map_service_error("chat.detach", message))?;
+            to_value("chat.detach", result)
+        }
     }
 }
 
@@ -321,6 +374,8 @@ fn map_service_error(method: &str, message: String) -> RpcError {
             "project.not_found"
         } else if method.starts_with("preset.") {
             "preset.not_found"
+        } else if method.starts_with("chat.") {
+            "chat.not_found"
         } else {
             "resource.not_found"
         };

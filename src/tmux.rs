@@ -117,7 +117,11 @@ pub async fn window_exists(session: &str, name: &str) -> Result<bool, String> {
 
     match windows {
         Ok(raw) => Ok(raw.lines().any(|entry| entry.trim() == name)),
-        Err(err) if err.contains("can't find session") || err.contains("no server running") => {
+        Err(err)
+            if err.contains("can't find session")
+                || err.contains("no server running")
+                || err.contains("no such file or directory") =>
+        {
             Ok(false)
         }
         Err(err) => Err(err),
@@ -136,7 +140,11 @@ pub async fn list_sessions() -> Result<Vec<String>, String> {
             .filter(|entry| !entry.is_empty())
             .map(ToOwned::to_owned)
             .collect()),
-        Err(err) if err.contains("no server running") => Ok(Vec::new()),
+        Err(err)
+            if err.contains("no server running") || err.contains("no such file or directory") =>
+        {
+            Ok(Vec::new())
+        }
         Err(err) => Err(err),
     }
 }
@@ -153,7 +161,10 @@ pub async fn session_exists(name: &str) -> Result<bool, String> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    if stderr.contains("can't find session") || stderr.contains("no server running") {
+    if stderr.contains("can't find session")
+        || stderr.contains("no server running")
+        || stderr.contains("no such file or directory")
+    {
         Ok(false)
     } else {
         Err(format!("tmux has-session failed: {}", stderr.trim()))

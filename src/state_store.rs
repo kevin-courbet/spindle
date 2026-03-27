@@ -60,12 +60,15 @@ impl Project {
             }
         };
 
+        let agents = project::load_project_agents(&self.path).unwrap_or_default();
+
         Ok(protocol::Project {
             id: self.id.clone(),
             name: self.name.clone(),
             path: self.path.clone(),
             default_branch: self.default_branch.clone(),
             presets,
+            agents,
         })
     }
 }
@@ -83,6 +86,7 @@ impl Thread {
             created_at: self.created_at.to_rfc3339(),
             tmux_session: self.tmux_session.clone(),
             port_offset: self.port_offset,
+            chat_sessions: Vec::new(),
         }
     }
 }

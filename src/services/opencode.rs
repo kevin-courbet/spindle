@@ -1,16 +1,22 @@
-use std::process::Stdio;
+use std::{env, process::Stdio};
 
 use tokio::{
     net::TcpStream,
     process::Command,
     time::{sleep, Duration, Instant},
 };
+use tracing::info;
 
 use crate::protocol;
 
 const OPENCODE_HOST: &str = "127.0.0.1";
 const OPENCODE_PORT: u16 = 4101;
 const OPENCODE_URL: &str = "http://127.0.0.1:4101";
+const DEFAULT_OPENCODE_BIN: &str = "/home/wsl/.bun/bin/opencode";
+
+fn opencode_bin() -> String {
+    env::var("OPENCODE_BIN").unwrap_or_else(|_| DEFAULT_OPENCODE_BIN.to_string())
+}
 
 pub struct OpencodeService;
 
@@ -28,25 +34,38 @@ impl OpencodeService {
     pub async fn ensure(
         _params: protocol::OpencodeEnsureParams,
     ) -> Result<protocol::OpencodeEnsureResult, String> {
-        if is_running().await {
-            return Ok(OPENCODE_URL.to_string());
-        }
-
-        Command::new("opencode")
-            .arg("serve")
-            .arg("--hostname")
-            .arg(OPENCODE_HOST)
-            .arg("--port")
-            .arg(OPENCODE_PORT.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| format!("failed to start opencode serve: {err}"))?;
-
-        wait_for_startup().await?;
-        Ok(OPENCODE_URL.to_string())
+        ensure_running().await
     }
+}
+
+/// Start opencode serve if not already running. Called at daemon startup
+/// and via the opencode.ensure RPC.
+pub async fn ensure_running() -> Result<String, String> {
+    if is_running().await {
+        return Ok(OPENCODE_URL.to_string());
+    }
+
+    let bin = opencode_bin();
+    info!(
+        "starting opencode serve on {}:{}",
+        OPENCODE_HOST, OPENCODE_PORT
+    );
+
+    Command::new(&bin)
+        .arg("serve")
+        .arg("--hostname")
+        .arg(OPENCODE_HOST)
+        .arg("--port")
+        .arg(OPENCODE_PORT.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("failed to start opencode serve ({}): {}", bin, err))?;
+
+    wait_for_startup().await?;
+    info!("opencode serve is ready");
+    Ok(OPENCODE_URL.to_string())
 }
 
 async fn is_running() -> bool {

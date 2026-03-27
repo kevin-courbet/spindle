@@ -38,6 +38,7 @@ pub struct AppState {
     state_version: Arc<AtomicU64>,
     next_operation_id: Arc<AtomicU64>,
     pub store: Arc<Mutex<StateStore>>,
+    pub chat: Arc<Mutex<services::chat::ChatState>>,
     pub create_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
 
@@ -56,6 +57,7 @@ impl AppState {
             state_version: Arc::new(AtomicU64::new(0)),
             next_operation_id: Arc::new(AtomicU64::new(1)),
             store: Arc::new(Mutex::new(store)),
+            chat: Arc::new(Mutex::new(services::chat::ChatState::default())),
             create_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -125,6 +127,26 @@ impl AppState {
 
     pub fn emit_preset_output(&self, event: protocol::PresetOutputEvent) {
         self.emit_event("preset.output", event);
+    }
+
+    pub fn emit_agent_status_changed(&self, event: protocol::AgentStatusChanged) {
+        self.emit_event("agent.status_changed", event);
+    }
+
+    pub fn emit_chat_session_created(&self, event: protocol::ChatSessionCreatedEvent) {
+        self.emit_event("chat.session_created", event);
+    }
+
+    pub fn emit_chat_session_ready(&self, event: protocol::ChatSessionReadyEvent) {
+        self.emit_event("chat.session_ready", event);
+    }
+
+    pub fn emit_chat_session_failed(&self, event: protocol::ChatSessionFailedEvent) {
+        self.emit_event("chat.session_failed", event);
+    }
+
+    pub fn emit_chat_session_ended(&self, event: protocol::ChatSessionEndedEvent) {
+        self.emit_event("chat.session_ended", event);
     }
 
     pub fn emit_state_delta(&self, operations: Vec<protocol::StateDeltaOperationPayload>) {
@@ -504,11 +526,32 @@ async fn handle_connection(
                 });
             }
             Ok(Message::Binary(data)) => {
-                if let Err(err) =
-                    terminal::handle_binary_frame(data.to_vec(), Arc::clone(&connection_state))
-                        .await
+                if data.len() < 2 {
+                    warn!(%connection_id, "received short binary frame");
+                    continue;
+                }
+
+                let channel_id = u16::from_be_bytes([data[0], data[1]]);
+                let payload = data[2..].to_vec();
+                match services::chat::ChatService::handle_binary_frame(
+                    Arc::clone(&state),
+                    channel_id,
+                    payload,
+                )
+                .await
                 {
-                    warn!(%connection_id, error = %err, "failed to route binary frame");
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(err) =
+                            terminal::handle_binary_frame(data.to_vec(), Arc::clone(&connection_state))
+                                .await
+                        {
+                            warn!(%connection_id, error = %err, "failed to route binary frame");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(%connection_id, error = %err, "failed to route chat binary frame");
+                    }
                 }
             }
             Ok(Message::Ping(payload)) => {
@@ -524,6 +567,11 @@ async fn handle_connection(
         }
     }
 
+    services::chat::ChatService::cleanup_connection_channels(
+        Arc::clone(&state),
+        Arc::clone(&connection_state),
+    )
+    .await;
     terminal::cleanup_connection(Arc::clone(&connection_state)).await;
     if let Some(events_task) = events_task.lock().await.take() {
         events_task.abort();

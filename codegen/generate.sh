@@ -25,6 +25,7 @@ selected_defs = [
     "ThreadStatus",
     "SourceType",
     "PresetStatus",
+    "SystemStatsResult",
     "DirectoryEntry",
     "BinaryFrame",
 ]
@@ -88,6 +89,8 @@ def rust_type(node: dict) -> str:
 
     if node_type == "string":
         return "String"
+    if node_type == "number":
+        return "f64"
     if node_type == "integer":
         return integer_type(node)
     if node_type == "boolean":

@@ -22,6 +22,7 @@ const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(15);
 pub struct TerminalConnectionState {
     pub(crate) by_channel: HashMap<u16, Attachment>,
     pub(crate) by_agent_channel: HashMap<u16, AgentAttachment>,
+    pub(crate) by_chat_channel: HashMap<u16, String>,
     pub(crate) by_target: HashMap<String, u16>,
     pub(crate) attaching_targets: HashMap<String, u16>,
 }
@@ -375,6 +376,7 @@ pub async fn cleanup_connection(connection_state: Arc<Mutex<TerminalConnectionSt
         let mut guard = connection_state.lock().await;
         guard.by_target.clear();
         guard.attaching_targets.clear();
+        guard.by_chat_channel.clear();
         (
             std::mem::take(&mut guard.by_channel),
             std::mem::take(&mut guard.by_agent_channel),

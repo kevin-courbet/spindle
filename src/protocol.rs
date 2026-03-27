@@ -72,6 +72,65 @@ pub struct Thread {
     pub tmux_session: String,
     #[serde(default)]
     pub port_offset: u16,
+    #[serde(default)]
+    pub chat_sessions: Vec<ChatSessionSummary>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum ChatSessionStatus {
+    #[serde(rename = "starting")]
+    Starting,
+    #[serde(rename = "ready")]
+    Ready,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "ended")]
+    Ended,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatSessionSummary {
+    pub session_id: String,
+    pub agent_type: String,
+    pub status: ChatSessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatSessionCreatedEvent {
+    pub thread_id: String,
+    pub session_id: String,
+    pub agent_type: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatSessionReadyEvent {
+    pub thread_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatSessionFailedEvent {
+    pub thread_id: String,
+    pub session_id: String,
+    pub error: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatSessionEndedEvent {
+    pub thread_id: String,
+    pub session_id: String,
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -285,6 +344,21 @@ pub enum StateDeltaOperationPayload {
         stream: PresetOutputStream,
         chunk: String,
     },
+    #[serde(rename = "chat.session_added")]
+    ChatSessionAdded {
+        thread_id: String,
+        chat_session: ChatSessionSummary,
+    },
+    #[serde(rename = "chat.session_updated")]
+    ChatSessionUpdated {
+        thread_id: String,
+        chat_session: ChatSessionSummary,
+    },
+    #[serde(rename = "chat.session_removed")]
+    ChatSessionRemoved {
+        thread_id: String,
+        session_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -478,6 +552,40 @@ pub struct AgentStopParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatStartParams {
+    pub thread_id: String,
+    pub agent_name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatLoadParams {
+    pub thread_id: String,
+    pub session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatStopParams {
+    pub thread_id: String,
+    pub session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatListParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatAttachParams {
+    pub thread_id: String,
+    pub session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatDetachParams {
+    pub channel_id: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
     pub name: String,
     pub path: String,
@@ -585,6 +693,31 @@ pub struct AgentStartResult {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AgentStopResult {}
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatStartResult {
+    pub session_id: String,
+    pub status: ChatSessionStatus,
+}
+
+pub type ChatLoadResult = ChatStartResult;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatStopResult {
+    pub archived: bool,
+}
+
+pub type ChatListResult = Vec<ChatSessionSummary>;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatAttachResult {
+    pub channel_id: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatDetachResult {
+    pub detached: bool,
+}
+
 pub const METHOD_SESSION_HELLO: &str = "session.hello";
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
@@ -628,6 +761,12 @@ pub const METHOD_PRESET_STOP: &str = "preset.stop";
 pub const METHOD_PRESET_RESTART: &str = "preset.restart";
 pub const METHOD_AGENT_START: &str = "agent.start";
 pub const METHOD_AGENT_STOP: &str = "agent.stop";
+pub const METHOD_CHAT_START: &str = "chat.start";
+pub const METHOD_CHAT_LOAD: &str = "chat.load";
+pub const METHOD_CHAT_STOP: &str = "chat.stop";
+pub const METHOD_CHAT_LIST: &str = "chat.list";
+pub const METHOD_CHAT_ATTACH: &str = "chat.attach";
+pub const METHOD_CHAT_DETACH: &str = "chat.detach";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -703,6 +842,18 @@ pub enum RequestDispatch {
     AgentStart(AgentStartParams),
     #[serde(rename = "agent.stop")]
     AgentStop(AgentStopParams),
+    #[serde(rename = "chat.start")]
+    ChatStart(ChatStartParams),
+    #[serde(rename = "chat.load")]
+    ChatLoad(ChatLoadParams),
+    #[serde(rename = "chat.stop")]
+    ChatStop(ChatStopParams),
+    #[serde(rename = "chat.list")]
+    ChatList(ChatListParams),
+    #[serde(rename = "chat.attach")]
+    ChatAttach(ChatAttachParams),
+    #[serde(rename = "chat.detach")]
+    ChatDetach(ChatDetachParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
 }
@@ -799,6 +950,24 @@ pub fn parse_request_dispatch(
         METHOD_AGENT_STOP => serde_json::from_value::<AgentStopParams>(params)
             .map(RequestDispatch::AgentStop)
             .map_err(|err| format!("invalid agent.stop params: {err}")),
+        METHOD_CHAT_START => serde_json::from_value::<ChatStartParams>(params)
+            .map(RequestDispatch::ChatStart)
+            .map_err(|err| format!("invalid chat.start params: {err}")),
+        METHOD_CHAT_LOAD => serde_json::from_value::<ChatLoadParams>(params)
+            .map(RequestDispatch::ChatLoad)
+            .map_err(|err| format!("invalid chat.load params: {err}")),
+        METHOD_CHAT_STOP => serde_json::from_value::<ChatStopParams>(params)
+            .map(RequestDispatch::ChatStop)
+            .map_err(|err| format!("invalid chat.stop params: {err}")),
+        METHOD_CHAT_LIST => serde_json::from_value::<ChatListParams>(params)
+            .map(RequestDispatch::ChatList)
+            .map_err(|err| format!("invalid chat.list params: {err}")),
+        METHOD_CHAT_ATTACH => serde_json::from_value::<ChatAttachParams>(params)
+            .map(RequestDispatch::ChatAttach)
+            .map_err(|err| format!("invalid chat.attach params: {err}")),
+        METHOD_CHAT_DETACH => serde_json::from_value::<ChatDetachParams>(params)
+            .map(RequestDispatch::ChatDetach)
+            .map_err(|err| format!("invalid chat.detach params: {err}")),
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),

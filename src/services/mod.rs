@@ -1,3 +1,5 @@
+pub mod agent;
+pub mod chat;
 pub mod file;
 pub mod opencode;
 pub mod preset;

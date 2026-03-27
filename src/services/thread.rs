@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     protocol,
-    services::{preset::PresetService, sanitize_name, short_id},
+    services::{chat::ChatService, preset::PresetService, sanitize_name, short_id},
     state_store::{port_base_with_offset, thread_env, Thread},
     tmux, AppState,
 };
@@ -249,6 +249,9 @@ impl ThreadService {
             )?;
             (thread, project_path)
         };
+
+        ChatService::stop_all_for_thread(Arc::clone(&state), &thread.id, "thread_closed", true)
+            .await?;
 
         if tmux::session_exists(&thread.tmux_session).await? {
             let _ = tmux::kill_session(&thread.tmux_session).await;
