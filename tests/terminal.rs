@@ -338,7 +338,7 @@ async fn first_terminal_attach_delivers_prompt_without_input() {
 
     let replay = replay_bytes.expect(
         "first terminal attach must deliver scrollback containing the shell prompt \
-         without any user input"
+         without any user input",
     );
 
     let replay_str = String::from_utf8_lossy(&replay);
@@ -397,8 +397,6 @@ async fn scrollback_replay_ends_with_trailing_crlf() {
         replay_bytes.ends_with(b"\r\n"),
         "scrollback replay must end with CR+LF for correct cursor positioning. \
          Last 20 bytes: {:?}",
-        String::from_utf8_lossy(
-            &replay_bytes[replay_bytes.len().saturating_sub(20)..]
-        )
+        String::from_utf8_lossy(&replay_bytes[replay_bytes.len().saturating_sub(20)..])
     );
 }

@@ -88,11 +88,26 @@ pub enum ChatSessionStatus {
     Ended,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub enum AgentStatus {
+    #[default]
+    #[serde(rename = "idle")]
+    Idle,
+    #[serde(rename = "busy")]
+    Busy,
+    #[serde(rename = "stalled")]
+    Stalled,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatSessionSummary {
     pub session_id: String,
     pub agent_type: String,
     pub status: ChatSessionStatus,
+    #[serde(default)]
+    pub agent_status: AgentStatus,
+    #[serde(default)]
+    pub worker_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +146,15 @@ pub struct ChatSessionEndedEvent {
     pub thread_id: String,
     pub session_id: String,
     pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatStatusChangedEvent {
+    pub thread_id: String,
+    pub session_id: String,
+    pub old_status: AgentStatus,
+    pub new_status: AgentStatus,
+    pub worker_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

@@ -154,6 +154,10 @@ impl AppState {
         self.emit_event("chat.session_ended", event);
     }
 
+    pub fn emit_chat_status_changed(&self, event: protocol::ChatStatusChangedEvent) {
+        self.emit_event("chat.status_changed", event);
+    }
+
     pub fn emit_state_delta(&self, operations: Vec<protocol::StateDeltaOperationPayload>) {
         if operations.is_empty() {
             return;
@@ -229,7 +233,9 @@ pub async fn serve_listener(listener: TcpListener, mut shutdown_rx: oneshot::Rec
         warn!(error = %err, "failed to start opencode serve at startup");
     }
     let state = Arc::new(AppState::new(store));
-    if let Err(err) = services::chat::ChatService::recover_persisted_sessions(Arc::clone(&state)).await {
+    if let Err(err) =
+        services::chat::ChatService::recover_persisted_sessions(Arc::clone(&state)).await
+    {
         warn!(error = %err, "failed to recover persisted chat sessions");
     }
     let local_addr = match listener.local_addr() {
@@ -550,9 +556,11 @@ async fn handle_connection(
                 {
                     Ok(true) => {}
                     Ok(false) => {
-                        if let Err(err) =
-                            terminal::handle_binary_frame(data.to_vec(), Arc::clone(&connection_state))
-                                .await
+                        if let Err(err) = terminal::handle_binary_frame(
+                            data.to_vec(),
+                            Arc::clone(&connection_state),
+                        )
+                        .await
                         {
                             warn!(%connection_id, error = %err, "failed to route binary frame");
                         }

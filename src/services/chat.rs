@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::{mpsc, oneshot, Mutex, Notify},
+    task::JoinHandle,
     time::{timeout, Duration},
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -30,6 +31,9 @@ const CHAT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(35);
 const CHAT_HISTORY_BATCH_SIZE: usize = 100;
 const CHAT_UPDATE_METHOD: &str = "session/update";
+const CHAT_PROMPT_METHOD: &str = "session/prompt";
+const CHAT_CANCEL_METHOD: &str = "session/cancel";
+const CHAT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct ChatService;
 
@@ -52,7 +56,13 @@ struct ChatSessionRuntime {
     status_notify: Arc<Notify>,
     ended_emitted: bool,
     history_path: PathBuf,
+    input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
+    active_tools: HashSet<String>,
+    pending_prompt_ids: HashSet<String>,
+    last_update_time: Option<chrono::DateTime<Utc>>,
+    stall_generation: u64,
+    stall_task: Option<JoinHandle<()>>,
 }
 
 impl ChatState {
@@ -81,18 +91,22 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatStartParams,
     ) -> Result<protocol::ChatStartResult, String> {
-        let (project_path, command, cwd) = resolve_agent_launch(&state, &params.thread_id, &params.agent_name).await?;
+        let (project_path, command, cwd) =
+            resolve_agent_launch(&state, &params.thread_id, &params.agent_name).await?;
 
         let session_id = Uuid::new_v4().to_string();
         let created_at = Utc::now().to_rfc3339();
         {
             let mut chat = state.chat.lock().await;
-            let history_path = history_path_for_session(&chat.history_root, &params.thread_id, &session_id);
+            let history_path =
+                history_path_for_session(&chat.history_root, &params.thread_id, &session_id);
             let runtime = ChatSessionRuntime {
                 summary: protocol::ChatSessionSummary {
                     session_id: session_id.clone(),
                     agent_type: params.agent_name.clone(),
                     status: protocol::ChatSessionStatus::Starting,
+                    agent_status: protocol::AgentStatus::Idle,
+                    worker_count: 0,
                     title: None,
                     model_id: None,
                     created_at,
@@ -105,7 +119,13 @@ impl ChatService {
                 status_notify: Arc::new(Notify::new()),
                 ended_emitted: false,
                 history_path,
+                input_buffer: Vec::new(),
                 output_buffer: Vec::new(),
+                active_tools: HashSet::new(),
+                pending_prompt_ids: HashSet::new(),
+                last_update_time: None,
+                stall_generation: 0,
+                stall_task: None,
             };
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -161,10 +181,9 @@ impl ChatService {
                 });
             }
 
-            let acp_session_id = session
-                .acp_session_id
-                .clone()
-                .ok_or_else(|| format!("chat session {} has no ACP session id", params.session_id))?;
+            let acp_session_id = session.acp_session_id.clone().ok_or_else(|| {
+                format!("chat session {} has no ACP session id", params.session_id)
+            })?;
             session.summary.status = protocol::ChatSessionStatus::Starting;
             session.input_tx = None;
             let stop_tx = session.stop_tx.take();
@@ -178,7 +197,8 @@ impl ChatService {
 
         emit_state_delta_updated(&state, &params.thread_id, &params.session_id).await;
 
-        let (project_path, command, cwd) = resolve_agent_launch(&state, &params.thread_id, &agent_type).await?;
+        let (project_path, command, cwd) =
+            resolve_agent_launch(&state, &params.thread_id, &agent_type).await?;
         spawn_session_task(
             Arc::clone(&state),
             params.thread_id,
@@ -200,7 +220,14 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatStopParams,
     ) -> Result<protocol::ChatStopResult, String> {
-        stop_session_internal(state, &params.thread_id, &params.session_id, "stopped", false).await?;
+        stop_session_internal(
+            state,
+            &params.thread_id,
+            &params.session_id,
+            "stopped",
+            false,
+        )
+        .await?;
         Ok(protocol::ChatStopResult { archived: true })
     }
 
@@ -228,7 +255,8 @@ impl ChatService {
             let chat = state.chat.lock().await;
             chat.history_root.clone()
         };
-        let history_path = history_path_for_session(&history_root, &params.thread_id, &params.session_id);
+        let history_path =
+            history_path_for_session(&history_root, &params.thread_id, &params.session_id);
         read_history_page(&history_path, params.cursor)
     }
 
@@ -292,7 +320,9 @@ impl ChatService {
 
                 match session.summary.status {
                     protocol::ChatSessionStatus::Ready => None,
-                    protocol::ChatSessionStatus::Starting => Some(Arc::clone(&session.status_notify)),
+                    protocol::ChatSessionStatus::Starting => {
+                        Some(Arc::clone(&session.status_notify))
+                    }
                     protocol::ChatSessionStatus::Failed | protocol::ChatSessionStatus::Ended => {
                         return Err(format!(
                             "chat session {} is {}",
@@ -306,7 +336,12 @@ impl ChatService {
             if let Some(notify) = wait_notify {
                 timeout(CHAT_ATTACH_WAIT_TIMEOUT, notify.notified())
                     .await
-                    .map_err(|_| format!("timed out waiting for chat session {} to become ready", params.session_id))?;
+                    .map_err(|_| {
+                        format!(
+                            "timed out waiting for chat session {} to become ready",
+                            params.session_id
+                        )
+                    })?;
                 continue;
             }
 
@@ -334,7 +369,8 @@ impl ChatService {
             session.attached_channels.insert(channel_id);
             chat.channel_to_session
                 .insert(channel_id, params.session_id.clone());
-            chat.channel_outbound.insert(channel_id, outbound_tx.clone());
+            chat.channel_outbound
+                .insert(channel_id, outbound_tx.clone());
             conn.by_chat_channel
                 .insert(channel_id, params.session_id.clone());
 
@@ -361,28 +397,34 @@ impl ChatService {
         channel_id: u16,
         payload: Vec<u8>,
     ) -> Result<bool, String> {
-        let input_tx = {
-            let chat = state.chat.lock().await;
-            let Some(session_id) = chat.channel_to_session.get(&channel_id) else {
+        let (input_tx, transitions) = {
+            let mut chat = state.chat.lock().await;
+            let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
                 return Ok(false);
             };
             let session = chat
                 .sessions
-                .get(session_id)
+                .get_mut(&session_id)
                 .ok_or_else(|| format!("chat session missing for channel {channel_id}"))?;
-            session
+            let input_tx = session
                 .input_tx
                 .as_ref()
-                .ok_or_else(|| format!("chat session {} is not running", session.summary.session_id))?
-                .clone()
+                .ok_or_else(|| {
+                    format!("chat session {} is not running", session.summary.session_id)
+                })?
+                .clone();
+            let messages = extract_json_messages(&mut session.input_buffer, &payload, "input");
+            let transitions = apply_inbound_status_updates(&state, session, messages);
+            (input_tx, transitions)
         };
+
+        emit_status_transitions(&state, transitions).await;
 
         input_tx
             .try_send(payload)
             .map_err(|err| format!("failed to queue chat input for channel {channel_id}: {err}"))?;
         Ok(true)
     }
-
     pub async fn cleanup_connection_channels(
         state: Arc<AppState>,
         connection_state: Arc<Mutex<TerminalConnectionState>>,
@@ -411,7 +453,8 @@ impl ChatService {
         };
 
         for session_id in session_ids {
-            stop_session_internal(Arc::clone(&state), thread_id, &session_id, reason, purge).await?;
+            stop_session_internal(Arc::clone(&state), thread_id, &session_id, reason, purge)
+                .await?;
         }
 
         if purge {
@@ -427,7 +470,10 @@ impl ChatService {
         Ok(())
     }
 
-    pub async fn thread_chat_sessions(state: Arc<AppState>, thread_id: &str) -> Vec<protocol::ChatSessionSummary> {
+    pub async fn thread_chat_sessions(
+        state: Arc<AppState>,
+        thread_id: &str,
+    ) -> Vec<protocol::ChatSessionSummary> {
         chat_session_summaries_for_thread(&state, thread_id).await
     }
 }
@@ -531,26 +577,14 @@ async fn run_session_task(
     let handshake = match handshake {
         Ok(result) => result,
         Err(error) => {
-            mark_session_failed(
-                Arc::clone(&state),
-                &thread_id,
-                &session_id,
-                error,
-            )
-            .await;
+            mark_session_failed(Arc::clone(&state), &thread_id, &session_id, error).await;
             let _ = child.kill().await;
             input_task.abort();
             return Ok(());
         }
     };
 
-    mark_session_ready(
-        Arc::clone(&state),
-        &thread_id,
-        &session_id,
-        &handshake,
-    )
-    .await;
+    mark_session_ready(Arc::clone(&state), &thread_id, &session_id, &handshake).await;
 
     let mut buf = [0_u8; CHAT_IO_CHUNK_SIZE];
     let mut explicit_stop = false;
@@ -606,21 +640,26 @@ async fn perform_handshake(
     load_session_id: Option<String>,
 ) -> Result<HandshakeResult, String> {
     let mut buffer = Vec::new();
-    send_acp_request(input_tx, 1, "initialize", json!({
-        "protocolVersion": 1,
-        "clientCapabilities": {
-            "fs": {
-                "readTextFile": false,
-                "writeTextFile": false
+    send_acp_request(
+        input_tx,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
             },
-            "terminal": false
-        },
-        "clientInfo": {
-            "name": "Threadmill",
-            "title": "Threadmill",
-            "version": "dev"
-        }
-    }))
+            "clientInfo": {
+                "name": "Threadmill",
+                "title": "Threadmill",
+                "version": "dev"
+            }
+        }),
+    )
     .await?;
 
     let init = wait_for_acp_response(stdout, &mut buffer, 1).await?;
@@ -754,14 +793,289 @@ async fn next_json_line(
     }
 }
 
+#[derive(Debug)]
+struct StatusTransition {
+    thread_id: String,
+    session_id: String,
+    old_status: protocol::AgentStatus,
+    new_status: protocol::AgentStatus,
+    worker_count: usize,
+}
+
+async fn emit_status_transitions(state: &Arc<AppState>, transitions: Vec<StatusTransition>) {
+    for transition in transitions {
+        state.emit_chat_status_changed(protocol::ChatStatusChangedEvent {
+            thread_id: transition.thread_id.clone(),
+            session_id: transition.session_id.clone(),
+            old_status: transition.old_status,
+            new_status: transition.new_status,
+            worker_count: transition.worker_count,
+        });
+        emit_state_delta_updated(state, &transition.thread_id, &transition.session_id).await;
+    }
+}
+
+fn apply_status_transition(
+    session: &mut ChatSessionRuntime,
+    new_status: protocol::AgentStatus,
+    transitions: &mut Vec<StatusTransition>,
+) {
+    let old_status = session.summary.agent_status.clone();
+    if old_status == new_status {
+        return;
+    }
+
+    session.summary.agent_status = new_status.clone();
+    transitions.push(StatusTransition {
+        thread_id: session.thread_id.clone(),
+        session_id: session.summary.session_id.clone(),
+        old_status,
+        new_status,
+        worker_count: session.summary.worker_count,
+    });
+}
+
+fn reset_status_tracking(
+    session: &mut ChatSessionRuntime,
+    transitions: &mut Vec<StatusTransition>,
+) {
+    session.active_tools.clear();
+    session.pending_prompt_ids.clear();
+    session.summary.worker_count = 0;
+    cancel_stall_timer(session);
+    apply_status_transition(session, protocol::AgentStatus::Idle, transitions);
+}
+
+fn cancel_stall_timer(session: &mut ChatSessionRuntime) {
+    session.stall_generation = session.stall_generation.wrapping_add(1);
+    session.last_update_time = None;
+    if let Some(task) = session.stall_task.take() {
+        task.abort();
+    }
+}
+
+fn restart_stall_timer(state: &Arc<AppState>, session: &mut ChatSessionRuntime) {
+    session.stall_generation = session.stall_generation.wrapping_add(1);
+    session.last_update_time = Some(Utc::now());
+    if let Some(task) = session.stall_task.take() {
+        task.abort();
+    }
+
+    let generation = session.stall_generation;
+    let session_id = session.summary.session_id.clone();
+    let state = Arc::clone(state);
+    session.stall_task = Some(tokio::spawn(async move {
+        tokio::time::sleep(CHAT_STALL_TIMEOUT).await;
+        handle_stall_timeout(state, session_id, generation).await;
+    }));
+}
+
+async fn handle_stall_timeout(state: Arc<AppState>, session_id: String, generation: u64) {
+    let transitions = {
+        let mut transitions = Vec::new();
+        let mut chat = state.chat.lock().await;
+        let Some(session) = chat.sessions.get_mut(&session_id) else {
+            return;
+        };
+
+        if session.stall_generation != generation
+            || session.summary.agent_status != protocol::AgentStatus::Busy
+        {
+            return;
+        }
+
+        session.stall_task = None;
+        apply_status_transition(session, protocol::AgentStatus::Stalled, &mut transitions);
+        transitions
+    };
+
+    if transitions.is_empty() {
+        return;
+    }
+
+    emit_status_transitions(&state, transitions).await;
+}
+
+fn apply_inbound_status_updates(
+    state: &Arc<AppState>,
+    session: &mut ChatSessionRuntime,
+    messages: Vec<Value>,
+) -> Vec<StatusTransition> {
+    let mut transitions = Vec::new();
+
+    for message in messages {
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if method == CHAT_PROMPT_METHOD {
+            if let Some(id) = request_id_key(message.get("id")) {
+                session.pending_prompt_ids.insert(id);
+            }
+            session.active_tools.clear();
+            session.summary.worker_count = 0;
+            apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
+            restart_stall_timer(state, session);
+            continue;
+        }
+
+        if method == CHAT_CANCEL_METHOD {
+            reset_status_tracking(session, &mut transitions);
+        }
+    }
+
+    transitions
+}
+
+fn apply_outbound_status_updates(
+    state: &Arc<AppState>,
+    session: &mut ChatSessionRuntime,
+    messages: Vec<Value>,
+) -> Vec<StatusTransition> {
+    let mut transitions = Vec::new();
+
+    for message in messages {
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            if method == CHAT_UPDATE_METHOD {
+                apply_worker_update(session, message.get("params"));
+                if session.summary.agent_status == protocol::AgentStatus::Busy {
+                    restart_stall_timer(state, session);
+                } else if session.summary.agent_status == protocol::AgentStatus::Stalled {
+                    apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
+                    restart_stall_timer(state, session);
+                }
+            }
+        }
+
+        if !(message.get("result").is_some() || message.get("error").is_some()) {
+            continue;
+        }
+
+        let Some(id) = request_id_key(message.get("id")) else {
+            continue;
+        };
+        if !session.pending_prompt_ids.remove(&id) {
+            continue;
+        }
+
+        reset_status_tracking(session, &mut transitions);
+    }
+
+    transitions
+}
+
+fn apply_worker_update(session: &mut ChatSessionRuntime, params: Option<&Value>) {
+    let Some(update) = params.and_then(|params| params.get("update")) else {
+        return;
+    };
+
+    let kind = update
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let status = extract_tool_status(update).unwrap_or_default();
+    let tool_call_id = extract_tool_call_id(update);
+
+    if kind == "tool_call" {
+        if matches!(status, "pending" | "in_progress") {
+            if let Some(tool_call_id) = tool_call_id {
+                session.active_tools.insert(tool_call_id);
+            }
+        }
+    } else if kind == "tool_call_update" && matches!(status, "completed" | "cancelled" | "error") {
+        if let Some(tool_call_id) = tool_call_id {
+            session.active_tools.remove(&tool_call_id);
+        }
+    }
+
+    session.summary.worker_count = session.active_tools.len();
+}
+
+fn extract_tool_call_id(update: &Value) -> Option<String> {
+    update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            update
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            update
+                .get("toolCall")
+                .and_then(|tool_call| tool_call.get("id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn extract_tool_status(update: &Value) -> Option<&str> {
+    update.get("status").and_then(Value::as_str).or_else(|| {
+        update
+            .get("toolCall")
+            .and_then(|tool_call| tool_call.get("status"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn request_id_key(id_value: Option<&Value>) -> Option<String> {
+    let id_value = id_value?;
+    id_value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| id_value.as_u64().map(|id| id.to_string()))
+        .or_else(|| id_value.as_i64().map(|id| id.to_string()))
+}
+
+fn extract_json_messages(buffer: &mut Vec<u8>, payload: &[u8], direction: &str) -> Vec<Value> {
+    buffer.extend_from_slice(payload);
+    let mut messages = Vec::new();
+
+    while let Some(newline_idx) = buffer.iter().position(|byte| *byte == b"\n"[0]) {
+        let line = buffer[..newline_idx].to_vec();
+        buffer.drain(..=newline_idx);
+        if line.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => messages.push(value),
+            Err(error) => {
+                warn!(error = %error, direction, "failed to parse chat JSON frame");
+            }
+        }
+    }
+
+    messages
+}
+
+fn collect_session_update_params(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .get("method")
+                .and_then(Value::as_str)
+                .map(|method| method == CHAT_UPDATE_METHOD)
+                .unwrap_or(false)
+        })
+        .filter_map(|message| message.get("params").cloned())
+        .collect()
+}
+
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
-    let (targets, history_path, updates) = {
+    let (targets, history_path, updates, transitions) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
-        let updates = extract_session_update_params(&mut session.output_buffer, payload);
+        let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let updates = collect_session_update_params(&messages);
+        let transitions = apply_outbound_status_updates(&state, session, messages);
         let history_path = session.history_path.clone();
         let attached_channels = session
             .attached_channels
@@ -779,8 +1093,10 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             })
             .collect::<Vec<_>>();
 
-        (targets, history_path, updates)
+        (targets, history_path, updates, transitions)
     };
+
+    emit_status_transitions(&state, transitions).await;
 
     if !updates.is_empty() {
         if let Err(error) = append_updates_to_history(&history_path, &updates) {
@@ -807,7 +1123,6 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         detach_channels(state, dead_channels).await;
     }
 }
-
 async fn mark_session_ready(
     state: Arc<AppState>,
     thread_id: &str,
@@ -835,16 +1150,26 @@ async fn mark_session_ready(
     emit_state_delta_updated(&state, thread_id, session_id).await;
 }
 
-async fn mark_session_failed(state: Arc<AppState>, thread_id: &str, session_id: &str, error: String) {
-    {
+async fn mark_session_failed(
+    state: Arc<AppState>,
+    thread_id: &str,
+    session_id: &str,
+    error: String,
+) {
+    let transitions = {
+        let mut transitions = Vec::new();
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
             session.summary.status = protocol::ChatSessionStatus::Failed;
             session.input_tx = None;
             session.stop_tx = None;
+            reset_status_tracking(session, &mut transitions);
             session.status_notify.notify_waiters();
         }
-    }
+        transitions
+    };
+
+    emit_status_transitions(&state, transitions).await;
 
     state.emit_chat_session_failed(protocol::ChatSessionFailedEvent {
         thread_id: thread_id.to_string(),
@@ -853,7 +1178,6 @@ async fn mark_session_failed(state: Arc<AppState>, thread_id: &str, session_id: 
     });
     emit_state_delta_updated(&state, thread_id, session_id).await;
 }
-
 async fn mark_session_ended(
     state: Arc<AppState>,
     thread_id: &str,
@@ -861,8 +1185,9 @@ async fn mark_session_ended(
     reason: &str,
     purge: bool,
 ) {
-    let mut should_emit_ended = false;
-    {
+    let (should_emit_ended, transitions) = {
+        let mut should_emit_ended = false;
+        let mut transitions = Vec::new();
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
             if !session.ended_emitted {
@@ -872,9 +1197,13 @@ async fn mark_session_ended(
                 session.ended_emitted = true;
                 should_emit_ended = true;
             }
+            reset_status_tracking(session, &mut transitions);
             session.status_notify.notify_waiters();
         }
-    }
+        (should_emit_ended, transitions)
+    };
+
+    emit_status_transitions(&state, transitions).await;
 
     if should_emit_ended {
         state.emit_chat_session_ended(protocol::ChatSessionEndedEvent {
@@ -889,7 +1218,6 @@ async fn mark_session_ended(
         purge_session(state, thread_id, session_id).await;
     }
 }
-
 async fn stop_session_internal(
     state: Arc<AppState>,
     thread_id: &str,
@@ -954,40 +1282,51 @@ async fn purge_session(state: Arc<AppState>, thread_id: &str, session_id: &str) 
         );
     }
 
-    state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ChatSessionRemoved {
-        thread_id: thread_id.to_string(),
-        session_id: session_id.to_string(),
-    }]);
+    state.emit_state_delta(vec![
+        protocol::StateDeltaOperationPayload::ChatSessionRemoved {
+            thread_id: thread_id.to_string(),
+            session_id: session_id.to_string(),
+        },
+    ]);
 }
 
 async fn emit_state_delta_added(state: &AppState, thread_id: &str, session_id: &str) {
     if let Some(chat_session) = find_summary(state, session_id).await {
-        state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ChatSessionAdded {
-            thread_id: thread_id.to_string(),
-            chat_session,
-        }]);
+        state.emit_state_delta(vec![
+            protocol::StateDeltaOperationPayload::ChatSessionAdded {
+                thread_id: thread_id.to_string(),
+                chat_session,
+            },
+        ]);
     }
 }
 
 async fn emit_state_delta_updated(state: &AppState, thread_id: &str, session_id: &str) {
     if let Some(chat_session) = find_summary(state, session_id).await {
-        state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ChatSessionUpdated {
-            thread_id: thread_id.to_string(),
-            chat_session,
-        }]);
+        state.emit_state_delta(vec![
+            protocol::StateDeltaOperationPayload::ChatSessionUpdated {
+                thread_id: thread_id.to_string(),
+                chat_session,
+            },
+        ]);
     }
 }
 
 async fn find_summary(state: &AppState, session_id: &str) -> Option<protocol::ChatSessionSummary> {
     let chat = state.chat.lock().await;
-    chat.sessions.get(session_id).map(|session| session.summary.clone())
+    chat.sessions
+        .get(session_id)
+        .map(|session| session.summary.clone())
 }
 
-async fn detach_channel(state: Arc<AppState>, channel_id: u16, hint_session_id: Option<String>) -> bool {
+async fn detach_channel(
+    state: Arc<AppState>,
+    channel_id: u16,
+    hint_session_id: Option<String>,
+) -> bool {
     let mut chat = state.chat.lock().await;
 
-    let session_id = hint_session_id
-        .or_else(|| chat.channel_to_session.get(&channel_id).cloned());
+    let session_id = hint_session_id.or_else(|| chat.channel_to_session.get(&channel_id).cloned());
     let Some(session_id) = session_id else {
         return false;
     };
@@ -1018,7 +1357,11 @@ async fn chat_session_summaries_for_thread(
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|session_id| chat.sessions.get(&session_id).map(|session| session.summary.clone()))
+        .filter_map(|session_id| {
+            chat.sessions
+                .get(&session_id)
+                .map(|session| session.summary.clone())
+        })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     sessions
@@ -1034,45 +1377,13 @@ fn chat_status_name(status: &protocol::ChatSessionStatus) -> &'static str {
 }
 
 fn history_path_for_session(history_root: &Path, thread_id: &str, session_id: &str) -> PathBuf {
-    history_root.join(thread_id).join(format!("{session_id}.jsonl"))
+    history_root
+        .join(thread_id)
+        .join(format!("{session_id}.jsonl"))
 }
 
 fn is_safe_history_component(value: &str) -> bool {
     !value.is_empty() && !value.contains('/') && !value.contains('\\') && !value.contains("..")
-}
-
-fn extract_session_update_params(output_buffer: &mut Vec<u8>, payload: &[u8]) -> Vec<Value> {
-    output_buffer.extend_from_slice(payload);
-    let mut updates = Vec::new();
-
-    while let Some(newline_idx) = output_buffer.iter().position(|byte| *byte == b'\n') {
-        let line = output_buffer[..newline_idx].to_vec();
-        output_buffer.drain(..=newline_idx);
-        if line.is_empty() {
-            continue;
-        }
-
-        let parsed = match serde_json::from_slice::<Value>(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(error = %error, "failed to parse chat agent output as JSON line");
-                continue;
-            }
-        };
-
-        if parsed
-            .get("method")
-            .and_then(Value::as_str)
-            .map(|method| method == CHAT_UPDATE_METHOD)
-            .unwrap_or(false)
-        {
-            if let Some(params) = parsed.get("params") {
-                updates.push(params.clone());
-            }
-        }
-    }
-
-    updates
 }
 
 fn append_updates_to_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
@@ -1095,8 +1406,12 @@ fn append_updates_to_history(history_path: &Path, updates: &[Value]) -> Result<(
     for update in updates {
         serde_json::to_writer(&mut file, update)
             .map_err(|err| format!("failed to encode history update: {err}"))?;
-        file.write_all(b"\n")
-            .map_err(|err| format!("failed to append newline to {}: {err}", history_path.display()))?;
+        file.write_all(b"\n").map_err(|err| {
+            format!(
+                "failed to append newline to {}: {err}",
+                history_path.display()
+            )
+        })?;
     }
 
     file.sync_data()
@@ -1192,7 +1507,8 @@ fn discover_history_sessions(
         let entries = fs::read_dir(thread_dir.path())
             .map_err(|err| format!("failed to read {}: {err}", thread_dir.path().display()))?;
         for entry in entries {
-            let entry = entry.map_err(|err| format!("failed to read chat history file entry: {err}"))?;
+            let entry =
+                entry.map_err(|err| format!("failed to read chat history file entry: {err}"))?;
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
@@ -1214,6 +1530,8 @@ fn discover_history_sessions(
                     session_id: stem.to_string(),
                     agent_type: "unknown".to_string(),
                     status: protocol::ChatSessionStatus::Ended,
+                    agent_status: protocol::AgentStatus::Idle,
+                    worker_count: 0,
                     title: None,
                     model_id: None,
                     created_at,
@@ -1226,7 +1544,13 @@ fn discover_history_sessions(
                 status_notify: Arc::new(Notify::new()),
                 ended_emitted: true,
                 history_path: path,
+                input_buffer: Vec::new(),
                 output_buffer: Vec::new(),
+                active_tools: HashSet::new(),
+                pending_prompt_ids: HashSet::new(),
+                last_update_time: None,
+                stall_generation: 0,
+                stall_task: None,
             });
         }
     }
@@ -1311,6 +1635,162 @@ mod tests {
     use super::*;
     use crate::state_store::{AppData, Project, StateStore, Thread};
 
+    fn make_test_state() -> Arc<AppState> {
+        Arc::new(AppState::new(StateStore {
+            path: PathBuf::from("/tmp/threadmill-tests.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: "thread-1".to_string(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Active,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }))
+    }
+
+    fn make_test_session() -> ChatSessionRuntime {
+        ChatSessionRuntime {
+            summary: protocol::ChatSessionSummary {
+                session_id: "session-1".to_string(),
+                agent_type: "opencode".to_string(),
+                status: protocol::ChatSessionStatus::Ready,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at: Utc::now().to_rfc3339(),
+            },
+            thread_id: "thread-1".to_string(),
+            acp_session_id: Some("acp-session-1".to_string()),
+            attached_channels: HashSet::new(),
+            input_tx: None,
+            stop_tx: None,
+            status_notify: Arc::new(Notify::new()),
+            ended_emitted: false,
+            history_path: PathBuf::from("/tmp/history.jsonl"),
+            input_buffer: Vec::new(),
+            output_buffer: Vec::new(),
+            active_tools: HashSet::new(),
+            pending_prompt_ids: HashSet::new(),
+            last_update_time: None,
+            stall_generation: 0,
+            stall_task: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_prompt_transitions_agent_to_busy() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+
+        let transitions = apply_inbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
+        );
+
+        assert_eq!(session.summary.agent_status, protocol::AgentStatus::Busy);
+        assert!(session.pending_prompt_ids.contains("42"));
+        assert_eq!(session.summary.worker_count, 0);
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].old_status, protocol::AgentStatus::Idle);
+        assert_eq!(transitions[0].new_status, protocol::AgentStatus::Busy);
+
+        cancel_stall_timer(&mut session);
+    }
+
+    #[tokio::test]
+    async fn outbound_tool_updates_adjust_worker_count() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.summary.agent_status = protocol::AgentStatus::Busy;
+
+        let started = apply_outbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"update": {"kind": "tool_call", "toolCallId": "tool-1", "status": "pending"}}
+            })],
+        );
+        assert!(started.is_empty());
+        assert_eq!(session.summary.worker_count, 1);
+
+        let completed = apply_outbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"update": {"kind": "tool_call_update", "toolCallId": "tool-1", "status": "completed"}}
+            })],
+        );
+        assert!(completed.is_empty());
+        assert_eq!(session.summary.worker_count, 0);
+
+        cancel_stall_timer(&mut session);
+    }
+
+    #[tokio::test]
+    async fn prompt_response_transitions_agent_back_to_idle() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.summary.agent_status = protocol::AgentStatus::Busy;
+        session.pending_prompt_ids.insert("7".to_string());
+        session.active_tools.insert("tool-1".to_string());
+        session.summary.worker_count = 1;
+
+        let transitions = apply_outbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}})],
+        );
+
+        assert_eq!(session.summary.agent_status, protocol::AgentStatus::Idle);
+        assert_eq!(session.summary.worker_count, 0);
+        assert!(session.active_tools.is_empty());
+        assert!(session.pending_prompt_ids.is_empty());
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].old_status, protocol::AgentStatus::Busy);
+        assert_eq!(transitions[0].new_status, protocol::AgentStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn stalled_session_update_transitions_back_to_busy() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.summary.agent_status = protocol::AgentStatus::Stalled;
+
+        let transitions = apply_outbound_status_updates(
+            &state,
+            &mut session,
+            vec![
+                json!({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"kind": "agent_message_chunk"}}}),
+            ],
+        );
+
+        assert_eq!(session.summary.agent_status, protocol::AgentStatus::Busy);
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].old_status, protocol::AgentStatus::Stalled);
+        assert_eq!(transitions[0].new_status, protocol::AgentStatus::Busy);
+
+        cancel_stall_timer(&mut session);
+    }
+
     #[tokio::test]
     async fn recovers_sessions_from_persisted_history_files() {
         let temp_root = std::env::temp_dir().join(format!(
@@ -1322,7 +1802,8 @@ mod tests {
         let thread_id = "thread-recovery".to_string();
         let session_id = "session-recovery".to_string();
 
-        let history_path = history_path_for_session(&state_dir.join("chat"), &thread_id, &session_id);
+        let history_path =
+            history_path_for_session(&state_dir.join("chat"), &thread_id, &session_id);
         fs::create_dir_all(
             history_path
                 .parent()

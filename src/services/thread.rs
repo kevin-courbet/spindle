@@ -190,7 +190,6 @@ impl ThreadService {
             create_tasks.remove(&params.thread_id)
         };
 
-
         if let Some(handle) = handle {
             handle.abort();
         }

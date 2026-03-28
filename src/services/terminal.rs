@@ -13,7 +13,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::{protocol, services::agent::{self, AgentAttachment}, AppState};
+use crate::{
+    protocol,
+    services::agent::{self, AgentAttachment},
+    AppState,
+};
 
 const INPUT_CHANNEL_CAPACITY: usize = 256;
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(15);
@@ -460,7 +464,13 @@ async fn cleanup_attachment(attachment: &mut Attachment) {
 
 async fn resolve_pane_target(session: &str, preset: &str) -> Result<String, String> {
     let windows_output = Command::new("tmux")
-        .args(["list-windows", "-t", session, "-F", "#{window_index}	#{window_name}"])
+        .args([
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_index}	#{window_name}",
+        ])
         .output()
         .await
         .map_err(|err| format!("failed to run tmux list-windows: {err}"))?;
@@ -531,7 +541,16 @@ fn select_window_target(session: &str, preset: &str, windows: &str) -> Option<St
 
 async fn capture_pane_scrollback(pane_target: &str) -> Result<String, String> {
     let output = Command::new("tmux")
-        .args(["capture-pane", "-e", "-p", "-J", "-t", pane_target, "-S", "-200"])
+        .args([
+            "capture-pane",
+            "-e",
+            "-p",
+            "-J",
+            "-t",
+            pane_target,
+            "-S",
+            "-200",
+        ])
         .output()
         .await
         .map_err(|err| format!("failed to run tmux capture-pane: {err}"))?;
@@ -543,7 +562,9 @@ async fn capture_pane_scrollback(pane_target: &str) -> Result<String, String> {
         ));
     }
 
-    Ok(sanitize_scrollback(&String::from_utf8_lossy(&output.stdout)))
+    Ok(sanitize_scrollback(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn sanitize_scrollback(scrollback: &str) -> String {
@@ -566,7 +587,6 @@ fn target_key(thread_id: &str, preset: &str) -> String {
     format!("{thread_id}:{preset}")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::sanitize_scrollback;
@@ -584,11 +604,14 @@ second line
         // Must strip leading blank lines and excess trailing blank lines,
         // but preserve exactly one trailing newline so the cursor lands on
         // the line below the last content (e.g. below the shell prompt).
-        assert_eq!(sanitize_scrollback(input), "first prompt
+        assert_eq!(
+            sanitize_scrollback(input),
+            "first prompt
 
 
 second line
-");
+"
+        );
     }
 
     #[test]
@@ -612,9 +635,21 @@ second line
 2	terminal
 3	terminal
 ";
-        assert_eq!(super::select_window_target("sess", "terminal", windows).as_deref(), Some("sess:2"));
-        assert_eq!(super::select_window_target("sess", "dev-server", windows), None);
-        assert_eq!(super::select_window_target("sess", "terminal", "1	zsh
-").as_deref(), Some("sess:1"));
+        assert_eq!(
+            super::select_window_target("sess", "terminal", windows).as_deref(),
+            Some("sess:2")
+        );
+        assert_eq!(
+            super::select_window_target("sess", "dev-server", windows),
+            None
+        );
+        assert_eq!(
+            super::select_window_target(
+                "sess", "terminal", "1	zsh
+"
+            )
+            .as_deref(),
+            Some("sess:1")
+        );
     }
 }

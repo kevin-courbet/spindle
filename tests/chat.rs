@@ -199,7 +199,9 @@ async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str,
             .wait_for_event("chat.session_ready", Duration::from_secs(10))
             .await;
         if let Ok(event) = ready {
-            if event["params"]["thread_id"] == thread_id && event["params"]["session_id"] == session_id {
+            if event["params"]["thread_id"] == thread_id
+                && event["params"]["session_id"] == session_id
+            {
                 return;
             }
         }
@@ -208,7 +210,9 @@ async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str,
             .wait_for_event("chat.session_failed", Duration::from_secs(1))
             .await;
         if let Ok(event) = failed {
-            if event["params"]["thread_id"] == thread_id && event["params"]["session_id"] == session_id {
+            if event["params"]["thread_id"] == thread_id
+                && event["params"]["session_id"] == session_id
+            {
                 panic!("chat session failed: {}", event["params"]["error"]);
             }
         }
@@ -258,7 +262,10 @@ async fn chat_start_emits_ready_and_lists_in_snapshot() {
         )
         .await
         .expect("chat.start");
-    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
     assert_eq!(started["status"], "starting");
 
     let created = harness
@@ -292,8 +299,12 @@ async fn chat_start_emits_ready_and_lists_in_snapshot() {
         .iter()
         .find(|thread| thread["id"] == thread_id)
         .expect("thread in snapshot");
-    let chat_sessions = thread["chat_sessions"].as_array().expect("chat sessions array");
-    assert!(chat_sessions.iter().any(|entry| entry["session_id"] == session_id));
+    let chat_sessions = thread["chat_sessions"]
+        .as_array()
+        .expect("chat sessions array");
+    assert!(chat_sessions
+        .iter()
+        .any(|entry| entry["session_id"] == session_id));
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
@@ -319,7 +330,10 @@ async fn chat_attach_queues_until_ready_and_fans_out_to_all_channels() {
         )
         .await
         .expect("chat.start");
-    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
 
     let first_attach = harness
         .rpc(
@@ -420,7 +434,10 @@ async fn chat_load_restarts_archived_session() {
         )
         .await
         .expect("chat.start");
-    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
     wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
 
     harness
@@ -469,7 +486,10 @@ async fn chat_history_persists_session_updates_with_cursor_pagination() {
         )
         .await
         .expect("chat.start");
-    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
     wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
 
     let attached = harness
@@ -547,7 +567,10 @@ async fn chat_history_nonexistent_session_returns_empty() {
         )
         .await
         .expect("chat.history for missing session");
-    assert!(history["updates"].as_array().expect("updates array").is_empty());
+    assert!(history["updates"]
+        .as_array()
+        .expect("updates array")
+        .is_empty());
     assert!(history["next_cursor"].is_null());
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
@@ -572,7 +595,10 @@ async fn thread_close_removes_chat_history_files() {
         )
         .await
         .expect("chat.start");
-    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
     wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
 
     let attached = harness
@@ -595,7 +621,10 @@ async fn thread_close_removes_chat_history_files() {
         .expect("wait for persisted marker output");
 
     let history_path = chat_history_path(&thread_id, &session_id);
-    assert!(history_path.exists(), "history file should exist before close");
+    assert!(
+        history_path.exists(),
+        "history file should exist before close"
+    );
 
     harness
         .rpc(
@@ -634,7 +663,10 @@ async fn thread_close_stops_chat_sessions() {
         )
         .await
         .expect("chat.start");
-    let session_id = started["session_id"].as_str().expect("session_id").to_string();
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
     wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
 
     harness

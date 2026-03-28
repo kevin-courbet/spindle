@@ -67,8 +67,7 @@ impl PresetService {
 
         if let Some(preset) = preset_config {
             let cwd = resolve_preset_cwd(&thread.worktree_path, preset.cwd.as_deref())?;
-            tmux::create_window(&thread.tmux_session, &effective_id, &preset.command, &cwd)
-                .await?;
+            tmux::create_window(&thread.tmux_session, &effective_id, &preset.command, &cwd).await?;
         } else {
             start_legacy_preset(&thread, &params.preset, &effective_id, &project.path).await?;
         }
