@@ -124,6 +124,7 @@ pub struct ChatSessionCreatedEvent {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatSessionReadyEvent {
+    pub acp_session_id: String,
     pub thread_id: String,
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -743,6 +744,7 @@ pub type ChatListResult = Vec<ChatSessionSummary>;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatAttachResult {
     pub channel_id: u16,
+    pub acp_session_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

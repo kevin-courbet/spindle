@@ -91,6 +91,7 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatStartParams,
     ) -> Result<protocol::ChatStartResult, String> {
+        tracing::info!(thread_id = %params.thread_id, agent = %params.agent_name, "chat_start");
         let (project_path, command, cwd) =
             resolve_agent_launch(&state, &params.thread_id, &params.agent_name).await?;
 
@@ -358,15 +359,23 @@ impl ChatService {
                     || chat.channel_to_session.contains_key(&candidate)
             });
 
-            let session = chat
-                .sessions
-                .get_mut(&params.session_id)
-                .ok_or_else(|| format!("chat session not found: {}", params.session_id))?;
-            if session.summary.status != protocol::ChatSessionStatus::Ready {
-                continue;
+            {
+                let session = chat
+                    .sessions
+                    .get(&params.session_id)
+                    .ok_or_else(|| format!("chat session not found: {}", params.session_id))?;
+                if session.summary.status != protocol::ChatSessionStatus::Ready {
+                    continue;
+                }
             }
 
-            session.attached_channels.insert(channel_id);
+            let acp_sid = chat.sessions.get(&params.session_id)
+                .and_then(|s| s.acp_session_id.clone())
+                .unwrap_or_default();
+
+            if let Some(session) = chat.sessions.get_mut(&params.session_id) {
+                session.attached_channels.insert(channel_id);
+            }
             chat.channel_to_session
                 .insert(channel_id, params.session_id.clone());
             chat.channel_outbound
@@ -374,7 +383,7 @@ impl ChatService {
             conn.by_chat_channel
                 .insert(channel_id, params.session_id.clone());
 
-            return Ok(protocol::ChatAttachResult { channel_id });
+            return Ok(protocol::ChatAttachResult { channel_id, acp_session_id: acp_sid });
         }
     }
 
@@ -420,8 +429,22 @@ impl ChatService {
 
         emit_status_transitions(&state, transitions).await;
 
+        // Rewrite Spindle session ID to ACP session ID in the payload
+        // so the agent receives its own session ID namespace
+        let rewritten_payload = {
+            let chat = state.chat.lock().await;
+            if let Some(sid) = chat.channel_to_session.get(&channel_id) {
+                if let Some(session) = chat.sessions.get(sid) {
+                    if let Some(ref acp_id) = session.acp_session_id {
+                        rewrite_session_id(&payload, sid, acp_id)
+                    } else { None }
+                } else { None }
+            } else { None }
+        };
+        let final_payload = rewritten_payload.unwrap_or(payload);
+
         input_tx
-            .try_send(payload)
+            .try_send(final_payload)
             .map_err(|err| format!("failed to queue chat input for channel {channel_id}: {err}"))?;
         Ok(true)
     }
@@ -668,7 +691,7 @@ async fn perform_handshake(
     let (method, params) = if let Some(session_id) = load_session_id {
         ("session/load", json!({ "sessionId": session_id }))
     } else {
-        ("session/new", json!({ "cwd": "." }))
+        ("session/new", json!({ "cwd": ".", "mcpServers": [] }))
     };
 
     send_acp_request(input_tx, 2, method, params).await?;
@@ -1066,6 +1089,21 @@ fn collect_session_update_params(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+
+/// Rewrite sessionId in a JSON payload. Spindle session IDs are the external
+/// contract; ACP session IDs are internal to the agent. Spindle translates
+/// at the relay boundary so clients never see ACP IDs.
+fn rewrite_session_id(payload: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
+    if from.is_empty() || to.is_empty() || from == to {
+        return None;
+    }
+    let payload_str = std::str::from_utf8(payload).ok()?;
+    if !payload_str.contains(from) {
+        return None;
+    }
+    Some(payload_str.replace(from, to).into_bytes())
+}
+
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
     let (targets, history_path, updates, transitions) = {
         let mut chat = state.chat.lock().await;
@@ -1109,11 +1147,22 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         }
     }
 
+    // Rewrite ACP session ID to Spindle session ID in outbound payload
+    let rewritten_payload = {
+        let chat = state.chat.lock().await;
+        if let Some(session) = chat.sessions.get(session_id) {
+            if let Some(ref acp_id) = session.acp_session_id {
+                rewrite_session_id(payload, acp_id, session_id)
+            } else { None }
+        } else { None }
+    };
+    let out_payload = rewritten_payload.as_deref().unwrap_or(payload);
+
     let mut dead_channels = Vec::new();
     for (channel_id, outbound) in targets {
-        let mut frame = Vec::with_capacity(payload.len() + 2);
+        let mut frame = Vec::with_capacity(out_payload.len() + 2);
         frame.extend_from_slice(&channel_id.to_be_bytes());
-        frame.extend_from_slice(payload);
+        frame.extend_from_slice(out_payload);
         if outbound.send(Message::Binary(frame)).is_err() {
             dead_channels.push(channel_id);
         }
@@ -1129,6 +1178,7 @@ async fn mark_session_ready(
     session_id: &str,
     handshake: &HandshakeResult,
 ) {
+    tracing::info!(thread_id, session_id, model = ?handshake.model_id, "chat_session_ready");
     {
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
@@ -1141,6 +1191,7 @@ async fn mark_session_ready(
     }
 
     state.emit_chat_session_ready(protocol::ChatSessionReadyEvent {
+        acp_session_id: handshake.acp_session_id.clone(),
         thread_id: thread_id.to_string(),
         session_id: session_id.to_string(),
         modes: handshake.modes.clone(),
@@ -1156,6 +1207,7 @@ async fn mark_session_failed(
     session_id: &str,
     error: String,
 ) {
+    tracing::warn!(thread_id, session_id, %error, "chat_session_failed");
     let transitions = {
         let mut transitions = Vec::new();
         let mut chat = state.chat.lock().await;
