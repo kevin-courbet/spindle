@@ -424,6 +424,14 @@ pub fn resolve_preset_cwd(worktree_path: &str, cwd: Option<&str>) -> Result<Stri
         .ok_or_else(|| format!("invalid utf-8 preset cwd: {}", resolved.display()))
 }
 
+pub fn default_agents() -> Vec<protocol::AgentConfig> {
+    vec![protocol::AgentConfig {
+        name: "opencode".to_string(),
+        command: "opencode acp".to_string(),
+        cwd: None,
+    }]
+}
+
 pub fn default_presets() -> Vec<protocol::PresetConfig> {
     vec![
         protocol::PresetConfig {
@@ -715,7 +723,7 @@ fn is_git_repo_dir(path: &Path) -> bool {
 pub fn load_project_agents(project_path: &str) -> Result<Vec<protocol::AgentConfig>, String> {
     let config_path = Path::new(project_path).join(".threadmill.yml");
     if !config_path.exists() {
-        return Ok(Vec::new());
+        return Ok(default_agents());
     }
 
     let raw = fs::read_to_string(&config_path)
@@ -760,6 +768,10 @@ pub fn load_project_agents(project_path: &str) -> Result<Vec<protocol::AgentConf
             .map(ToOwned::to_owned);
 
         agents.push(protocol::AgentConfig { name, command, cwd });
+    }
+
+    if agents.is_empty() {
+        return Ok(default_agents());
     }
 
     Ok(agents)

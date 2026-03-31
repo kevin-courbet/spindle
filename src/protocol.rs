@@ -333,6 +333,8 @@ pub struct StateSnapshot {
     pub state_version: StateVersion,
     pub projects: Vec<Project>,
     pub threads: Vec<Thread>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_registry: Vec<crate::services::agent_registry::AgentRegistryEntry>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -745,6 +747,12 @@ pub type ChatListResult = Vec<ChatSessionSummary>;
 pub struct ChatAttachResult {
     pub channel_id: u16,
     pub acp_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -820,6 +828,27 @@ pub struct SystemStatsResult {
     pub memory_used_mb: u32,
     pub opencode_instances: u32,
 }
+
+pub const METHOD_AGENT_REGISTRY_LIST: &str = "agent.registry.list";
+pub const METHOD_AGENT_REGISTRY_INSTALL: &str = "agent.registry.install";
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AgentRegistryListParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentRegistryInstallParams {
+    pub agent_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentRegistryInstallResult {
+    pub success: bool,
+    pub resolved_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub type AgentRegistryListResult = Vec<crate::services::agent_registry::AgentRegistryEntry>;
 
 pub const METHOD_SYSTEM_STATS: &str = "system.stats";
 
@@ -900,6 +929,10 @@ pub enum RequestDispatch {
     ChatHistory(ChatHistoryParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
+    #[serde(rename = "agent.registry.list")]
+    AgentRegistryList(AgentRegistryListParams),
+    #[serde(rename = "agent.registry.install")]
+    AgentRegistryInstall(AgentRegistryInstallParams),
 }
 
 pub fn parse_request_dispatch(
@@ -1018,6 +1051,14 @@ pub fn parse_request_dispatch(
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),
+        METHOD_AGENT_REGISTRY_LIST => serde_json::from_value::<AgentRegistryListParams>(params)
+            .map(RequestDispatch::AgentRegistryList)
+            .map_err(|err| format!("invalid agent.registry.list params: {err}")),
+        METHOD_AGENT_REGISTRY_INSTALL => {
+            serde_json::from_value::<AgentRegistryInstallParams>(params)
+                .map(RequestDispatch::AgentRegistryInstall)
+                .map_err(|err| format!("invalid agent.registry.install params: {err}"))
+        }
         _ => Err(format!("unknown method '{method}'")),
     }
 }

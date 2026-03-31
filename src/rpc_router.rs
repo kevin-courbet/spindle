@@ -140,6 +140,7 @@ pub async fn dispatch_request(
                     ChatService::thread_chat_sessions(Arc::clone(&state), &thread.id).await;
             }
 
+            let agent_registry = crate::services::agent_registry::discover_agents();
             let snapshot = protocol::StateSnapshot {
                 state_version: state.state_version(),
                 projects: projects
@@ -148,6 +149,7 @@ pub async fn dispatch_request(
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|message| map_service_error("state.snapshot", message))?,
                 threads,
+                agent_registry,
             };
             to_value("state.snapshot", snapshot)
         }
@@ -342,6 +344,30 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("chat.history", message))?;
             to_value("chat.history", result)
         }
+        RequestDispatch::AgentRegistryList(_) => {
+            let entries = crate::services::agent_registry::discover_agents();
+            to_value("agent.registry.list", entries)
+        }
+        RequestDispatch::AgentRegistryInstall(params) => {
+            match crate::services::agent_registry::install_agent(&params.agent_id).await {
+                Ok(resolved_path) => to_value(
+                    "agent.registry.install",
+                    protocol::AgentRegistryInstallResult {
+                        success: true,
+                        resolved_path: Some(resolved_path),
+                        error: None,
+                    },
+                ),
+                Err(err) => to_value(
+                    "agent.registry.install",
+                    protocol::AgentRegistryInstallResult {
+                        success: false,
+                        resolved_path: None,
+                        error: Some(err),
+                    },
+                ),
+            }
+        }
     }
 }
 
@@ -358,7 +384,8 @@ fn normalize_params(method: &str, params: Value) -> Value {
         | protocol::METHOD_OPENCODE_ENSURE
         | protocol::METHOD_PROJECT_LIST
         | protocol::METHOD_THREAD_LIST
-        | protocol::METHOD_SYSTEM_STATS => json!({}),
+        | protocol::METHOD_SYSTEM_STATS
+        | protocol::METHOD_AGENT_REGISTRY_LIST => json!({}),
         _ => Value::Null,
     }
 }

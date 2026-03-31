@@ -249,6 +249,7 @@ impl StateStore {
                 .map(Project::to_protocol)
                 .collect::<Result<Vec<_>, _>>()?,
             threads: self.data.threads.iter().map(Thread::to_protocol).collect(),
+            agent_registry: crate::services::agent_registry::discover_agents(),
         })
     }
 

@@ -63,6 +63,9 @@ struct ChatSessionRuntime {
     last_update_time: Option<chrono::DateTime<Utc>>,
     stall_generation: u64,
     stall_task: Option<JoinHandle<()>>,
+    modes: Option<Value>,
+    models: Option<Value>,
+    config_options: Option<Value>,
 }
 
 impl ChatState {
@@ -127,6 +130,9 @@ impl ChatService {
                 last_update_time: None,
                 stall_generation: 0,
                 stall_task: None,
+                modes: None,
+                models: None,
+                config_options: None,
             };
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -369,9 +375,15 @@ impl ChatService {
                 }
             }
 
-            let acp_sid = chat.sessions.get(&params.session_id)
-                .and_then(|s| s.acp_session_id.clone())
-                .unwrap_or_default();
+            let (acp_sid, modes, models, config_options) = {
+                let session = chat.sessions.get(&params.session_id);
+                (
+                    session.and_then(|s| s.acp_session_id.clone()).unwrap_or_default(),
+                    session.and_then(|s| s.modes.clone()),
+                    session.and_then(|s| s.models.clone()),
+                    session.and_then(|s| s.config_options.clone()),
+                )
+            };
 
             if let Some(session) = chat.sessions.get_mut(&params.session_id) {
                 session.attached_channels.insert(channel_id);
@@ -383,7 +395,7 @@ impl ChatService {
             conn.by_chat_channel
                 .insert(channel_id, params.session_id.clone());
 
-            return Ok(protocol::ChatAttachResult { channel_id, acp_session_id: acp_sid });
+            return Ok(protocol::ChatAttachResult { channel_id, acp_session_id: acp_sid, modes, models, config_options });
         }
     }
 
@@ -1186,6 +1198,9 @@ async fn mark_session_ready(
             session.summary.title = handshake.title.clone();
             session.summary.model_id = handshake.model_id.clone();
             session.acp_session_id = Some(handshake.acp_session_id.clone());
+            session.modes = handshake.modes.clone();
+            session.models = handshake.models.clone();
+            session.config_options = handshake.config_options.clone();
             session.status_notify.notify_waiters();
         }
     }
@@ -1603,6 +1618,9 @@ fn discover_history_sessions(
                 last_update_time: None,
                 stall_generation: 0,
                 stall_task: None,
+                modes: None,
+                models: None,
+                config_options: None,
             });
         }
     }
@@ -1737,6 +1755,9 @@ mod tests {
             output_buffer: Vec::new(),
             active_tools: HashSet::new(),
             pending_prompt_ids: HashSet::new(),
+            modes: None,
+            models: None,
+            config_options: None,
             last_update_time: None,
             stall_generation: 0,
             stall_task: None,
