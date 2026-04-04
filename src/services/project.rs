@@ -321,6 +321,12 @@ struct ProjectConfigFile {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+struct ProjectAgentFile {
+    #[serde(default)]
+    command: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct ProjectPresetFile {
     #[serde(default)]
     command: Option<String>,
@@ -328,14 +334,6 @@ struct ProjectPresetFile {
     cwd: Option<String>,
     #[serde(default)]
     commands: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct ProjectAgentFile {
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
 }
 
 pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetConfig>, String> {
@@ -422,14 +420,6 @@ pub fn resolve_preset_cwd(worktree_path: &str, cwd: Option<&str>) -> Result<Stri
         .to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| format!("invalid utf-8 preset cwd: {}", resolved.display()))
-}
-
-pub fn default_agents() -> Vec<protocol::AgentConfig> {
-    vec![protocol::AgentConfig {
-        name: "opencode".to_string(),
-        command: "opencode acp".to_string(),
-        cwd: None,
-    }]
 }
 
 pub fn default_presets() -> Vec<protocol::PresetConfig> {
@@ -720,59 +710,18 @@ fn is_git_repo_dir(path: &Path) -> bool {
     std::fs::metadata(path.join("HEAD")).is_ok() && std::fs::metadata(path.join("objects")).is_ok()
 }
 
-pub fn load_project_agents(project_path: &str) -> Result<Vec<protocol::AgentConfig>, String> {
+
+
+/// Look up a custom agent command from .threadmill.yml.
+/// Only used as fallback when the agent registry has no match.
+pub fn project_agent_command(project_path: &str, agent_name: &str) -> Option<String> {
     let config_path = Path::new(project_path).join(".threadmill.yml");
-    if !config_path.exists() {
-        return Ok(default_agents());
-    }
-
-    let raw = fs::read_to_string(&config_path)
-        .map_err(|err| format!("failed to read {}: {err}", config_path.display()))?;
-    let parsed: ProjectConfigFile = match serde_yaml::from_str(&raw) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            warn!(
-                project_path = %project_path,
-                config_path = %config_path.display(),
-                error = %err,
-                "failed to parse project agents; using none"
-            );
-            return Ok(Vec::new());
-        }
-    };
-
-    let mut agents = Vec::with_capacity(parsed.agents.len());
-    for (name, agent) in parsed.agents {
-        let command = agent
-            .command
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-
-        let Some(command) = command else {
-            warn!(
-                project_path = %project_path,
-                config_path = %config_path.display(),
-                agent_name = %name,
-                "invalid agent config missing command; skipping"
-            );
-            continue;
-        };
-
-        let cwd = agent
-            .cwd
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-
-        agents.push(protocol::AgentConfig { name, command, cwd });
-    }
-
-    if agents.is_empty() {
-        return Ok(default_agents());
-    }
-
-    Ok(agents)
+    let raw = fs::read_to_string(&config_path).ok()?;
+    let parsed: ProjectConfigFile = serde_yaml::from_str(&raw).ok()?;
+    let agent = parsed.agents.get(agent_name)?;
+    agent.command.as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
 }
+

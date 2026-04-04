@@ -60,7 +60,6 @@ impl Project {
             }
         };
 
-        let agents = project::load_project_agents(&self.path).unwrap_or_default();
 
         Ok(protocol::Project {
             id: self.id.clone(),
@@ -68,7 +67,6 @@ impl Project {
             path: self.path.clone(),
             default_branch: self.default_branch.clone(),
             presets,
-            agents,
         })
     }
 }

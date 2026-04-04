@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     protocol,
-    services::{project::load_project_agents, terminal::TerminalConnectionState},
+    services::{agent_registry, project::project_agent_command, terminal::TerminalConnectionState},
     AppState,
 };
 
@@ -356,7 +356,6 @@ impl ChatService {
             let mut chat = state.chat.lock().await;
             let channel_id = state.alloc_channel_id_with(|candidate| {
                 conn.by_channel.contains_key(&candidate)
-                    || conn.by_agent_channel.contains_key(&candidate)
                     || conn.by_chat_channel.contains_key(&candidate)
                     || conn
                         .attaching_targets
@@ -455,6 +454,10 @@ impl ChatService {
         };
         let final_payload = rewritten_payload.unwrap_or(payload);
 
+        if let Ok(s) = std::str::from_utf8(&final_payload) {
+            warn!(channel_id, "chat_inbound_frame payload_len={} snippet={:?}", final_payload.len(), &s[..s.floor_char_boundary(s.len().min(200))]);
+        }
+
         input_tx
             .try_send(final_payload)
             .map_err(|err| format!("failed to queue chat input for channel {channel_id}: {err}"))?;
@@ -523,7 +526,11 @@ fn spawn_session_task(
     cwd: String,
     load_session_id: Option<String>,
 ) {
-    tokio::spawn(async move {
+    let fail_state = Arc::clone(&state);
+    let fail_thread_id = thread_id.clone();
+    let fail_session_id = session_id.clone();
+
+    let handle = tokio::spawn(async move {
         if let Err(error) = run_session_task(
             Arc::clone(&state),
             thread_id,
@@ -537,6 +544,34 @@ fn spawn_session_task(
         .await
         {
             warn!(error = %error, "chat session task failed");
+        }
+    });
+
+    // Monitor the spawned task — if it panics, emit a session_failed event
+    tokio::spawn(async move {
+        if let Err(join_error) = handle.await {
+            if join_error.is_panic() {
+                let panic_msg = match join_error.into_panic().downcast::<String>() {
+                    Ok(msg) => *msg,
+                    Err(payload) => match payload.downcast::<&str>() {
+                        Ok(s) => s.to_string(),
+                        Err(_) => "task panicked (unknown payload)".to_string(),
+                    },
+                };
+                tracing::error!(
+                    thread_id = %fail_thread_id,
+                    session_id = %fail_session_id,
+                    panic = %panic_msg,
+                    "chat session task panicked"
+                );
+                mark_session_failed(
+                    fail_state,
+                    &fail_thread_id,
+                    &fail_session_id,
+                    format!("internal error: session task panicked: {panic_msg}"),
+                )
+                .await;
+            }
         }
     });
 }
@@ -1170,6 +1205,10 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
     };
     let out_payload = rewritten_payload.as_deref().unwrap_or(payload);
 
+    if let Ok(s) = std::str::from_utf8(out_payload) {
+        warn!(session_id, "chat_outbound_frame payload_len={} snippet={:?}", out_payload.len(), &s[..s.floor_char_boundary(s.len().min(200))]);
+    }
+
     let mut dead_channels = Vec::new();
     for (channel_id, outbound) in targets {
         let mut frame = Vec::with_capacity(out_payload.len() + 2);
@@ -1664,41 +1703,14 @@ async fn resolve_agent_launch(
         (project.path, thread.worktree_path)
     };
 
-    let agents = load_project_agents(&project_path)?;
-    let agent = agents
-        .into_iter()
-        .find(|candidate| candidate.name == agent_name)
+    let command = agent_registry::agent_command(agent_name)
+        .or_else(|| project_agent_command(&project_path, agent_name))
         .ok_or_else(|| format!("agent not found: {agent_name}"))?;
 
-    let cwd = resolve_agent_cwd(&worktree_path, agent.cwd.as_deref())?;
-    Ok((project_path, agent.command, cwd))
+    Ok((project_path, command, worktree_path))
 }
 
-fn resolve_agent_cwd(project_path: &str, cwd: Option<&str>) -> Result<String, String> {
-    let Some(cwd) = cwd else {
-        return Ok(project_path.to_string());
-    };
 
-    let cwd_path = Path::new(cwd);
-    if cwd_path.is_absolute() {
-        return Ok(cwd.to_string());
-    }
-
-    let project_root = std::fs::canonicalize(project_path)
-        .map_err(|err| format!("failed to canonicalize project {project_path}: {err}"))?;
-    let joined = project_root.join(cwd_path);
-    let resolved = std::fs::canonicalize(&joined)
-        .map_err(|err| format!("failed to resolve agent cwd {}: {err}", joined.display()))?;
-
-    if !resolved.starts_with(&project_root) {
-        return Err(format!("agent cwd escapes project root: {cwd}"));
-    }
-
-    resolved
-        .to_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("invalid utf-8 agent cwd: {}", resolved.display()))
-}
 
 #[cfg(test)]
 mod tests {

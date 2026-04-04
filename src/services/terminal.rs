@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 use crate::{
     protocol,
-    services::agent::{self, AgentAttachment},
     AppState,
 };
 
@@ -25,7 +24,6 @@ const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(15);
 #[derive(Default)]
 pub struct TerminalConnectionState {
     pub(crate) by_channel: HashMap<u16, Attachment>,
-    pub(crate) by_agent_channel: HashMap<u16, AgentAttachment>,
     pub(crate) by_chat_channel: HashMap<u16, String>,
     pub(crate) by_target: HashMap<String, u16>,
     pub(crate) attaching_targets: HashMap<String, u16>,
@@ -60,12 +58,6 @@ pub async fn handle_binary_frame(
                 .input_tx
                 .as_ref()
                 .ok_or_else(|| format!("channel {channel_id} is closed"))?
-                .clone()
-        } else if let Some(attachment) = guard.by_agent_channel.get(&channel_id) {
-            attachment
-                .input_tx
-                .as_ref()
-                .ok_or_else(|| format!("agent channel {channel_id} is closed"))?
                 .clone()
         } else {
             return Err(format!("unknown channel {channel_id}"));
@@ -108,8 +100,7 @@ pub async fn attach(
             } else {
                 let reserved_channel_id = state.alloc_channel_id_with(|candidate| {
                     guard.by_channel.contains_key(&candidate)
-                        || guard.by_agent_channel.contains_key(&candidate)
-                        || guard
+                            || guard
                             .attaching_targets
                             .values()
                             .any(|existing| *existing == candidate)
@@ -376,23 +367,16 @@ pub async fn resize(
 }
 
 pub async fn cleanup_connection(connection_state: Arc<Mutex<TerminalConnectionState>>) {
-    let (attachments, agent_attachments) = {
+    let attachments = {
         let mut guard = connection_state.lock().await;
         guard.by_target.clear();
         guard.attaching_targets.clear();
         guard.by_chat_channel.clear();
-        (
-            std::mem::take(&mut guard.by_channel),
-            std::mem::take(&mut guard.by_agent_channel),
-        )
+        std::mem::take(&mut guard.by_channel)
     };
 
     for (_, mut attachment) in attachments {
         cleanup_attachment(&mut attachment).await;
-    }
-
-    for (_, mut attachment) in agent_attachments {
-        agent::cleanup_agent_attachment(&mut attachment).await;
     }
 }
 

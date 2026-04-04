@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     protocol::{self, RequestDispatch},
     services::{
-        agent::AgentService, chat::ChatService, file::FileService, opencode::OpencodeService,
+        chat::ChatService, file::FileService, opencode::OpencodeService,
         preset::PresetService, project::ProjectService, system::SystemService, terminal,
         terminal::TerminalConnectionState, thread::ThreadService,
     },
@@ -289,18 +289,6 @@ pub async fn dispatch_request(
                 .await
                 .map_err(|message| map_service_error("preset.restart", message))?;
             to_value("preset.restart", result)
-        }
-        RequestDispatch::AgentStart(params) => {
-            let result = AgentService::start(state, params, connection_state, outbound_tx)
-                .await
-                .map_err(|message| map_service_error("agent.start", message))?;
-            to_value("agent.start", result)
-        }
-        RequestDispatch::AgentStop(params) => {
-            let result = AgentService::stop(params, connection_state)
-                .await
-                .map_err(|message| map_service_error("agent.stop", message))?;
-            to_value("agent.stop", result)
         }
         RequestDispatch::ChatStart(params) => {
             let result = ChatService::start(state, params)

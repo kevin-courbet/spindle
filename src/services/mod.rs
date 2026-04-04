@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod agent_registry;
 pub mod chat;
 pub mod file;
