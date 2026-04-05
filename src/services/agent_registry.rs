@@ -45,9 +45,9 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
     BuiltInAgent {
         id: "claude",
         name: "Claude Code",
-        binary: "claude-code-acp",
+        binary: "claude-agent-acp",
         launch_args: &[],
-        install_package: "@anthropic-ai/claude-code@latest",
+        install_package: "@agentclientprotocol/claude-agent-acp@latest",
         install_type: "npm",
     },
     BuiltInAgent {
@@ -235,13 +235,13 @@ mod tests {
     fn test_build_command_with_args() {
         assert_eq!(build_command("opencode", &["acp"]), "opencode acp");
         assert_eq!(build_command("gemini", &["--experimental-acp"]), "gemini --experimental-acp");
-        assert_eq!(build_command("claude-code-acp", &[]), "claude-code-acp");
+        assert_eq!(build_command("claude-agent-acp", &[]), "claude-agent-acp");
     }
 
     #[test]
     fn test_agent_command_lookup() {
         assert_eq!(agent_command("opencode"), Some("opencode acp".to_string()));
-        assert_eq!(agent_command("claude"), Some("claude-code-acp".to_string()));
+        assert_eq!(agent_command("claude"), Some("claude-agent-acp".to_string()));
         assert_eq!(agent_command("nonexistent"), None);
     }
 }
