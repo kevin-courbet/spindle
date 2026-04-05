@@ -103,6 +103,10 @@ pub struct ChatSessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -110,6 +114,10 @@ pub struct ChatSessionCreatedEvent {
     pub thread_id: String,
     pub session_id: String,
     pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -147,6 +155,34 @@ pub struct ChatStatusChangedEvent {
     pub new_status: AgentStatus,
     pub worker_count: usize,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatWorkerUpdateEvent {
+    pub parent_session_id: String,
+    pub worker_session_id: String,
+    pub agent_status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_tool: Option<WorkerToolSummary>,
+    pub tool_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkerToolSummary {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatStatusParams {
+    pub session_id: String,
+}
+
+pub type ChatStatusResult = ChatSessionSummary;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ThreadStatus {
@@ -541,12 +577,22 @@ pub struct PresetRestartParams {
 pub struct ChatStartParams {
     pub thread_id: String,
     pub agent_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatLoadParams {
     pub thread_id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub agent_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -766,6 +812,7 @@ pub const METHOD_CHAT_LIST: &str = "chat.list";
 pub const METHOD_CHAT_ATTACH: &str = "chat.attach";
 pub const METHOD_CHAT_DETACH: &str = "chat.detach";
 pub const METHOD_CHAT_HISTORY: &str = "chat.history";
+pub const METHOD_CHAT_STATUS: &str = "chat.status";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -872,6 +919,8 @@ pub enum RequestDispatch {
     ChatDetach(ChatDetachParams),
     #[serde(rename = "chat.history")]
     ChatHistory(ChatHistoryParams),
+    #[serde(rename = "chat.status")]
+    ChatStatus(ChatStatusParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
     #[serde(rename = "agent.registry.list")]
@@ -987,6 +1036,9 @@ pub fn parse_request_dispatch(
         METHOD_CHAT_HISTORY => serde_json::from_value::<ChatHistoryParams>(params)
             .map(RequestDispatch::ChatHistory)
             .map_err(|err| format!("invalid chat.history params: {err}")),
+        METHOD_CHAT_STATUS => serde_json::from_value::<ChatStatusParams>(params)
+            .map(RequestDispatch::ChatStatus)
+            .map_err(|err| format!("invalid chat.status params: {err}")),
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),

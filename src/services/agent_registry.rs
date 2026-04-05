@@ -31,6 +31,8 @@ struct BuiltInAgent {
     launch_args: &'static [&'static str],
     install_package: &'static str,
     install_type: &'static str,
+    /// Whether the agent auto-loads AGENTS.md from cwd (skip injection for these)
+    self_injects_context: bool,
 }
 
 const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
@@ -41,6 +43,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &["acp"],
         install_package: "opencode-ai@latest",
         install_type: "npm",
+        self_injects_context: true,
     },
     BuiltInAgent {
         id: "claude",
@@ -49,6 +52,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &[],
         install_package: "@agentclientprotocol/claude-agent-acp@latest",
         install_type: "npm",
+        self_injects_context: false,
     },
     BuiltInAgent {
         id: "codex",
@@ -57,6 +61,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &[],
         install_package: "@openai/codex@latest",
         install_type: "npm",
+        self_injects_context: false,
     },
     BuiltInAgent {
         id: "gemini",
@@ -65,6 +70,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &["--experimental-acp"],
         install_package: "@google/gemini-cli@latest",
         install_type: "npm",
+        self_injects_context: false,
     },
     BuiltInAgent {
         id: "copilot",
@@ -73,6 +79,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &["--acp", "--stdio"],
         install_package: "@github/copilot@latest",
         install_type: "npm",
+        self_injects_context: false,
     },
     BuiltInAgent {
         id: "kimi",
@@ -81,6 +88,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &["acp"],
         install_package: "kimi-cli",
         install_type: "uv",
+        self_injects_context: false,
     },
     BuiltInAgent {
         id: "vibe",
@@ -89,6 +97,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &[],
         install_package: "mistral-vibe",
         install_type: "uv",
+        self_injects_context: false,
     },
     BuiltInAgent {
         id: "qwen",
@@ -97,6 +106,7 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
         launch_args: &["--experimental-acp"],
         install_package: "@qwen-code/qwen-code@latest",
         install_type: "npm",
+        self_injects_context: false,
     },
 ];
 
@@ -208,6 +218,15 @@ pub async fn install_agent(agent_id: &str) -> Result<String, String> {
                 .ok_or_else(|| format!("installed but binary '{}' not found in PATH", agent.binary))
         }
     }
+}
+
+/// Returns whether a built-in agent auto-loads AGENTS.md from cwd.
+pub fn agent_self_injects_context(agent_id: &str) -> bool {
+    BUILT_IN_AGENTS
+        .iter()
+        .find(|a| a.id == agent_id)
+        .map(|a| a.self_injects_context)
+        .unwrap_or(false)
 }
 
 /// Returns the ACP command for a given agent_id (e.g. "opencode acp").

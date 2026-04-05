@@ -332,6 +332,12 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("chat.history", message))?;
             to_value("chat.history", result)
         }
+        RequestDispatch::ChatStatus(params) => {
+            let result = ChatService::status(state, params)
+                .await
+                .map_err(|message| map_service_error("chat.status", message))?;
+            to_value("chat.status", result)
+        }
         RequestDispatch::AgentRegistryList(_) => {
             let entries = crate::services::agent_registry::discover_agents();
             to_value("agent.registry.list", entries)

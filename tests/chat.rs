@@ -694,3 +694,119 @@ async fn thread_close_stops_chat_sessions() {
         .rpc("project.remove", json!({ "project_id": project_id }))
         .await;
 }
+
+#[tokio::test]
+async fn chat_history_jsonl_preserves_acp_session_id_for_recovery() {
+    if !common::tmux_available().await {
+        eprintln!("skipping: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    // Start a session
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({"thread_id": thread_id, "agent_name": "mock"}),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    // Attach to get ACP session ID and channel
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel_id") as u16;
+    let acp_session_id = attached["acp_session_id"]
+        .as_str()
+        .expect("acp_session_id")
+        .to_string();
+
+    // Generate history by sending a test update through the agent
+    send_test_update(&mut harness, channel_id, "recovery-test-marker").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"recovery-test-marker",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for marker output");
+
+    // Verify JSONL first line contains ACP session ID (not Spindle session ID)
+    let history_path = chat_history_path(&thread_id, &session_id);
+    assert!(history_path.exists(), "history file must exist");
+    let first_line = std::fs::read_to_string(&history_path)
+        .expect("read history file")
+        .lines()
+        .next()
+        .expect("at least one line")
+        .to_string();
+    let first_entry: serde_json::Value =
+        serde_json::from_str(&first_line).expect("parse first JSONL line");
+    let stored_session_id = first_entry["sessionId"]
+        .as_str()
+        .expect("sessionId in JSONL");
+
+    // The ACP session ID in JSONL should match what chat.attach returned
+    assert_eq!(
+        stored_session_id, acp_session_id,
+        "JSONL should contain ACP session ID, not Spindle session ID. \
+         Got stored={stored_session_id}, expected acp={acp_session_id}, spindle={session_id}"
+    );
+
+    // Now test the full load cycle: stop, then load
+    harness
+        .rpc(
+            "chat.stop",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.stop");
+    harness
+        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .await
+        .expect("chat.session_ended");
+
+    // chat.load should pass the ACP session ID to session/load
+    let loaded = harness
+        .rpc(
+            "chat.load",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.load");
+    assert_eq!(loaded["status"], "starting");
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    // Re-attach and verify ACP session ID is preserved
+    let reattached = harness
+        .rpc(
+            "chat.attach",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.attach after load");
+    let reattached_acp = reattached["acp_session_id"]
+        .as_str()
+        .expect("acp_session_id after load");
+    assert_eq!(
+        reattached_acp, acp_session_id,
+        "ACP session ID should be preserved across load"
+    );
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}

@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::{
     protocol,
     services::{agent_registry, project::project_agent_command, terminal::TerminalConnectionState},
+    state_store,
     AppState,
 };
 
@@ -49,6 +50,10 @@ pub struct ChatState {
 struct ChatSessionRuntime {
     summary: protocol::ChatSessionSummary,
     thread_id: String,
+    display_name: Option<String>,
+    parent_session_id: Option<String>,
+    system_prompt: Option<String>,
+    initial_prompt: Option<String>,
     acp_session_id: Option<String>,
     attached_channels: HashSet<u16>,
     input_tx: Option<mpsc::Sender<Vec<u8>>>,
@@ -59,6 +64,10 @@ struct ChatSessionRuntime {
     input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
     active_tools: HashSet<String>,
+    total_tool_count: usize,
+    latest_tool_name: Option<String>,
+    latest_tool_title: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
     pending_prompt_ids: HashSet<String>,
     last_update_time: Option<chrono::DateTime<Utc>>,
     stall_generation: u64,
@@ -87,6 +96,8 @@ struct HandshakeResult {
     config_options: Option<Value>,
     title: Option<String>,
     model_id: Option<String>,
+    /// Notifications collected during session/load replay. Empty for session/new.
+    replay_notifications: Vec<Value>,
 }
 
 impl ChatService {
@@ -114,8 +125,14 @@ impl ChatService {
                     title: None,
                     model_id: None,
                     created_at,
+                    display_name: params.display_name.clone(),
+                    parent_session_id: params.parent_session_id.clone(),
                 },
                 thread_id: params.thread_id.clone(),
+                display_name: params.display_name.clone(),
+                parent_session_id: params.parent_session_id.clone(),
+                system_prompt: params.system_prompt.clone(),
+                initial_prompt: params.initial_prompt.clone(),
                 acp_session_id: None,
                 attached_channels: HashSet::new(),
                 input_tx: None,
@@ -126,6 +143,10 @@ impl ChatService {
                 input_buffer: Vec::new(),
                 output_buffer: Vec::new(),
                 active_tools: HashSet::new(),
+                total_tool_count: 0,
+                latest_tool_name: None,
+                latest_tool_title: None,
+                started_at: Some(Utc::now()),
                 pending_prompt_ids: HashSet::new(),
                 last_update_time: None,
                 stall_generation: 0,
@@ -145,6 +166,8 @@ impl ChatService {
             thread_id: params.thread_id.clone(),
             session_id: session_id.clone(),
             agent_type: params.agent_name.clone(),
+            display_name: params.display_name.clone(),
+            parent_session_id: params.parent_session_id.clone(),
         });
         emit_state_delta_added(&state, &params.thread_id, &session_id).await;
 
@@ -169,6 +192,7 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatLoadParams,
     ) -> Result<protocol::ChatLoadResult, String> {
+
         let (agent_type, acp_session_id, stop_tx) = {
             let mut chat = state.chat.lock().await;
             let session = chat
@@ -204,8 +228,16 @@ impl ChatService {
 
         emit_state_delta_updated(&state, &params.thread_id, &params.session_id).await;
 
+        // Recovered sessions have agent_type "unknown". Use client-supplied
+        // agent_name as fallback so resolve_agent_launch can find the command.
+        let effective_agent = if agent_type == "unknown" {
+            params.agent_name.as_deref().unwrap_or(&agent_type).to_string()
+        } else {
+            agent_type.clone()
+        };
+
         let (project_path, command, cwd) =
-            resolve_agent_launch(&state, &params.thread_id, &agent_type).await?;
+            resolve_agent_launch(&state, &params.thread_id, &effective_agent).await?;
         spawn_session_task(
             Arc::clone(&state),
             params.thread_id,
@@ -267,6 +299,18 @@ impl ChatService {
         read_history_page(&history_path, params.cursor)
     }
 
+    pub async fn status(
+        state: Arc<AppState>,
+        params: protocol::ChatStatusParams,
+    ) -> Result<protocol::ChatStatusResult, String> {
+        let chat = state.chat.lock().await;
+        let runtime = chat
+            .sessions
+            .get(&params.session_id)
+            .ok_or_else(|| format!("session not found: {}", params.session_id))?;
+        Ok(runtime.summary.clone())
+    }
+
     pub async fn recover_persisted_sessions(state: Arc<AppState>) -> Result<(), String> {
         let known_threads = {
             let store = state.store.lock().await;
@@ -282,7 +326,9 @@ impl ChatService {
             chat.history_root.clone()
         };
 
+
         let recovered = discover_history_sessions(&history_root, &known_threads)?;
+
         if recovered.is_empty() {
             return Ok(());
         }
@@ -311,6 +357,7 @@ impl ChatService {
         connection_state: Arc<Mutex<TerminalConnectionState>>,
         outbound_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<protocol::ChatAttachResult, String> {
+
         loop {
             let wait_notify = {
                 let chat = state.chat.lock().await;
@@ -537,7 +584,21 @@ fn spawn_session_task(
     let fail_thread_id = thread_id.clone();
     let fail_session_id = session_id.clone();
 
+    // Build env vars for the agent process
+    let env_vars = {
+        let state_ref = state.clone();
+        let tid = thread_id.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            build_agent_env_vars(&state_ref, &tid, &sid).await
+        })
+    };
+
     let handle = tokio::spawn(async move {
+        let env_vars = match env_vars.await {
+            Ok(vars) => vars,
+            Err(_) => Vec::new(),
+        };
         if let Err(error) = run_session_task(
             Arc::clone(&state),
             thread_id,
@@ -547,6 +608,7 @@ fn spawn_session_task(
             command,
             cwd,
             load_session_id,
+            env_vars,
         )
         .await
         {
@@ -587,19 +649,23 @@ async fn run_session_task(
     state: Arc<AppState>,
     thread_id: String,
     session_id: String,
-    _agent_type: String,
+    agent_type: String,
     _project_path: String,
     command: String,
     cwd: String,
     load_session_id: Option<String>,
+    env_vars: Vec<(String, String)>,
 ) -> Result<(), String> {
-    let mut child = Command::new("bash")
-        .args(["-lc", &command])
-        .current_dir(cwd)
+    let mut cmd = Command::new("bash");
+    cmd.args(["-lc", &command])
+        .current_dir(&cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    for (key, value) in &env_vars {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn()
         .map_err(|err| format!("failed to spawn chat agent process: {err}"))?;
 
     let stdout = child
@@ -644,9 +710,10 @@ async fn run_session_task(
     }
 
     let mut stdout = stdout;
+    let is_new_session = load_session_id.is_none();
     let handshake = timeout(
         CHAT_HANDSHAKE_TIMEOUT,
-        perform_handshake(&input_tx, &mut stdout, load_session_id),
+        perform_handshake(&input_tx, &mut stdout, load_session_id, &cwd),
     )
     .await
     .map_err(|_| "chat handshake timed out after 30s".to_string())?;
@@ -661,7 +728,107 @@ async fn run_session_task(
         }
     };
 
+    // Persist replay notifications from session/load to JSONL so that
+    // chat.history returns the canonical conversation history from the agent.
+    // Done BEFORE mark_session_ready so the JSONL is ready when the Mac
+    // calls chat.history after attaching.
+    if !handshake.replay_notifications.is_empty() {
+        let history_path = {
+            let chat = state.chat.lock().await;
+            chat.sessions.get(&session_id).map(|s| s.history_path.clone())
+        };
+        if let Some(path) = history_path {
+            let updates = collect_session_update_params(&handshake.replay_notifications);
+            if !updates.is_empty() {
+                tracing::info!(
+                    session_id = %session_id,
+                    count = updates.len(),
+                    "persisting session/load replay to JSONL ({} session/update params)",
+                    updates.len()
+                );
+                if let Err(e) = overwrite_history(&path, &updates) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to persist replay history"
+                    );
+                }
+            }
+        }
+    }
+
     mark_session_ready(Arc::clone(&state), &thread_id, &session_id, &handshake).await;
+
+    // Post-handshake context injection: AGENTS.md + system_prompt + initial_prompt.
+    // Only inject on session/new — session/load already has the context from the
+    // prior conversation. Re-injecting would show the injection text again.
+    if is_new_session {
+        let (system_prompt, initial_prompt, should_inject_agents_md) = {
+            let chat = state.chat.lock().await;
+            let session = chat.sessions.get(&session_id);
+            let sp = session.and_then(|s| s.system_prompt.clone());
+            let ip = session.and_then(|s| s.initial_prompt.clone());
+            (sp, ip, !agent_registry::agent_self_injects_context(&agent_type))
+        };
+
+        // Read platform system prompt from ~/.config/threadmill/system-prompt.md
+        let platform_prompt = if should_inject_agents_md {
+            let config_dir = dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/home/wsl/.config"));
+            let platform_path = config_dir.join("threadmill").join("system-prompt.md");
+            match std::fs::read_to_string(&platform_path) {
+                Ok(content) => {
+                    tracing::info!(session_id = %session_id, "injecting platform system-prompt.md ({} bytes)", content.len());
+                    Some(content)
+                }
+                Err(_) => {
+                    tracing::debug!(session_id = %session_id, "no system-prompt.md found, skipping platform prompt");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let agents_md = if should_inject_agents_md {
+            let agents_path = std::path::Path::new(&cwd).join("AGENTS.md");
+            match std::fs::read_to_string(&agents_path) {
+                Ok(content) => {
+                    tracing::info!(session_id = %session_id, "injecting AGENTS.md ({} bytes)", content.len());
+                    Some(content)
+                }
+                Err(_) => {
+                    tracing::debug!(session_id = %session_id, "no AGENTS.md found in worktree, skipping injection");
+                    None
+                }
+            }
+        } else {
+            tracing::debug!(session_id = %session_id, agent = %agent_type, "agent self-injects context, skipping AGENTS.md injection");
+            None
+        };
+
+        let combined = build_injection_prompt(platform_prompt.as_deref(), agents_md.as_deref(), system_prompt.as_deref(), initial_prompt.as_deref());
+        if let Some(prompt_text) = combined {
+            tracing::info!(session_id = %session_id, len = prompt_text.len(), "sending injection prompt");
+            let injection_id = 100;
+            if let Err(err) = send_acp_request(
+                &input_tx,
+                injection_id,
+                "session/prompt",
+                json!({
+                    "sessionId": handshake.acp_session_id,
+                    "prompt": [{"type": "text", "text": prompt_text}]
+                }),
+            )
+            .await
+            {
+                tracing::warn!(session_id = %session_id, error = %err, "failed to send injection prompt");
+            }
+            // Don't wait for response — let it stream in the I/O loop
+        }
+    } else {
+        tracing::debug!(session_id = %session_id, "session/load — skipping context injection (already in conversation history)");
+    }
 
     let mut buf = [0_u8; CHAT_IO_CHUNK_SIZE];
     let mut explicit_stop = false;
@@ -715,8 +882,11 @@ async fn perform_handshake(
     input_tx: &mpsc::Sender<Vec<u8>>,
     stdout: &mut tokio::process::ChildStdout,
     load_session_id: Option<String>,
+    cwd: &str,
 ) -> Result<HandshakeResult, String> {
     let mut buffer = Vec::new();
+    let mut collected = Vec::new();
+
     send_acp_request(
         input_tx,
         1,
@@ -739,18 +909,30 @@ async fn perform_handshake(
     )
     .await?;
 
-    let init = wait_for_acp_response(stdout, &mut buffer, 1).await?;
+    let init = wait_for_acp_response(stdout, &mut buffer, 1, &mut collected).await?;
+    // Discard anything collected before initialize response (shouldn't be any)
+    collected.clear();
     ensure_acp_success(&init, "initialize")?;
 
     let (method, params) = if let Some(session_id) = load_session_id {
-        ("session/load", json!({ "sessionId": session_id }))
+        ("session/load", json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }))
     } else {
-        ("session/new", json!({ "cwd": ".", "mcpServers": [] }))
+        ("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
     };
 
     send_acp_request(input_tx, 2, method, params).await?;
-    let session_response = wait_for_acp_response(stdout, &mut buffer, 2).await?;
+    // For session/load, the agent replays the full conversation history as
+    // session/update notifications before returning the response. These are
+    // collected here instead of discarded.
+    let session_response = wait_for_acp_response(stdout, &mut buffer, 2, &mut collected).await?;
     let result = ensure_acp_success(&session_response, method)?;
+
+    if !collected.is_empty() {
+        tracing::info!(
+            "perform_handshake: captured {} notification(s) during {method}",
+            collected.len()
+        );
+    }
 
     let acp_session_id = result
         .get("sessionId")
@@ -774,6 +956,7 @@ async fn perform_handshake(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         model_id,
+        replay_notifications: collected,
     })
 }
 
@@ -803,6 +986,7 @@ async fn wait_for_acp_response(
     stdout: &mut tokio::process::ChildStdout,
     buffer: &mut Vec<u8>,
     response_id: u64,
+    collected: &mut Vec<Value>,
 ) -> Result<Value, String> {
     loop {
         let Some(line) = next_json_line(stdout, buffer).await? else {
@@ -823,6 +1007,7 @@ async fn wait_for_acp_response(
         if id_matches {
             return Ok(line);
         }
+        collected.push(line);
     }
 }
 
@@ -991,15 +1176,25 @@ fn apply_inbound_status_updates(
             if let Some(id) = request_id_key(message.get("id")) {
                 session.pending_prompt_ids.insert(id);
             }
-            // Persist user prompt as a synthetic userMessageChunk for history hydration
+            // Persist user prompt as a synthetic userMessageChunk for history hydration.
+            // ACP session/prompt params: { sessionId, prompt: [{ type: "text", text: "..." }] }
             if let Some(params) = message.get("params") {
-                if let Some(text) = params.get("text").and_then(Value::as_str) {
-                    history_updates.push(json!({
-                        "update": {
-                            "kind": "user_message_chunk",
-                            "content": { "type": "text", "text": text }
+                let session_id_value = params
+                    .get("sessionId")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new()));
+                if let Some(prompt_array) = params.get("prompt").and_then(Value::as_array) {
+                    for block in prompt_array {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            history_updates.push(json!({
+                                "sessionId": session_id_value,
+                                "update": {
+                                    "sessionUpdate": "user_message_chunk",
+                                    "content": { "type": "text", "text": text }
+                                }
+                            }));
                         }
-                    }));
+                    }
                 }
             }
             session.active_tools.clear();
@@ -1071,10 +1266,46 @@ fn apply_worker_update(session: &mut ChatSessionRuntime, params: Option<&Value>)
             if let Some(tool_call_id) = tool_call_id {
                 session.active_tools.insert(tool_call_id);
             }
+            session.total_tool_count += 1;
+
+            // Extract tool name and title for worker update relay
+            let tool_name = update
+                .get("toolCall")
+                .and_then(|tc| tc.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| update.get("name").and_then(Value::as_str))
+                .map(ToOwned::to_owned);
+            let tool_title = update
+                .get("toolCall")
+                .and_then(|tc| tc.get("state"))
+                .and_then(|s| s.get("title"))
+                .and_then(Value::as_str)
+                .or_else(|| update.get("title").and_then(Value::as_str))
+                .map(ToOwned::to_owned);
+            if let Some(name) = tool_name {
+                session.latest_tool_name = Some(name);
+            }
+            if let Some(title) = tool_title {
+                session.latest_tool_title = Some(title);
+            }
         }
-    } else if kind == "tool_call_update" && matches!(status, "completed" | "cancelled" | "error") {
-        if let Some(tool_call_id) = tool_call_id {
-            session.active_tools.remove(&tool_call_id);
+    } else if kind == "tool_call_update" {
+        // Update title if available (tools stream their title as they progress)
+        let tool_title = update
+            .get("toolCall")
+            .and_then(|tc| tc.get("state"))
+            .and_then(|s| s.get("title"))
+            .and_then(Value::as_str)
+            .or_else(|| update.get("title").and_then(Value::as_str))
+            .map(ToOwned::to_owned);
+        if let Some(title) = tool_title {
+            session.latest_tool_title = Some(title);
+        }
+
+        if matches!(status, "completed" | "cancelled" | "error") {
+            if let Some(tool_call_id) = tool_call_id {
+                session.active_tools.remove(&tool_call_id);
+            }
         }
     }
 
@@ -1202,6 +1433,9 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
 
     emit_status_transitions(&state, transitions).await;
 
+    // Emit worker_update to parent session if this is a child worker
+    emit_worker_update_to_parent(&state, session_id).await;
+
     if !updates.is_empty() {
         if let Err(error) = append_updates_to_history(&history_path, &updates) {
             warn!(
@@ -1242,6 +1476,42 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         detach_channels(state, dead_channels).await;
     }
 }
+
+async fn emit_worker_update_to_parent(state: &Arc<AppState>, worker_session_id: &str) {
+    let event = {
+        let chat = state.chat.lock().await;
+        let Some(worker) = chat.sessions.get(worker_session_id) else {
+            return;
+        };
+        let Some(ref parent_id) = worker.parent_session_id else {
+            return;
+        };
+
+        let duration_ms = worker
+            .started_at
+            .map(|started| Utc::now().signed_duration_since(started).num_milliseconds().max(0) as u64);
+
+        let latest_tool = worker.latest_tool_name.as_ref().map(|name| {
+            protocol::WorkerToolSummary {
+                name: name.clone(),
+                title: worker.latest_tool_title.clone(),
+            }
+        });
+
+        protocol::ChatWorkerUpdateEvent {
+            parent_session_id: parent_id.clone(),
+            worker_session_id: worker_session_id.to_string(),
+            agent_status: worker.summary.agent_status.clone(),
+            display_name: worker.display_name.clone(),
+            latest_tool,
+            tool_count: worker.total_tool_count,
+            duration_ms,
+        }
+    };
+
+    state.emit_event("chat.worker_update", &event);
+}
+
 async fn mark_session_ready(
     state: Arc<AppState>,
     thread_id: &str,
@@ -1511,6 +1781,42 @@ fn is_safe_history_component(value: &str) -> bool {
     !value.is_empty() && !value.contains('/') && !value.contains('\\') && !value.contains("..")
 }
 
+/// Overwrite (truncate + write) the JSONL history file with the given updates.
+/// Used after session/load to replace stale history with the agent's canonical
+/// replay. Subsequent output from fanout_output appends normally.
+fn overwrite_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let parent = history_path
+        .parent()
+        .ok_or_else(|| format!("invalid chat history path: {}", history_path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(history_path)
+        .map_err(|err| format!("failed to open {}: {err}", history_path.display()))?;
+
+    for update in updates {
+        serde_json::to_writer(&mut file, update)
+            .map_err(|err| format!("failed to encode history update: {err}"))?;
+        file.write_all(b"\n").map_err(|err| {
+            format!(
+                "failed to write newline to {}: {err}",
+                history_path.display()
+            )
+        })?;
+    }
+
+    file.sync_data()
+        .map_err(|err| format!("failed to fsync {}: {err}", history_path.display()))
+}
+
 fn append_updates_to_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
     if updates.is_empty() {
         return Ok(());
@@ -1650,6 +1956,18 @@ fn discover_history_sessions(
                 .unwrap_or_else(Utc::now)
                 .to_rfc3339();
 
+            // Extract the ACP session ID from the first JSONL entry.
+            // Updates are persisted before session ID rewriting, so the
+            // sessionId field contains the agent-side ACP session ID.
+            let acp_session_id = fs::File::open(&path)
+                .ok()
+                .and_then(|file| {
+                    let reader = BufReader::new(file);
+                    reader.lines().next()?.ok()
+                })
+                .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+                .and_then(|value| value.get("sessionId")?.as_str().map(ToOwned::to_owned));
+
             recovered.push(ChatSessionRuntime {
                 summary: protocol::ChatSessionSummary {
                     session_id: stem.to_string(),
@@ -1660,9 +1978,15 @@ fn discover_history_sessions(
                     title: None,
                     model_id: None,
                     created_at,
+                    display_name: None,
+                    parent_session_id: None,
                 },
                 thread_id: thread_id.clone(),
-                acp_session_id: Some(stem.to_string()),
+                display_name: None,
+                parent_session_id: None,
+                system_prompt: None,
+                initial_prompt: None,
+                acp_session_id,
                 attached_channels: HashSet::new(),
                 input_tx: None,
                 stop_tx: None,
@@ -1672,6 +1996,10 @@ fn discover_history_sessions(
                 input_buffer: Vec::new(),
                 output_buffer: Vec::new(),
                 active_tools: HashSet::new(),
+                total_tool_count: 0,
+                latest_tool_name: None,
+                latest_tool_title: None,
+                started_at: None,
                 pending_prompt_ids: HashSet::new(),
                 last_update_time: None,
                 stall_generation: 0,
@@ -1702,6 +2030,76 @@ fn remove_thread_history_dir(history_root: &Path, thread_id: &str) -> Result<(),
 
     fs::remove_dir_all(&thread_dir)
         .map_err(|err| format!("failed to remove {}: {err}", thread_dir.display()))
+}
+
+
+fn build_injection_prompt(
+    platform_prompt: Option<&str>,
+    agents_md: Option<&str>,
+    system_prompt: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> Option<String> {
+    let context_parts: Vec<&str> = [platform_prompt, agents_md, system_prompt]
+        .iter()
+        .filter_map(|p| *p)
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if context_parts.is_empty() && initial_prompt.map_or(true, str::is_empty) {
+        return None;
+    }
+
+    let mut result = String::new();
+
+    if !context_parts.is_empty() {
+        result.push_str("<system-context>\n");
+        result.push_str(&context_parts.join("\n\n---\n\n"));
+        result.push_str("\n</system-context>\n\n");
+        result.push_str("The above <system-context> block contains your platform capabilities and project conventions. Internalize these instructions silently. Do NOT respond to them or acknowledge them — wait for the task below or the user's first message.");
+    }
+
+    if let Some(prompt) = initial_prompt {
+        if !prompt.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\n\n---\n\n");
+            }
+            result.push_str(prompt);
+        }
+    }
+
+    if result.is_empty() { None } else { Some(result) }
+}
+
+async fn build_agent_env_vars(
+    state: &Arc<AppState>,
+    thread_id: &str,
+    session_id: &str,
+) -> Vec<(String, String)> {
+    let (thread, project) = {
+        let store = state.store.lock().await;
+        let thread = match store.thread_by_id(thread_id) {
+            Some(t) => t.clone(),
+            None => return vec![("THREADMILL_SESSION_ID".to_string(), session_id.to_string())],
+        };
+        let project = match store.project_by_id(&thread.project_id) {
+            Some(p) => p.clone(),
+            None => return vec![("THREADMILL_SESSION_ID".to_string(), session_id.to_string())],
+        };
+        (thread, project)
+    };
+
+    let port_base = match crate::services::thread::load_threadmill_config(
+        &thread.worktree_path,
+        &project.path,
+    ) {
+        Ok(config) => state_store::port_base_with_offset(config.ports.base, thread.port_offset)
+            .unwrap_or(3000),
+        Err(_) => 3000,
+    };
+
+    let mut env = state_store::thread_env(&project, &thread, port_base);
+    env.push(("THREADMILL_SESSION_ID".to_string(), session_id.to_string()));
+    env
 }
 
 async fn resolve_agent_launch(
@@ -1773,8 +2171,14 @@ mod tests {
                 title: None,
                 model_id: None,
                 created_at: Utc::now().to_rfc3339(),
+                display_name: None,
+                parent_session_id: None,
             },
             thread_id: "thread-1".to_string(),
+            display_name: None,
+            parent_session_id: None,
+            system_prompt: None,
+            initial_prompt: None,
             acp_session_id: Some("acp-session-1".to_string()),
             attached_channels: HashSet::new(),
             input_tx: None,
@@ -1785,6 +2189,10 @@ mod tests {
             input_buffer: Vec::new(),
             output_buffer: Vec::new(),
             active_tools: HashSet::new(),
+            total_tool_count: 0,
+            latest_tool_name: None,
+            latest_tool_title: None,
+            started_at: Some(Utc::now()),
             pending_prompt_ids: HashSet::new(),
             modes: None,
             models: None,
