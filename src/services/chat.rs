@@ -417,7 +417,7 @@ impl ChatService {
         channel_id: u16,
         payload: Vec<u8>,
     ) -> Result<bool, String> {
-        let (input_tx, transitions) = {
+        let (input_tx, transitions, prompt_updates, history_path) = {
             let mut chat = state.chat.lock().await;
             let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
                 return Ok(false);
@@ -433,12 +433,19 @@ impl ChatService {
                     format!("chat session {} is not running", session.summary.session_id)
                 })?
                 .clone();
+            let history_path = session.history_path.clone();
             let messages = extract_json_messages(&mut session.input_buffer, &payload, "input");
-            let transitions = apply_inbound_status_updates(&state, session, messages);
-            (input_tx, transitions)
+            let (transitions, prompt_updates) = apply_inbound_status_updates(&state, session, messages);
+            (input_tx, transitions, prompt_updates, history_path)
         };
 
         emit_status_transitions(&state, transitions).await;
+
+        if !prompt_updates.is_empty() {
+            if let Err(error) = append_updates_to_history(&history_path, &prompt_updates) {
+                warn!(channel_id, error = %error, "failed to persist user prompt to chat history");
+            }
+        }
 
         // Rewrite Spindle session ID to ACP session ID in the payload
         // so the agent receives its own session ID namespace
@@ -970,8 +977,9 @@ fn apply_inbound_status_updates(
     state: &Arc<AppState>,
     session: &mut ChatSessionRuntime,
     messages: Vec<Value>,
-) -> Vec<StatusTransition> {
+) -> (Vec<StatusTransition>, Vec<Value>) {
     let mut transitions = Vec::new();
+    let mut history_updates = Vec::new();
 
     for message in messages {
         let method = message
@@ -982,6 +990,17 @@ fn apply_inbound_status_updates(
         if method == CHAT_PROMPT_METHOD {
             if let Some(id) = request_id_key(message.get("id")) {
                 session.pending_prompt_ids.insert(id);
+            }
+            // Persist user prompt as a synthetic userMessageChunk for history hydration
+            if let Some(params) = message.get("params") {
+                if let Some(text) = params.get("text").and_then(Value::as_str) {
+                    history_updates.push(json!({
+                        "update": {
+                            "kind": "user_message_chunk",
+                            "content": { "type": "text", "text": text }
+                        }
+                    }));
+                }
             }
             session.active_tools.clear();
             session.summary.worker_count = 0;
@@ -995,7 +1014,7 @@ fn apply_inbound_status_updates(
         }
     }
 
-    transitions
+    (transitions, history_updates)
 }
 
 fn apply_outbound_status_updates(
@@ -1781,7 +1800,7 @@ mod tests {
         let state = make_test_state();
         let mut session = make_test_session();
 
-        let transitions = apply_inbound_status_updates(
+        let (transitions, _prompt_updates) = apply_inbound_status_updates(
             &state,
             &mut session,
             vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
