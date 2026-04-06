@@ -75,6 +75,9 @@ struct ChatSessionRuntime {
     modes: Option<Value>,
     models: Option<Value>,
     config_options: Option<Value>,
+    /// Tracks the injection prompt request ID so we can detect when the injection turn completes.
+    /// Set when injection is sent, cleared when the response arrives in apply_outbound_status_updates.
+    injection_prompt_id: Option<String>,
 }
 
 impl ChatState {
@@ -154,6 +157,7 @@ impl ChatService {
                 modes: None,
                 models: None,
                 config_options: None,
+                injection_prompt_id: None,
             };
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -649,7 +653,7 @@ async fn run_session_task(
     state: Arc<AppState>,
     thread_id: String,
     session_id: String,
-    agent_type: String,
+    _agent_type: String,
     _project_path: String,
     command: String,
     cwd: String,
@@ -733,46 +737,33 @@ async fn run_session_task(
     // Done BEFORE mark_session_ready so the JSONL is ready when the Mac
     // calls chat.history after attaching.
     if !handshake.replay_notifications.is_empty() {
-        let history_path = {
-            let chat = state.chat.lock().await;
-            chat.sessions.get(&session_id).map(|s| s.history_path.clone())
-        };
-        if let Some(path) = history_path {
-            let updates = collect_session_update_params(&handshake.replay_notifications);
-            if !updates.is_empty() {
-                tracing::info!(
-                    session_id = %session_id,
-                    count = updates.len(),
-                    "persisting session/load replay to JSONL ({} session/update params)",
-                    updates.len()
-                );
-                if let Err(e) = overwrite_history(&path, &updates) {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "failed to persist replay history"
-                    );
-                }
-            }
-        }
+        // Skip overwrite_history — the JSONL already contains the full history
+        // from live fanout_output. The agent's session/load replay is often
+        // incomplete (only the latest turn), so overwriting would destroy data.
+        // New updates after load will append normally via fanout_output.
     }
 
     mark_session_ready(Arc::clone(&state), &thread_id, &session_id, &handshake).await;
 
-    // Post-handshake context injection: AGENTS.md + system_prompt + initial_prompt.
+    // Post-handshake context injection: platform prompt + system_prompt + initial_prompt.
     // Only inject on session/new — session/load already has the context from the
     // prior conversation. Re-injecting would show the injection text again.
+    //
+    // Project AGENTS.md is NOT injected here — each agent binary handles its own
+    // project context discovery (OpenCode reads AGENTS.md, Claude reads CLAUDE.md, etc.).
+    // We only inject platform-level awareness (Threadmill env vars, threadmill-cli,
+    // worker orchestration) which no agent can discover on its own.
     if is_new_session {
-        let (system_prompt, initial_prompt, should_inject_agents_md) = {
+        let (system_prompt, initial_prompt) = {
             let chat = state.chat.lock().await;
             let session = chat.sessions.get(&session_id);
             let sp = session.and_then(|s| s.system_prompt.clone());
             let ip = session.and_then(|s| s.initial_prompt.clone());
-            (sp, ip, !agent_registry::agent_self_injects_context(&agent_type))
+            (sp, ip)
         };
 
         // Read platform system prompt from ~/.config/threadmill/system-prompt.md
-        let platform_prompt = if should_inject_agents_md {
+        let platform_prompt = {
             let config_dir = dirs::config_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("/home/wsl/.config"));
             let platform_path = config_dir.join("threadmill").join("system-prompt.md");
@@ -786,31 +777,12 @@ async fn run_session_task(
                     None
                 }
             }
-        } else {
-            None
         };
 
-        let agents_md = if should_inject_agents_md {
-            let agents_path = std::path::Path::new(&cwd).join("AGENTS.md");
-            match std::fs::read_to_string(&agents_path) {
-                Ok(content) => {
-                    tracing::info!(session_id = %session_id, "injecting AGENTS.md ({} bytes)", content.len());
-                    Some(content)
-                }
-                Err(_) => {
-                    tracing::debug!(session_id = %session_id, "no AGENTS.md found in worktree, skipping injection");
-                    None
-                }
-            }
-        } else {
-            tracing::debug!(session_id = %session_id, agent = %agent_type, "agent self-injects context, skipping AGENTS.md injection");
-            None
-        };
-
-        let combined = build_injection_prompt(platform_prompt.as_deref(), agents_md.as_deref(), system_prompt.as_deref(), initial_prompt.as_deref());
+        let combined = build_injection_prompt(platform_prompt.as_deref(), system_prompt.as_deref(), initial_prompt.as_deref());
         if let Some(prompt_text) = combined {
             tracing::info!(session_id = %session_id, len = prompt_text.len(), "sending injection prompt");
-            let injection_id = 100;
+            let injection_id: u64 = 100;
             if let Err(err) = send_acp_request(
                 &input_tx,
                 injection_id,
@@ -823,11 +795,39 @@ async fn run_session_task(
             .await
             {
                 tracing::warn!(session_id = %session_id, error = %err, "failed to send injection prompt");
+            } else {
+                // Track injection id so the outbound status machinery fires Busy→Idle
+                // when the agent responds, giving the Mac a clear "injection complete" signal.
+                let transitions = {
+                    let mut chat = state.chat.lock().await;
+                    let mut transitions = Vec::new();
+                    if let Some(session) = chat.sessions.get_mut(&session_id) {
+                        let id_str = injection_id.to_string();
+                        session.pending_prompt_ids.insert(id_str.clone());
+                        session.injection_prompt_id = Some(id_str);
+                        apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
+                    }
+                    transitions
+                };
+                emit_status_transitions(&state, transitions).await;
             }
-            // Don't wait for response — let it stream in the I/O loop
+            // Don't wait for response — let it stream in the I/O loop.
+            // The response will be detected by apply_outbound_status_updates which
+            // fires Busy→Idle and emits chat.injection_complete.
+        } else {
+            // No injection content — signal immediately so the Mac doesn't wait
+            state.emit_event("chat.injection_complete", json!({
+                "thread_id": thread_id,
+                "session_id": session_id,
+            }));
         }
     } else {
         tracing::debug!(session_id = %session_id, "session/load — skipping context injection (already in conversation history)");
+        // Loaded sessions don't inject — signal immediately
+        state.emit_event("chat.injection_complete", json!({
+            "thread_id": thread_id,
+            "session_id": session_id,
+        }));
     }
 
     let mut buf = [0_u8; CHAT_IO_CHUNK_SIZE];
@@ -1212,12 +1212,14 @@ fn apply_inbound_status_updates(
     (transitions, history_updates)
 }
 
+/// Returns (status_transitions, injection_just_completed).
 fn apply_outbound_status_updates(
     state: &Arc<AppState>,
     session: &mut ChatSessionRuntime,
     messages: Vec<Value>,
-) -> Vec<StatusTransition> {
+) -> (Vec<StatusTransition>, bool) {
     let mut transitions = Vec::new();
+    let mut injection_completed = false;
 
     for message in messages {
         if let Some(method) = message.get("method").and_then(Value::as_str) {
@@ -1243,10 +1245,16 @@ fn apply_outbound_status_updates(
             continue;
         }
 
+        // Detect injection turn completion
+        if session.injection_prompt_id.as_deref() == Some(&id) {
+            session.injection_prompt_id = None;
+            injection_completed = true;
+        }
+
         reset_status_tracking(session, &mut transitions);
     }
 
-    transitions
+    (transitions, injection_completed)
 }
 
 fn apply_worker_update(session: &mut ChatSessionRuntime, params: Option<&Value>) {
@@ -1402,7 +1410,7 @@ fn rewrite_session_id(payload: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
 }
 
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
-    let (targets, history_path, updates, transitions) = {
+    let (targets, history_path, updates, transitions, injection_completed, thread_id) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
@@ -1410,7 +1418,8 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
 
         let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
         let updates = collect_session_update_params(&messages);
-        let transitions = apply_outbound_status_updates(&state, session, messages);
+        let (transitions, injection_completed) = apply_outbound_status_updates(&state, session, messages);
+        let thread_id = session.thread_id.clone();
         let history_path = session.history_path.clone();
         let attached_channels = session
             .attached_channels
@@ -1428,10 +1437,18 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             })
             .collect::<Vec<_>>();
 
-        (targets, history_path, updates, transitions)
+        (targets, history_path, updates, transitions, injection_completed, thread_id)
     };
 
     emit_status_transitions(&state, transitions).await;
+
+    if injection_completed {
+        tracing::info!(session_id, "injection turn completed — emitting chat.injection_complete");
+        state.emit_event("chat.injection_complete", json!({
+            "thread_id": thread_id,
+            "session_id": session_id,
+        }));
+    }
 
     // Emit worker_update to parent session if this is a child worker
     emit_worker_update_to_parent(&state, session_id).await;
@@ -2007,6 +2024,7 @@ fn discover_history_sessions(
                 modes: None,
                 models: None,
                 config_options: None,
+                injection_prompt_id: None,
             });
         }
     }
@@ -2035,11 +2053,10 @@ fn remove_thread_history_dir(history_root: &Path, thread_id: &str) -> Result<(),
 
 fn build_injection_prompt(
     platform_prompt: Option<&str>,
-    agents_md: Option<&str>,
     system_prompt: Option<&str>,
     initial_prompt: Option<&str>,
 ) -> Option<String> {
-    let context_parts: Vec<&str> = [platform_prompt, agents_md, system_prompt]
+    let context_parts: Vec<&str> = [platform_prompt, system_prompt]
         .iter()
         .filter_map(|p| *p)
         .filter(|p| !p.is_empty())
@@ -2198,6 +2215,7 @@ mod tests {
             models: None,
             config_options: None,
             last_update_time: None,
+            injection_prompt_id: None,
             stall_generation: 0,
             stall_task: None,
         }
@@ -2230,7 +2248,7 @@ mod tests {
         let mut session = make_test_session();
         session.summary.agent_status = protocol::AgentStatus::Busy;
 
-        let started = apply_outbound_status_updates(
+        let (started, _) = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({
@@ -2242,7 +2260,7 @@ mod tests {
         assert!(started.is_empty());
         assert_eq!(session.summary.worker_count, 1);
 
-        let completed = apply_outbound_status_updates(
+        let (completed, _) = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({
@@ -2266,7 +2284,7 @@ mod tests {
         session.active_tools.insert("tool-1".to_string());
         session.summary.worker_count = 1;
 
-        let transitions = apply_outbound_status_updates(
+        let (transitions, _) = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}})],
@@ -2287,7 +2305,7 @@ mod tests {
         let mut session = make_test_session();
         session.summary.agent_status = protocol::AgentStatus::Stalled;
 
-        let transitions = apply_outbound_status_updates(
+        let (transitions, _) = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![
