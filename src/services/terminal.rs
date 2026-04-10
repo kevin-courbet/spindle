@@ -13,10 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::{
-    protocol,
-    AppState,
-};
+use crate::{protocol, AppState};
 
 const INPUT_CHANNEL_CAPACITY: usize = 256;
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(15);
@@ -35,6 +32,7 @@ pub(crate) struct Attachment {
     input_fifo_path: String,
     output_fifo_path: String,
     input_tx: Option<mpsc::Sender<Vec<u8>>>,
+    output_start_tx: Option<oneshot::Sender<()>>,
     output_shutdown_tx: Option<oneshot::Sender<()>>,
     input_task: JoinHandle<()>,
     output_task: JoinHandle<()>,
@@ -100,7 +98,7 @@ pub async fn attach(
             } else {
                 let reserved_channel_id = state.alloc_channel_id_with(|candidate| {
                     guard.by_channel.contains_key(&candidate)
-                            || guard
+                        || guard
                             .attaching_targets
                             .values()
                             .any(|existing| *existing == candidate)
@@ -186,6 +184,7 @@ pub async fn attach(
             ));
         }
 
+        let (output_start_tx, output_start_rx) = oneshot::channel();
         let (output_shutdown_tx, mut output_shutdown_rx) = oneshot::channel();
         let output_tx = outbound_tx.clone();
         let output_fifo_for_task = output_fifo_path.clone();
@@ -197,6 +196,10 @@ pub async fn attach(
                     return;
                 }
             };
+
+            if output_start_rx.await.is_err() {
+                return;
+            }
 
             let mut buf = [0_u8; 8192];
             loop {
@@ -260,6 +263,7 @@ pub async fn attach(
             input_fifo_path,
             output_fifo_path,
             input_tx: Some(input_tx),
+            output_start_tx: Some(output_start_tx),
             output_shutdown_tx: Some(output_shutdown_tx),
             input_task,
             output_task,
@@ -267,7 +271,7 @@ pub async fn attach(
     }
     .await;
 
-    let attachment = match attach_result {
+    let mut attachment = match attach_result {
         Ok(attachment) => attachment,
         Err(err) => {
             let mut guard = connection_state.lock().await;
@@ -277,12 +281,6 @@ pub async fn attach(
     };
 
     let pane_target_for_replay = attachment.pane_target.clone();
-    {
-        let mut guard = connection_state.lock().await;
-        guard.attaching_targets.remove(&target_key);
-        guard.by_target.insert(target_key.clone(), channel_id);
-        guard.by_channel.insert(channel_id, attachment);
-    }
 
     // Give the shell time to finish initializing and draw its prompt.
     // Without this, capture_pane_scrollback runs before the prompt is in
@@ -301,6 +299,17 @@ pub async fn attach(
             payload.extend_from_slice(normalized.as_bytes());
             let _ = outbound_tx.send(Message::Binary(payload));
         }
+    }
+
+    if let Some(output_start_tx) = attachment.output_start_tx.take() {
+        let _ = output_start_tx.send(());
+    }
+
+    {
+        let mut guard = connection_state.lock().await;
+        guard.attaching_targets.remove(&target_key);
+        guard.by_target.insert(target_key.clone(), channel_id);
+        guard.by_channel.insert(channel_id, attachment);
     }
 
     Ok(json!({ "channel_id": channel_id }))

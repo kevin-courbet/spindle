@@ -112,10 +112,7 @@ fn install_method_from(agent: &BuiltInAgent) -> InstallMethod {
 }
 
 fn which(binary: &str) -> Option<String> {
-    let output = Command::new("which")
-        .arg(binary)
-        .output()
-        .ok()?;
+    let output = Command::new("which").arg(binary).output().ok()?;
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if path.is_empty() {
@@ -234,14 +231,20 @@ mod tests {
     #[test]
     fn test_build_command_with_args() {
         assert_eq!(build_command("opencode", &["acp"]), "opencode acp");
-        assert_eq!(build_command("gemini", &["--experimental-acp"]), "gemini --experimental-acp");
+        assert_eq!(
+            build_command("gemini", &["--experimental-acp"]),
+            "gemini --experimental-acp"
+        );
         assert_eq!(build_command("claude-agent-acp", &[]), "claude-agent-acp");
     }
 
     #[test]
     fn test_agent_command_lookup() {
         assert_eq!(agent_command("opencode"), Some("opencode acp".to_string()));
-        assert_eq!(agent_command("claude"), Some("claude-agent-acp".to_string()));
+        assert_eq!(
+            agent_command("claude"),
+            Some("claude-agent-acp".to_string())
+        );
         assert_eq!(agent_command("nonexistent"), None);
     }
 }

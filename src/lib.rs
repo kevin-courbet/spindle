@@ -134,7 +134,6 @@ impl AppState {
         self.emit_event("preset.output", event);
     }
 
-
     pub fn emit_chat_session_created(&self, event: protocol::ChatSessionCreatedEvent) {
         self.emit_event("chat.session_created", event);
     }

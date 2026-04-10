@@ -318,6 +318,8 @@ struct ProjectConfigFile {
     presets: BTreeMap<String, ProjectPresetFile>,
     #[serde(default)]
     agents: BTreeMap<String, ProjectAgentFile>,
+    #[serde(default)]
+    default_chat_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -337,24 +339,8 @@ struct ProjectPresetFile {
 }
 
 pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetConfig>, String> {
-    let config_path = Path::new(project_path).join(".threadmill.yml");
-    if !config_path.exists() {
+    let Some(parsed) = load_project_config(project_path)? else {
         return Ok(default_presets());
-    }
-
-    let raw = fs::read_to_string(&config_path)
-        .map_err(|err| format!("failed to read {}: {err}", config_path.display()))?;
-    let parsed: ProjectConfigFile = match serde_yaml::from_str(&raw) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            warn!(
-                project_path = %project_path,
-                config_path = %config_path.display(),
-                error = %err,
-                "failed to parse project presets; using defaults"
-            );
-            return Ok(default_presets());
-        }
     };
 
     let mut presets = Vec::with_capacity(parsed.presets.len());
@@ -376,7 +362,6 @@ pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetCo
         let Some(command) = command else {
             warn!(
                 project_path = %project_path,
-                config_path = %config_path.display(),
                 preset_name = %name,
                 "invalid preset config missing command; using defaults"
             );
@@ -394,6 +379,42 @@ pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetCo
     }
 
     Ok(presets)
+}
+
+pub fn load_project_agents(project_path: &str) -> Result<Vec<protocol::ProjectAgentConfig>, String> {
+    let Some(parsed) = load_project_config(project_path)? else {
+        return Ok(vec![]);
+    };
+
+    let mut agents = Vec::with_capacity(parsed.agents.len());
+    for (name, agent) in parsed.agents {
+        let Some(command) = agent
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+
+        agents.push(protocol::ProjectAgentConfig { name, command });
+    }
+
+    Ok(agents)
+}
+
+pub fn load_project_default_chat_model(project_path: &str) -> Result<Option<String>, String> {
+    let Some(parsed) = load_project_config(project_path)? else {
+        return Ok(None);
+    };
+
+    Ok(parsed
+        .default_chat_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned))
 }
 
 pub fn resolve_preset_cwd(worktree_path: &str, cwd: Option<&str>) -> Result<String, String> {
@@ -710,18 +731,37 @@ fn is_git_repo_dir(path: &Path) -> bool {
     std::fs::metadata(path.join("HEAD")).is_ok() && std::fs::metadata(path.join("objects")).is_ok()
 }
 
-
-
 /// Look up a custom agent command from .threadmill.yml.
 /// Only used as fallback when the agent registry has no match.
 pub fn project_agent_command(project_path: &str, agent_name: &str) -> Option<String> {
-    let config_path = Path::new(project_path).join(".threadmill.yml");
-    let raw = fs::read_to_string(&config_path).ok()?;
-    let parsed: ProjectConfigFile = serde_yaml::from_str(&raw).ok()?;
+    let parsed = load_project_config(project_path).ok()??;
     let agent = parsed.agents.get(agent_name)?;
-    agent.command.as_deref()
+    agent
+        .command
+        .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned)
 }
 
+fn load_project_config(project_path: &str) -> Result<Option<ProjectConfigFile>, String> {
+    let config_path = Path::new(project_path).join(".threadmill.yml");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&config_path)
+        .map_err(|err| format!("failed to read {}: {err}", config_path.display()))?;
+
+    match serde_yaml::from_str(&raw) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(err) => {
+            warn!(
+                project_path = %project_path,
+                error = %err,
+                "failed to parse project config"
+            );
+            Ok(None)
+        }
+    }
+}

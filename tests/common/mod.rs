@@ -36,6 +36,7 @@ fn test_mutex() -> &'static Mutex<()> {
 
 pub struct TestHarness {
     socket: Socket,
+    ws_url: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: JoinHandle<()>,
     next_id: u64,
@@ -54,6 +55,10 @@ pub struct RpcFailure {
 }
 
 impl TestHarness {
+    pub fn ws_url(&self) -> &str {
+        &self.ws_url
+    }
+
     pub async fn rpc(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -392,10 +397,11 @@ pub async fn setup_test_server() -> TestHarness {
     });
 
     let url = format!("ws://{addr}");
-    let (socket, _) = connect_async(url).await.expect("connect websocket");
+    let (socket, _) = connect_async(url.clone()).await.expect("connect websocket");
 
     let mut harness = TestHarness {
         socket,
+        ws_url: url,
         shutdown_tx: Some(shutdown_tx),
         server_task,
         next_id: 1,

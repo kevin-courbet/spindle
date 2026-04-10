@@ -21,9 +21,11 @@ use uuid::Uuid;
 
 use crate::{
     protocol,
-    services::{agent_registry, project::project_agent_command, terminal::TerminalConnectionState},
-    state_store,
-    AppState,
+    services::{
+        agent_registry, checkpoint::CheckpointService, project::{load_project_default_chat_model, project_agent_command},
+        terminal::TerminalConnectionState,
+    },
+    state_store, AppState,
 };
 
 const CHAT_INPUT_CHANNEL_CAPACITY: usize = 256;
@@ -69,6 +71,7 @@ struct ChatSessionRuntime {
     latest_tool_title: Option<String>,
     started_at: Option<chrono::DateTime<Utc>>,
     pending_prompt_ids: HashSet<String>,
+    checkpoint_seq: u64,
     last_update_time: Option<chrono::DateTime<Utc>>,
     stall_generation: u64,
     stall_task: Option<JoinHandle<()>>,
@@ -92,6 +95,12 @@ impl ChatState {
     }
 }
 
+impl ChatState {
+    pub(crate) fn history_root_path(&self) -> &Path {
+        &self.history_root
+    }
+}
+
 struct HandshakeResult {
     acp_session_id: String,
     modes: Option<Value>,
@@ -109,7 +118,7 @@ impl ChatService {
         params: protocol::ChatStartParams,
     ) -> Result<protocol::ChatStartResult, String> {
         tracing::info!(thread_id = %params.thread_id, agent = %params.agent_name, "chat_start");
-        let (project_path, command, cwd) =
+        let (project_path, command, cwd, preferred_model) =
             resolve_agent_launch(&state, &params.thread_id, &params.agent_name).await?;
 
         let session_id = Uuid::new_v4().to_string();
@@ -151,6 +160,7 @@ impl ChatService {
                 latest_tool_title: None,
                 started_at: Some(Utc::now()),
                 pending_prompt_ids: HashSet::new(),
+                checkpoint_seq: 0,
                 last_update_time: None,
                 stall_generation: 0,
                 stall_task: None,
@@ -184,6 +194,7 @@ impl ChatService {
             command,
             cwd,
             None,
+            preferred_model.clone(),
         );
 
         Ok(protocol::ChatStartResult {
@@ -196,7 +207,6 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatLoadParams,
     ) -> Result<protocol::ChatLoadResult, String> {
-
         let (agent_type, acp_session_id, stop_tx) = {
             let mut chat = state.chat.lock().await;
             let session = chat
@@ -235,12 +245,16 @@ impl ChatService {
         // Recovered sessions have agent_type "unknown". Use client-supplied
         // agent_name as fallback so resolve_agent_launch can find the command.
         let effective_agent = if agent_type == "unknown" {
-            params.agent_name.as_deref().unwrap_or(&agent_type).to_string()
+            params
+                .agent_name
+                .as_deref()
+                .unwrap_or(&agent_type)
+                .to_string()
         } else {
             agent_type.clone()
         };
 
-        let (project_path, command, cwd) =
+        let (project_path, command, cwd, preferred_model) =
             resolve_agent_launch(&state, &params.thread_id, &effective_agent).await?;
         spawn_session_task(
             Arc::clone(&state),
@@ -251,6 +265,7 @@ impl ChatService {
             command,
             cwd,
             Some(acp_session_id),
+            preferred_model.clone(),
         );
 
         Ok(protocol::ChatLoadResult {
@@ -330,7 +345,6 @@ impl ChatService {
             chat.history_root.clone()
         };
 
-
         let recovered = discover_history_sessions(&history_root, &known_threads)?;
 
         if recovered.is_empty() {
@@ -361,7 +375,6 @@ impl ChatService {
         connection_state: Arc<Mutex<TerminalConnectionState>>,
         outbound_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<protocol::ChatAttachResult, String> {
-
         loop {
             let wait_notify = {
                 let chat = state.chat.lock().await;
@@ -428,7 +441,9 @@ impl ChatService {
             let (acp_sid, modes, models, config_options) = {
                 let session = chat.sessions.get(&params.session_id);
                 (
-                    session.and_then(|s| s.acp_session_id.clone()).unwrap_or_default(),
+                    session
+                        .and_then(|s| s.acp_session_id.clone())
+                        .unwrap_or_default(),
                     session.and_then(|s| s.modes.clone()),
                     session.and_then(|s| s.models.clone()),
                     session.and_then(|s| s.config_options.clone()),
@@ -445,7 +460,13 @@ impl ChatService {
             conn.by_chat_channel
                 .insert(channel_id, params.session_id.clone());
 
-            return Ok(protocol::ChatAttachResult { channel_id, acp_session_id: acp_sid, modes, models, config_options });
+            return Ok(protocol::ChatAttachResult {
+                channel_id,
+                acp_session_id: acp_sid,
+                modes,
+                models,
+                config_options,
+            });
         }
     }
 
@@ -468,7 +489,7 @@ impl ChatService {
         channel_id: u16,
         payload: Vec<u8>,
     ) -> Result<bool, String> {
-        let (input_tx, transitions, prompt_updates, history_path) = {
+        let (input_tx, transitions, prompt_updates, auto_checkpoints, history_path) = {
             let mut chat = state.chat.lock().await;
             let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
                 return Ok(false);
@@ -486,8 +507,15 @@ impl ChatService {
                 .clone();
             let history_path = session.history_path.clone();
             let messages = extract_json_messages(&mut session.input_buffer, &payload, "input");
-            let (transitions, prompt_updates) = apply_inbound_status_updates(&state, session, messages);
-            (input_tx, transitions, prompt_updates, history_path)
+            let (transitions, prompt_updates, auto_checkpoints) =
+                apply_inbound_status_updates(&state, session, messages);
+            (
+                input_tx,
+                transitions,
+                prompt_updates,
+                auto_checkpoints,
+                history_path,
+            )
         };
 
         emit_status_transitions(&state, transitions).await;
@@ -498,6 +526,10 @@ impl ChatService {
             }
         }
 
+        for checkpoint in auto_checkpoints {
+            spawn_auto_checkpoint(Arc::clone(&state), checkpoint);
+        }
+
         // Rewrite Spindle session ID to ACP session ID in the payload
         // so the agent receives its own session ID namespace
         let rewritten_payload = {
@@ -506,14 +538,25 @@ impl ChatService {
                 if let Some(session) = chat.sessions.get(sid) {
                     if let Some(ref acp_id) = session.acp_session_id {
                         rewrite_session_id(&payload, sid, acp_id)
-                    } else { None }
-                } else { None }
-            } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
         let final_payload = rewritten_payload.unwrap_or(payload);
 
         if let Ok(s) = std::str::from_utf8(&final_payload) {
-            warn!(channel_id, "chat_inbound_frame payload_len={} snippet={:?}", final_payload.len(), &s[..s.floor_char_boundary(s.len().min(200))]);
+            warn!(
+                channel_id,
+                "chat_inbound_frame payload_len={} snippet={:?}",
+                final_payload.len(),
+                &s[..s.floor_char_boundary(s.len().min(200))]
+            );
         }
 
         input_tx
@@ -583,6 +626,7 @@ fn spawn_session_task(
     command: String,
     cwd: String,
     load_session_id: Option<String>,
+    preferred_model: Option<String>,
 ) {
     let fail_state = Arc::clone(&state);
     let fail_thread_id = thread_id.clone();
@@ -593,9 +637,7 @@ fn spawn_session_task(
         let state_ref = state.clone();
         let tid = thread_id.clone();
         let sid = session_id.clone();
-        tokio::spawn(async move {
-            build_agent_env_vars(&state_ref, &tid, &sid).await
-        })
+        tokio::spawn(async move { build_agent_env_vars(&state_ref, &tid, &sid).await })
     };
 
     let handle = tokio::spawn(async move {
@@ -612,6 +654,7 @@ fn spawn_session_task(
             command,
             cwd,
             load_session_id,
+            preferred_model,
             env_vars,
         )
         .await
@@ -658,6 +701,7 @@ async fn run_session_task(
     command: String,
     cwd: String,
     load_session_id: Option<String>,
+    preferred_model: Option<String>,
     env_vars: Vec<(String, String)>,
 ) -> Result<(), String> {
     let mut cmd = Command::new("bash");
@@ -669,7 +713,8 @@ async fn run_session_task(
     for (key, value) in &env_vars {
         cmd.env(key, value);
     }
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|err| format!("failed to spawn chat agent process: {err}"))?;
 
     let stdout = child
@@ -717,7 +762,7 @@ async fn run_session_task(
     let is_new_session = load_session_id.is_none();
     let handshake = timeout(
         CHAT_HANDSHAKE_TIMEOUT,
-        perform_handshake(&input_tx, &mut stdout, load_session_id, &cwd),
+        perform_handshake(&input_tx, &mut stdout, load_session_id, &cwd, preferred_model.as_deref()),
     )
     .await
     .map_err(|_| "chat handshake timed out after 30s".to_string())?;
@@ -764,8 +809,8 @@ async fn run_session_task(
 
         // Read platform system prompt from ~/.config/threadmill/system-prompt.md
         let platform_prompt = {
-            let config_dir = dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/home/wsl/.config"));
+            let config_dir =
+                dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("/home/wsl/.config"));
             let platform_path = config_dir.join("threadmill").join("system-prompt.md");
             match std::fs::read_to_string(&platform_path) {
                 Ok(content) => {
@@ -779,7 +824,11 @@ async fn run_session_task(
             }
         };
 
-        let combined = build_injection_prompt(platform_prompt.as_deref(), system_prompt.as_deref(), initial_prompt.as_deref());
+        let combined = build_injection_prompt(
+            platform_prompt.as_deref(),
+            system_prompt.as_deref(),
+            initial_prompt.as_deref(),
+        );
         if let Some(prompt_text) = combined {
             tracing::info!(session_id = %session_id, len = prompt_text.len(), "sending injection prompt");
             let injection_id: u64 = 100;
@@ -805,7 +854,11 @@ async fn run_session_task(
                         let id_str = injection_id.to_string();
                         session.pending_prompt_ids.insert(id_str.clone());
                         session.injection_prompt_id = Some(id_str);
-                        apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
+                        apply_status_transition(
+                            session,
+                            protocol::AgentStatus::Busy,
+                            &mut transitions,
+                        );
                     }
                     transitions
                 };
@@ -816,18 +869,24 @@ async fn run_session_task(
             // fires Busy→Idle and emits chat.injection_complete.
         } else {
             // No injection content — signal immediately so the Mac doesn't wait
-            state.emit_event("chat.injection_complete", json!({
-                "thread_id": thread_id,
-                "session_id": session_id,
-            }));
+            state.emit_event(
+                "chat.injection_complete",
+                json!({
+                    "thread_id": thread_id,
+                    "session_id": session_id,
+                }),
+            );
         }
     } else {
         tracing::debug!(session_id = %session_id, "session/load — skipping context injection (already in conversation history)");
         // Loaded sessions don't inject — signal immediately
-        state.emit_event("chat.injection_complete", json!({
-            "thread_id": thread_id,
-            "session_id": session_id,
-        }));
+        state.emit_event(
+            "chat.injection_complete",
+            json!({
+                "thread_id": thread_id,
+                "session_id": session_id,
+            }),
+        );
     }
 
     let mut buf = [0_u8; CHAT_IO_CHUNK_SIZE];
@@ -883,6 +942,7 @@ async fn perform_handshake(
     stdout: &mut tokio::process::ChildStdout,
     load_session_id: Option<String>,
     cwd: &str,
+    preferred_model: Option<&str>,
 ) -> Result<HandshakeResult, String> {
     let mut buffer = Vec::new();
     let mut collected = Vec::new();
@@ -915,7 +975,10 @@ async fn perform_handshake(
     ensure_acp_success(&init, "initialize")?;
 
     let (method, params) = if let Some(session_id) = load_session_id {
-        ("session/load", json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }))
+        (
+            "session/load",
+            json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+        )
     } else {
         ("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
     };
@@ -940,16 +1003,40 @@ async fn perform_handshake(
         .ok_or_else(|| format!("{method} response missing sessionId"))?
         .to_string();
 
-    let model_id = result
+    let mut model_id = result
         .get("models")
         .and_then(|models| models.get("currentModelId"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let mut models = result.get("models").cloned();
+
+    if let Some(preferred_model) = preferred_model {
+        send_acp_request(
+            input_tx,
+            3,
+            "session/set_model",
+            json!({
+                "sessionId": acp_session_id,
+                "modelId": preferred_model,
+            }),
+        )
+        .await?;
+        let set_model_response =
+            wait_for_acp_response(stdout, &mut buffer, 3, &mut collected).await?;
+        ensure_acp_success(&set_model_response, "session/set_model")?;
+        model_id = Some(preferred_model.to_string());
+        if let Some(models_value) = models.as_mut().and_then(Value::as_object_mut) {
+            models_value.insert(
+                "currentModelId".to_string(),
+                Value::String(preferred_model.to_string()),
+            );
+        }
+    }
 
     Ok(HandshakeResult {
         acp_session_id,
         modes: result.get("modes").cloned(),
-        models: result.get("models").cloned(),
+        models,
         config_options: result.get("configOptions").cloned(),
         title: result
             .get("title")
@@ -1064,6 +1151,13 @@ struct StatusTransition {
     worker_count: usize,
 }
 
+struct AutoCheckpointRequest {
+    thread_id: String,
+    session_id: String,
+    message: String,
+    prompt_preview: Option<String>,
+}
+
 async fn emit_status_transitions(state: &Arc<AppState>, transitions: Vec<StatusTransition>) {
     for transition in transitions {
         state.emit_chat_status_changed(protocol::ChatStatusChangedEvent {
@@ -1162,9 +1256,14 @@ fn apply_inbound_status_updates(
     state: &Arc<AppState>,
     session: &mut ChatSessionRuntime,
     messages: Vec<Value>,
-) -> (Vec<StatusTransition>, Vec<Value>) {
+) -> (
+    Vec<StatusTransition>,
+    Vec<Value>,
+    Vec<AutoCheckpointRequest>,
+) {
     let mut transitions = Vec::new();
     let mut history_updates = Vec::new();
+    let mut auto_checkpoints = Vec::new();
 
     for message in messages {
         let method = message
@@ -1197,6 +1296,13 @@ fn apply_inbound_status_updates(
                     }
                 }
             }
+            session.checkpoint_seq += 1;
+            auto_checkpoints.push(AutoCheckpointRequest {
+                thread_id: session.thread_id.clone(),
+                session_id: session.summary.session_id.clone(),
+                message: format!("Auto-checkpoint before prompt {}", session.checkpoint_seq),
+                prompt_preview: prompt_preview_from_message(&message),
+            });
             session.active_tools.clear();
             session.summary.worker_count = 0;
             apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
@@ -1209,7 +1315,50 @@ fn apply_inbound_status_updates(
         }
     }
 
-    (transitions, history_updates)
+    (transitions, history_updates, auto_checkpoints)
+}
+
+fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
+    tokio::spawn(async move {
+        if let Err(error) = CheckpointService::save(
+            state,
+            protocol::CheckpointSaveParams {
+                thread_id: request.thread_id,
+                session_id: Some(request.session_id),
+                message: Some(request.message),
+                prompt_preview: request.prompt_preview,
+            },
+        )
+        .await
+        {
+            warn!(error = %error, "failed to save auto-checkpoint");
+        }
+    });
+}
+
+fn prompt_preview_from_message(message: &Value) -> Option<String> {
+    let prompt = message
+        .get("params")
+        .and_then(|params| params.get("prompt"))
+        .and_then(Value::as_array)?;
+    let preview = prompt
+        .iter()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if preview.is_empty() {
+        return None;
+    }
+
+    let mut preview = preview;
+    if preview.len() > 160 {
+        preview.truncate(preview.floor_char_boundary(160));
+        preview.push('…');
+    }
+    Some(preview)
 }
 
 /// Returns (status_transitions, injection_just_completed).
@@ -1394,7 +1543,6 @@ fn collect_session_update_params(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-
 /// Rewrite sessionId in a JSON payload. Spindle session IDs are the external
 /// contract; ACP session IDs are internal to the agent. Spindle translates
 /// at the relay boundary so clients never see ACP IDs.
@@ -1418,7 +1566,8 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
 
         let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
         let updates = collect_session_update_params(&messages);
-        let (transitions, injection_completed) = apply_outbound_status_updates(&state, session, messages);
+        let (transitions, injection_completed) =
+            apply_outbound_status_updates(&state, session, messages);
         let thread_id = session.thread_id.clone();
         let history_path = session.history_path.clone();
         let attached_channels = session
@@ -1437,17 +1586,30 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             })
             .collect::<Vec<_>>();
 
-        (targets, history_path, updates, transitions, injection_completed, thread_id)
+        (
+            targets,
+            history_path,
+            updates,
+            transitions,
+            injection_completed,
+            thread_id,
+        )
     };
 
     emit_status_transitions(&state, transitions).await;
 
     if injection_completed {
-        tracing::info!(session_id, "injection turn completed — emitting chat.injection_complete");
-        state.emit_event("chat.injection_complete", json!({
-            "thread_id": thread_id,
-            "session_id": session_id,
-        }));
+        tracing::info!(
+            session_id,
+            "injection turn completed — emitting chat.injection_complete"
+        );
+        state.emit_event(
+            "chat.injection_complete",
+            json!({
+                "thread_id": thread_id,
+                "session_id": session_id,
+            }),
+        );
     }
 
     // Emit worker_update to parent session if this is a child worker
@@ -1470,13 +1632,22 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         if let Some(session) = chat.sessions.get(session_id) {
             if let Some(ref acp_id) = session.acp_session_id {
                 rewrite_session_id(payload, acp_id, session_id)
-            } else { None }
-        } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     };
     let out_payload = rewritten_payload.as_deref().unwrap_or(payload);
 
     if let Ok(s) = std::str::from_utf8(out_payload) {
-        warn!(session_id, "chat_outbound_frame payload_len={} snippet={:?}", out_payload.len(), &s[..s.floor_char_boundary(s.len().min(200))]);
+        warn!(
+            session_id,
+            "chat_outbound_frame payload_len={} snippet={:?}",
+            out_payload.len(),
+            &s[..s.floor_char_boundary(s.len().min(200))]
+        );
     }
 
     let mut dead_channels = Vec::new();
@@ -1504,16 +1675,21 @@ async fn emit_worker_update_to_parent(state: &Arc<AppState>, worker_session_id: 
             return;
         };
 
-        let duration_ms = worker
-            .started_at
-            .map(|started| Utc::now().signed_duration_since(started).num_milliseconds().max(0) as u64);
-
-        let latest_tool = worker.latest_tool_name.as_ref().map(|name| {
-            protocol::WorkerToolSummary {
-                name: name.clone(),
-                title: worker.latest_tool_title.clone(),
-            }
+        let duration_ms = worker.started_at.map(|started| {
+            Utc::now()
+                .signed_duration_since(started)
+                .num_milliseconds()
+                .max(0) as u64
         });
+
+        let latest_tool =
+            worker
+                .latest_tool_name
+                .as_ref()
+                .map(|name| protocol::WorkerToolSummary {
+                    name: name.clone(),
+                    title: worker.latest_tool_title.clone(),
+                });
 
         protocol::ChatWorkerUpdateEvent {
             parent_session_id: parent_id.clone(),
@@ -1788,7 +1964,7 @@ fn chat_status_name(status: &protocol::ChatSessionStatus) -> &'static str {
     }
 }
 
-fn history_path_for_session(history_root: &Path, thread_id: &str, session_id: &str) -> PathBuf {
+pub(crate) fn history_path_for_session(history_root: &Path, thread_id: &str, session_id: &str) -> PathBuf {
     history_root
         .join(thread_id)
         .join(format!("{session_id}.jsonl"))
@@ -1796,42 +1972,6 @@ fn history_path_for_session(history_root: &Path, thread_id: &str, session_id: &s
 
 fn is_safe_history_component(value: &str) -> bool {
     !value.is_empty() && !value.contains('/') && !value.contains('\\') && !value.contains("..")
-}
-
-/// Overwrite (truncate + write) the JSONL history file with the given updates.
-/// Used after session/load to replace stale history with the agent's canonical
-/// replay. Subsequent output from fanout_output appends normally.
-fn overwrite_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
-    if updates.is_empty() {
-        return Ok(());
-    }
-
-    let parent = history_path
-        .parent()
-        .ok_or_else(|| format!("invalid chat history path: {}", history_path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(history_path)
-        .map_err(|err| format!("failed to open {}: {err}", history_path.display()))?;
-
-    for update in updates {
-        serde_json::to_writer(&mut file, update)
-            .map_err(|err| format!("failed to encode history update: {err}"))?;
-        file.write_all(b"\n").map_err(|err| {
-            format!(
-                "failed to write newline to {}: {err}",
-                history_path.display()
-            )
-        })?;
-    }
-
-    file.sync_data()
-        .map_err(|err| format!("failed to fsync {}: {err}", history_path.display()))
 }
 
 fn append_updates_to_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
@@ -2018,6 +2158,7 @@ fn discover_history_sessions(
                 latest_tool_title: None,
                 started_at: None,
                 pending_prompt_ids: HashSet::new(),
+                checkpoint_seq: 0,
                 last_update_time: None,
                 stall_generation: 0,
                 stall_task: None,
@@ -2049,7 +2190,6 @@ fn remove_thread_history_dir(history_root: &Path, thread_id: &str) -> Result<(),
     fs::remove_dir_all(&thread_dir)
         .map_err(|err| format!("failed to remove {}: {err}", thread_dir.display()))
 }
-
 
 fn build_injection_prompt(
     platform_prompt: Option<&str>,
@@ -2084,7 +2224,11 @@ fn build_injection_prompt(
         }
     }
 
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 async fn build_agent_env_vars(
@@ -2105,14 +2249,13 @@ async fn build_agent_env_vars(
         (thread, project)
     };
 
-    let port_base = match crate::services::thread::load_threadmill_config(
-        &thread.worktree_path,
-        &project.path,
-    ) {
-        Ok(config) => state_store::port_base_with_offset(config.ports.base, thread.port_offset)
-            .unwrap_or(3000),
-        Err(_) => 3000,
-    };
+    let port_base =
+        match crate::services::thread::load_threadmill_config(&thread.worktree_path, &project.path)
+        {
+            Ok(config) => state_store::port_base_with_offset(config.ports.base, thread.port_offset)
+                .unwrap_or(3000),
+            Err(_) => 3000,
+        };
 
     let mut env = state_store::thread_env(&project, &thread, port_base);
     env.push(("THREADMILL_SESSION_ID".to_string(), session_id.to_string()));
@@ -2123,7 +2266,7 @@ async fn resolve_agent_launch(
     state: &Arc<AppState>,
     thread_id: &str,
     agent_name: &str,
-) -> Result<(String, String, String), String> {
+) -> Result<(String, String, String, Option<String>), String> {
     let (project_path, worktree_path) = {
         let store = state.store.lock().await;
         let thread = store
@@ -2137,14 +2280,14 @@ async fn resolve_agent_launch(
         (project.path, thread.worktree_path)
     };
 
-    let command = agent_registry::agent_command(agent_name)
-        .or_else(|| project_agent_command(&project_path, agent_name))
+    let command = project_agent_command(&project_path, agent_name)
+        .or_else(|| agent_registry::agent_command(agent_name))
         .ok_or_else(|| format!("agent not found: {agent_name}"))?;
 
-    Ok((project_path, command, worktree_path))
+    let preferred_model = load_project_default_chat_model(&project_path)?;
+
+    Ok((project_path, command, worktree_path, preferred_model))
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -2211,6 +2354,7 @@ mod tests {
             latest_tool_title: None,
             started_at: Some(Utc::now()),
             pending_prompt_ids: HashSet::new(),
+            checkpoint_seq: 0,
             modes: None,
             models: None,
             config_options: None,
@@ -2226,7 +2370,7 @@ mod tests {
         let state = make_test_state();
         let mut session = make_test_session();
 
-        let (transitions, _prompt_updates) = apply_inbound_status_updates(
+        let (transitions, _prompt_updates, auto_checkpoints) = apply_inbound_status_updates(
             &state,
             &mut session,
             vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
@@ -2234,7 +2378,14 @@ mod tests {
 
         assert_eq!(session.summary.agent_status, protocol::AgentStatus::Busy);
         assert!(session.pending_prompt_ids.contains("42"));
+        assert_eq!(session.checkpoint_seq, 1);
         assert_eq!(session.summary.worker_count, 0);
+        assert_eq!(auto_checkpoints.len(), 1);
+        assert_eq!(
+            auto_checkpoints[0].message,
+            "Auto-checkpoint before prompt 1"
+        );
+        assert_eq!(auto_checkpoints[0].prompt_preview, None);
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].old_status, protocol::AgentStatus::Idle);
         assert_eq!(transitions[0].new_status, protocol::AgentStatus::Busy);

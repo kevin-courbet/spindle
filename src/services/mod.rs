@@ -1,11 +1,14 @@
 pub mod agent_registry;
 pub mod chat;
+pub mod checkpoint;
 pub mod file;
+pub mod git;
 pub mod opencode;
 pub mod preset;
 pub mod project;
 pub mod terminal;
 pub mod thread;
+pub mod todo;
 
 pub fn sanitize_name(value: &str) -> String {
     let mut out = String::with_capacity(value.len());

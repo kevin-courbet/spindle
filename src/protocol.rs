@@ -40,6 +40,12 @@ pub struct PresetConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectAgentConfig {
+    pub name: String,
+    pub command: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -47,6 +53,10 @@ pub struct Project {
     pub default_branch: String,
     #[serde(default)]
     pub presets: Vec<PresetConfig>,
+    #[serde(default)]
+    pub agents: Vec<ProjectAgentConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_chat_model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -492,6 +502,32 @@ pub struct FileGitStatusParams {
     pub path: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum FileDiffScope {
+    #[serde(rename = "working")]
+    Working,
+    #[serde(rename = "staged")]
+    Staged,
+    #[serde(rename = "head")]
+    Head,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileDiffSummaryParams {
+    pub thread_id: String,
+    pub scope: FileDiffScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileDiffParams {
+    pub thread_id: String,
+    pub scope: FileDiffScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadCreateParams {
     pub project_id: String,
@@ -650,6 +686,300 @@ pub struct FileGitStatusResult {
     pub entries: HashMap<String, String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileDiffSummaryEntry {
+    pub path: String,
+    pub status: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileDiffSummaryResult {
+    pub files: Vec<FileDiffSummaryEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileDiffStats {
+    pub added: u32,
+    pub removed: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileDiffResult {
+    pub path: String,
+    pub status: String,
+    pub diff_text: String,
+    pub stats: FileDiffStats,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointSummary {
+    pub seq: u64,
+    pub git_ref: String,
+    pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub head_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointSaveParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_preview: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointSaveResult {
+    pub skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointSummary>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointRestoreParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointRestoreResult {
+    pub restored: bool,
+    pub checkpoint: CheckpointSummary,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointListParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+pub type CheckpointListResult = Vec<CheckpointSummary>;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointDiffParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointDiffResult {
+    pub base_ref: String,
+    pub target_ref: String,
+    pub diff_text: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum TodoPriority {
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub enum TodoFilter {
+    #[default]
+    #[serde(rename = "all")]
+    All,
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "completed")]
+    Completed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoItem {
+    pub id: String,
+    pub thread_id: String,
+    pub content: String,
+    pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<TodoPriority>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoListParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub filter: TodoFilter,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoAddParams {
+    pub thread_id: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<TodoPriority>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoUpdateParams {
+    pub thread_id: String,
+    pub todo_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<TodoPriority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoToggleParams {
+    pub thread_id: String,
+    pub todo_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoRemoveParams {
+    pub thread_id: String,
+    pub todo_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoReorderParams {
+    pub thread_id: String,
+    pub todo_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoRemoveResult {
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoReorderResult {
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoAddedEvent {
+    pub thread_id: String,
+    pub todo: TodoItem,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoUpdatedEvent {
+    pub thread_id: String,
+    pub todo: TodoItem,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoRemovedEvent {
+    pub thread_id: String,
+    pub todo_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoReorderedEvent {
+    pub thread_id: String,
+    pub todo_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitStatusSummaryFile {
+    pub path: String,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitStatusSummaryParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitStatusSummaryResult {
+    pub branch: String,
+    pub ahead_count: u32,
+    pub behind_count: u32,
+    pub files: Vec<GitStatusSummaryFile>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitCommitParams {
+    pub thread_id: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub amend: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitCommitResult {
+    pub commit_hash: String,
+    pub summary: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitPushParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default = "default_true")]
+    pub set_upstream: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitPushResult {
+    pub success: bool,
+    pub remote: String,
+    pub branch: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitCreatePrParams {
+    pub thread_id: String,
+    pub title: String,
+    pub body: String,
+    #[serde(default = "default_true")]
+    pub draft: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GitCreatePrResult {
+    pub pr_url: String,
+    pub pr_number: u64,
+}
+
+pub type TodoListResult = Vec<TodoItem>;
+pub type TodoAddResult = TodoItem;
+pub type TodoUpdateResult = TodoItem;
+
 pub type PingResult = String;
 pub type StateSnapshotResult = StateSnapshot;
 
@@ -793,6 +1123,22 @@ pub const METHOD_PROJECT_LOOKUP: &str = "project.lookup";
 pub const METHOD_FILE_LIST: &str = "file.list";
 pub const METHOD_FILE_READ: &str = "file.read";
 pub const FILE_GIT_STATUS: &str = "file.git_status";
+pub const METHOD_FILE_DIFF_SUMMARY: &str = "file.diff_summary";
+pub const METHOD_FILE_DIFF: &str = "file.diff";
+pub const METHOD_CHECKPOINT_SAVE: &str = "checkpoint.save";
+pub const METHOD_CHECKPOINT_RESTORE: &str = "checkpoint.restore";
+pub const METHOD_CHECKPOINT_LIST: &str = "checkpoint.list";
+pub const METHOD_CHECKPOINT_DIFF: &str = "checkpoint.diff";
+pub const METHOD_GIT_STATUS_SUMMARY: &str = "git.status_summary";
+pub const METHOD_GIT_COMMIT: &str = "git.commit";
+pub const METHOD_GIT_PUSH: &str = "git.push";
+pub const METHOD_GIT_CREATE_PR: &str = "git.create_pr";
+pub const METHOD_TODO_LIST: &str = "todo.list";
+pub const METHOD_TODO_ADD: &str = "todo.add";
+pub const METHOD_TODO_UPDATE: &str = "todo.update";
+pub const METHOD_TODO_TOGGLE: &str = "todo.toggle";
+pub const METHOD_TODO_REMOVE: &str = "todo.remove";
+pub const METHOD_TODO_REORDER: &str = "todo.reorder";
 pub const METHOD_THREAD_CREATE: &str = "thread.create";
 pub const METHOD_THREAD_CLOSE: &str = "thread.close";
 pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
@@ -881,6 +1227,38 @@ pub enum RequestDispatch {
     FileRead(FileReadParams),
     #[serde(rename = "file.git_status")]
     FileGitStatus(FileGitStatusParams),
+    #[serde(rename = "file.diff_summary")]
+    FileDiffSummary(FileDiffSummaryParams),
+    #[serde(rename = "file.diff")]
+    FileDiff(FileDiffParams),
+    #[serde(rename = "checkpoint.save")]
+    CheckpointSave(CheckpointSaveParams),
+    #[serde(rename = "checkpoint.restore")]
+    CheckpointRestore(CheckpointRestoreParams),
+    #[serde(rename = "checkpoint.list")]
+    CheckpointList(CheckpointListParams),
+    #[serde(rename = "checkpoint.diff")]
+    CheckpointDiff(CheckpointDiffParams),
+    #[serde(rename = "git.status_summary")]
+    GitStatusSummary(GitStatusSummaryParams),
+    #[serde(rename = "git.commit")]
+    GitCommit(GitCommitParams),
+    #[serde(rename = "git.push")]
+    GitPush(GitPushParams),
+    #[serde(rename = "git.create_pr")]
+    GitCreatePr(GitCreatePrParams),
+    #[serde(rename = "todo.list")]
+    TodoList(TodoListParams),
+    #[serde(rename = "todo.add")]
+    TodoAdd(TodoAddParams),
+    #[serde(rename = "todo.update")]
+    TodoUpdate(TodoUpdateParams),
+    #[serde(rename = "todo.toggle")]
+    TodoToggle(TodoToggleParams),
+    #[serde(rename = "todo.remove")]
+    TodoRemove(TodoRemoveParams),
+    #[serde(rename = "todo.reorder")]
+    TodoReorder(TodoReorderParams),
     #[serde(rename = "thread.create")]
     ThreadCreate(ThreadCreateParams),
     #[serde(rename = "thread.close")]
@@ -979,6 +1357,54 @@ pub fn parse_request_dispatch(
         FILE_GIT_STATUS => serde_json::from_value::<FileGitStatusParams>(params)
             .map(RequestDispatch::FileGitStatus)
             .map_err(|err| format!("invalid file.git_status params: {err}")),
+        METHOD_FILE_DIFF_SUMMARY => serde_json::from_value::<FileDiffSummaryParams>(params)
+            .map(RequestDispatch::FileDiffSummary)
+            .map_err(|err| format!("invalid file.diff_summary params: {err}")),
+        METHOD_FILE_DIFF => serde_json::from_value::<FileDiffParams>(params)
+            .map(RequestDispatch::FileDiff)
+            .map_err(|err| format!("invalid file.diff params: {err}")),
+        METHOD_CHECKPOINT_SAVE => serde_json::from_value::<CheckpointSaveParams>(params)
+            .map(RequestDispatch::CheckpointSave)
+            .map_err(|err| format!("invalid checkpoint.save params: {err}")),
+        METHOD_CHECKPOINT_RESTORE => serde_json::from_value::<CheckpointRestoreParams>(params)
+            .map(RequestDispatch::CheckpointRestore)
+            .map_err(|err| format!("invalid checkpoint.restore params: {err}")),
+        METHOD_CHECKPOINT_LIST => serde_json::from_value::<CheckpointListParams>(params)
+            .map(RequestDispatch::CheckpointList)
+            .map_err(|err| format!("invalid checkpoint.list params: {err}")),
+        METHOD_CHECKPOINT_DIFF => serde_json::from_value::<CheckpointDiffParams>(params)
+            .map(RequestDispatch::CheckpointDiff)
+            .map_err(|err| format!("invalid checkpoint.diff params: {err}")),
+        METHOD_GIT_STATUS_SUMMARY => serde_json::from_value::<GitStatusSummaryParams>(params)
+            .map(RequestDispatch::GitStatusSummary)
+            .map_err(|err| format!("invalid git.status_summary params: {err}")),
+        METHOD_GIT_COMMIT => serde_json::from_value::<GitCommitParams>(params)
+            .map(RequestDispatch::GitCommit)
+            .map_err(|err| format!("invalid git.commit params: {err}")),
+        METHOD_GIT_PUSH => serde_json::from_value::<GitPushParams>(params)
+            .map(RequestDispatch::GitPush)
+            .map_err(|err| format!("invalid git.push params: {err}")),
+        METHOD_GIT_CREATE_PR => serde_json::from_value::<GitCreatePrParams>(params)
+            .map(RequestDispatch::GitCreatePr)
+            .map_err(|err| format!("invalid git.create_pr params: {err}")),
+        METHOD_TODO_LIST => serde_json::from_value::<TodoListParams>(params)
+            .map(RequestDispatch::TodoList)
+            .map_err(|err| format!("invalid todo.list params: {err}")),
+        METHOD_TODO_ADD => serde_json::from_value::<TodoAddParams>(params)
+            .map(RequestDispatch::TodoAdd)
+            .map_err(|err| format!("invalid todo.add params: {err}")),
+        METHOD_TODO_UPDATE => serde_json::from_value::<TodoUpdateParams>(params)
+            .map(RequestDispatch::TodoUpdate)
+            .map_err(|err| format!("invalid todo.update params: {err}")),
+        METHOD_TODO_TOGGLE => serde_json::from_value::<TodoToggleParams>(params)
+            .map(RequestDispatch::TodoToggle)
+            .map_err(|err| format!("invalid todo.toggle params: {err}")),
+        METHOD_TODO_REMOVE => serde_json::from_value::<TodoRemoveParams>(params)
+            .map(RequestDispatch::TodoRemove)
+            .map_err(|err| format!("invalid todo.remove params: {err}")),
+        METHOD_TODO_REORDER => serde_json::from_value::<TodoReorderParams>(params)
+            .map(RequestDispatch::TodoReorder)
+            .map_err(|err| format!("invalid todo.reorder params: {err}")),
         METHOD_THREAD_CREATE => serde_json::from_value::<ThreadCreateParams>(params)
             .map(RequestDispatch::ThreadCreate)
             .map_err(|err| format!("invalid thread.create params: {err}")),

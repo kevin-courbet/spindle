@@ -300,7 +300,7 @@ async fn file_git_status_returns_modified_entries_for_worktree_files() {
         .rpc(
             "thread.create",
             json!({
-                "project_id": project_id,
+                "project_id": project_id.clone(),
                 "name": common::unique_name("git-status"),
                 "source_type": "new_feature"
             }),
@@ -485,5 +485,287 @@ async fn file_git_status_reports_renamed_and_modified_entries() {
     assert_eq!(
         status["entries"]["README-renamed.md"], "renamed",
         "expected renamed status for renamed and modified tracked file"
+    );
+}
+
+async fn create_ready_thread(
+    harness: &mut common::TestHarness,
+    name: &str,
+) -> (String, String, String) {
+    let project = common::create_git_project(None, false)
+        .await
+        .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+    let project_id = added["id"].as_str().expect("project id").to_string();
+
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id.clone(),
+                "name": common::unique_name(name),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create thread");
+
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = created["worktree_path"]
+        .as_str()
+        .expect("thread worktree path")
+        .to_string();
+
+    loop {
+        let event = harness
+            .wait_for_event("thread.progress", std::time::Duration::from_secs(45))
+            .await
+            .expect("thread progress event");
+        if event["params"]["thread_id"] == thread_id && event["params"]["step"] == "ready" {
+            break;
+        }
+    }
+
+    (project_id, thread_id, worktree_path)
+}
+
+fn run_git(repo_path: &str, args: &[&str]) -> std::process::Output {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .expect("run git command");
+    assert!(
+        output.status.success(),
+        "git {:?} should succeed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[tokio::test]
+async fn file_diff_returns_working_scope_unified_diff_for_all_files_or_one_path() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping file_diff_returns_working_scope_unified_diff_for_all_files_or_one_path: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project_id, thread_id, worktree_path) =
+        create_ready_thread(&mut harness, "file-diff-working").await;
+    let worktree = std::path::Path::new(&worktree_path);
+
+    fs::write(
+        worktree.join("README.md"),
+        "spindle integration test\nchanged\n",
+    )
+    .expect("modify tracked file");
+    fs::write(worktree.join("notes.txt"), "alpha\nbeta\n").expect("write untracked file");
+
+    let diff = harness
+        .rpc(
+            "file.diff",
+            json!({
+                "thread_id": thread_id.clone(),
+                "scope": "working"
+            }),
+        )
+        .await
+        .expect("fetch working diff");
+
+    let diff_text = diff["diff_text"].as_str().expect("diff string");
+    assert!(diff_text.contains("diff --git a/README.md b/README.md"));
+    assert!(diff_text.contains("diff --git a/notes.txt b/notes.txt"));
+    assert!(diff_text.contains("+changed"));
+    assert!(diff_text.contains("+alpha"));
+
+    let filtered = harness
+        .rpc(
+            "file.diff",
+            json!({
+                "thread_id": thread_id,
+                "path": "notes.txt",
+                "scope": "working"
+            }),
+        )
+        .await
+        .expect("fetch filtered diff");
+
+    let filtered_text = filtered["diff_text"]
+        .as_str()
+        .expect("filtered diff string");
+    assert!(filtered_text.contains("diff --git a/notes.txt b/notes.txt"));
+    assert!(!filtered_text.contains("README.md"));
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
+}
+
+#[tokio::test]
+async fn file_diff_summary_reports_staged_statuses_and_counts() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping file_diff_summary_reports_staged_statuses_and_counts: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project_id, thread_id, worktree_path) =
+        create_ready_thread(&mut harness, "file-diff-summary").await;
+    let worktree = std::path::Path::new(&worktree_path);
+
+    fs::write(worktree.join("obsolete.txt"), "remove me\n").expect("write obsolete file");
+    fs::write(worktree.join("changed.txt"), "before\n").expect("write changed file");
+    run_git(&worktree_path, &["add", "obsolete.txt", "changed.txt"]);
+    run_git(&worktree_path, &["commit", "-m", "baseline"]);
+
+    run_git(&worktree_path, &["mv", "README.md", "README-renamed.md"]);
+    fs::write(
+        worktree.join("README-renamed.md"),
+        "spindle integration test\nrenamed and modified\n",
+    )
+    .expect("modify renamed file");
+    fs::write(worktree.join("changed.txt"), "before\nafter\n").expect("modify tracked file");
+    fs::write(worktree.join("notes.txt"), "alpha\nbeta\n").expect("write staged file");
+    fs::remove_file(worktree.join("obsolete.txt")).expect("delete tracked file");
+    run_git(&worktree_path, &["add", "-A"]);
+
+    let summary = harness
+        .rpc(
+            "file.diff_summary",
+            json!({
+                "thread_id": thread_id,
+                "scope": "staged"
+            }),
+        )
+        .await
+        .expect("fetch diff summary");
+
+    let files = summary["files"].as_array().expect("summary array");
+    let renamed = files
+        .iter()
+        .find(|entry| entry["path"] == "README-renamed.md")
+        .expect("renamed entry present");
+    assert_eq!(renamed["status"], "renamed");
+    assert_eq!(renamed["added"], 1);
+    assert_eq!(renamed["removed"], 0);
+
+    let modified = files
+        .iter()
+        .find(|entry| entry["path"] == "changed.txt")
+        .expect("modified entry present");
+    assert_eq!(modified["status"], "modified");
+    assert_eq!(modified["added"], 1);
+    assert_eq!(modified["removed"], 0);
+
+    let added = files
+        .iter()
+        .find(|entry| entry["path"] == "notes.txt")
+        .expect("added entry present");
+    assert_eq!(added["status"], "added");
+    assert_eq!(added["added"], 2);
+    assert_eq!(added["removed"], 0);
+
+    let deleted = files
+        .iter()
+        .find(|entry| entry["path"] == "obsolete.txt")
+        .expect("deleted entry present");
+    assert_eq!(deleted["status"], "deleted");
+    assert_eq!(deleted["added"], 0);
+    assert_eq!(deleted["removed"], 1);
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
+}
+
+#[tokio::test]
+async fn file_diff_and_summary_report_head_scope_changes_against_upstream() {
+    if !common::tmux_available().await {
+        eprintln!("skipping file_diff_and_summary_report_head_scope_changes_against_upstream: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project_id, thread_id, worktree_path) =
+        create_ready_thread(&mut harness, "file-diff-head").await;
+    let worktree = std::path::Path::new(&worktree_path);
+
+    fs::write(
+        worktree.join("README.md"),
+        "spindle integration test\nhead change\n",
+    )
+    .expect("modify tracked file");
+    run_git(&worktree_path, &["add", "README.md"]);
+    run_git(&worktree_path, &["commit", "-m", "head change"]);
+
+    let diff = harness
+        .rpc(
+            "file.diff",
+            json!({
+                "thread_id": thread_id.clone(),
+                "scope": "head"
+            }),
+        )
+        .await
+        .expect("fetch head diff");
+    let diff_text = diff["diff_text"].as_str().expect("head diff string");
+    assert!(diff_text.contains("diff --git a/README.md b/README.md"));
+    assert!(diff_text.contains("+head change"));
+
+    let summary = harness
+        .rpc(
+            "file.diff_summary",
+            json!({
+                "thread_id": thread_id,
+                "scope": "head"
+            }),
+        )
+        .await
+        .expect("fetch head summary");
+    let files = summary["files"].as_array().expect("head summary array");
+    let readme = files
+        .iter()
+        .find(|entry| entry["path"] == "README.md")
+        .expect("head summary entry present");
+    assert_eq!(readme["status"], "modified");
+    assert_eq!(readme["added"], 1);
+    assert_eq!(readme["removed"], 0);
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
+}
+
+#[tokio::test]
+async fn file_diff_rejects_invalid_scope() {
+    let mut harness = setup_test_server().await;
+
+    let error = harness
+        .rpc_expect_error(
+            "file.diff",
+            json!({
+                "thread_id": "thread-1",
+                "scope": "bogus"
+            }),
+        )
+        .await;
+    assert!(
+        error.contains("working") && error.contains("staged") && error.contains("head"),
+        "expected invalid scope error, got: {error}"
     );
 }

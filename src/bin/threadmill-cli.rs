@@ -1,6 +1,6 @@
 use std::{env, fs, process::ExitCode};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -35,6 +35,10 @@ enum Command {
     Chat {
         #[command(subcommand)]
         command: ChatCommand,
+    },
+    Todo {
+        #[command(subcommand)]
+        command: TodoCommand,
     },
     Status {
         #[arg(long)]
@@ -124,6 +128,72 @@ enum ChatCommand {
         #[arg(long)]
         pretty: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TodoCommand {
+    List {
+        #[arg(long, value_enum, default_value_t = TodoFilterArg::Active)]
+        filter: TodoFilterArg,
+    },
+    Add {
+        content: String,
+        #[arg(long, value_enum)]
+        priority: Option<TodoPriorityArg>,
+    },
+    Update {
+        id: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long, value_enum)]
+        priority: Option<TodoPriorityArg>,
+    },
+    Done {
+        id: String,
+    },
+    Reopen {
+        id: String,
+    },
+    Remove {
+        id: String,
+    },
+    Reorder {
+        ids: Vec<String>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum TodoFilterArg {
+    All,
+    Active,
+    Completed,
+}
+
+impl TodoFilterArg {
+    fn as_rpc_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum TodoPriorityArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl TodoPriorityArg {
+    fn as_rpc_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -261,6 +331,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             }
         },
         Command::Chat { command } => handle_chat(command, &ws_url, auth_token.as_deref()).await,
+        Command::Todo { command } => handle_todo(command, &ws_url, auth_token.as_deref()).await,
         Command::Status { pretty } => {
             let ping = rpc_request(&ws_url, auth_token.as_deref(), "ping", json!({})).await?;
             let output = json!({
@@ -332,7 +403,9 @@ fn resolve_agent_def_path(name: &str) -> Result<std::path::PathBuf, CliError> {
 
     // Try global: ~/.config/threadmill/agents/<name>.md
     if let Some(config_dir) = dirs::config_dir() {
-        let global_path = config_dir.join("threadmill/agents").join(format!("{name}.md"));
+        let global_path = config_dir
+            .join("threadmill/agents")
+            .join(format!("{name}.md"));
         if global_path.exists() {
             return Ok(global_path);
         }
@@ -376,9 +449,7 @@ async fn handle_chat(
                     .transpose()?;
                 (agent_name, sys, display_name)
             } else {
-                return Err(CliError::error(
-                    "either --agent or --agent-def is required",
-                ));
+                return Err(CliError::error("either --agent or --agent-def is required"));
             };
 
             let mut params = json!({
@@ -401,7 +472,10 @@ async fn handle_chat(
             let result = rpc_request(ws_url, auth_token, "chat.start", params).await?;
             print_json(&result, pretty)
         }
-        ChatCommand::Wait { session, timeout: timeout_secs } => {
+        ChatCommand::Wait {
+            session,
+            timeout: timeout_secs,
+        } => {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
             // Event-streaming wait: connect, send session.hello, then listen for events
@@ -420,7 +494,8 @@ async fn handle_chat(
                     "capabilities": PROTOCOL_CAPABILITIES,
                 },
             });
-            socket.send(Message::Text(hello.to_string()))
+            socket
+                .send(Message::Text(hello.to_string()))
                 .await
                 .map_err(|err| CliError::connection(format!("failed to send hello: {err}")))?;
             let _ = read_response_by_id(&mut socket, HELLO_REQUEST_ID, "session.hello").await?;
@@ -448,10 +523,8 @@ async fn handle_chat(
                     last_heartbeat = std::time::Instant::now();
                 }
 
-                let frame = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    socket.next(),
-                ).await;
+                let frame =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await;
 
                 match frame {
                     Ok(Some(Ok(Message::Text(text)))) => {
@@ -470,14 +543,22 @@ async fn handle_chat(
 
                         match method {
                             "chat.status_changed" => {
-                                let sid = params.get("session_id").and_then(Value::as_str).unwrap_or("");
+                                let sid = params
+                                    .get("session_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
                                 if sid != session {
                                     continue;
                                 }
-                                let new_status = params.get("new_status").and_then(Value::as_str).unwrap_or("");
+                                let new_status = params
+                                    .get("new_status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
                                 eprintln!("worker status: {new_status}");
                                 match new_status {
-                                    "busy" => { was_busy = true; }
+                                    "busy" => {
+                                        was_busy = true;
+                                    }
                                     "idle" if was_busy => {
                                         eprintln!("worker finished (idle after busy)");
                                         return Ok(());
@@ -486,11 +567,16 @@ async fn handle_chat(
                                 }
                             }
                             "chat.worker_update" => {
-                                let sid = params.get("worker_session_id").and_then(Value::as_str).unwrap_or("");
+                                let sid = params
+                                    .get("worker_session_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
                                 if sid == session {
                                     if let Some(tool) = params.get("latest_tool") {
-                                        let name = tool.get("name").and_then(Value::as_str).unwrap_or("?");
-                                        let title = tool.get("title").and_then(Value::as_str).unwrap_or("");
+                                        let name =
+                                            tool.get("name").and_then(Value::as_str).unwrap_or("?");
+                                        let title =
+                                            tool.get("title").and_then(Value::as_str).unwrap_or("");
                                         if title.is_empty() {
                                             eprintln!("worker: {name}");
                                         } else {
@@ -500,22 +586,34 @@ async fn handle_chat(
                                 }
                             }
                             "chat.session_ended" | "chat.session_failed" => {
-                                let sid = params.get("session_id").and_then(Value::as_str).unwrap_or("");
+                                let sid = params
+                                    .get("session_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
                                 if sid == session {
-                                    let reason = params.get("reason")
+                                    let reason = params
+                                        .get("reason")
                                         .or_else(|| params.get("error"))
                                         .and_then(Value::as_str)
                                         .unwrap_or("unknown");
                                     eprintln!("session ended: {reason}");
-                                    return Err(CliError::error(format!("session ended: {reason}")));
+                                    return Err(CliError::error(format!(
+                                        "session ended: {reason}"
+                                    )));
                                 }
                             }
                             "state.delta" => {
-                                if let Some(ops) = params.get("operations").and_then(Value::as_array) {
+                                if let Some(ops) =
+                                    params.get("operations").and_then(Value::as_array)
+                                {
                                     for op in ops {
-                                        let op_type = op.get("type").and_then(Value::as_str).unwrap_or("");
+                                        let op_type =
+                                            op.get("type").and_then(Value::as_str).unwrap_or("");
                                         if op_type == "chat.session_removed" {
-                                            let sid = op.get("session_id").and_then(Value::as_str).unwrap_or("");
+                                            let sid = op
+                                                .get("session_id")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
                                             if sid == session {
                                                 eprintln!("session removed");
                                                 return Err(CliError::error("session removed"));
@@ -548,13 +646,130 @@ async fn handle_chat(
             }
         }
         ChatCommand::Status { session, pretty } => {
-            let result = rpc_request(ws_url, auth_token, "chat.status", json!({ "session_id": session })).await?;
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "chat.status",
+                json!({ "session_id": session }),
+            )
+            .await?;
             print_json(&result, pretty)
         }
         ChatCommand::List { pretty } => {
             let thread_id = resolve_current_thread_id(ws_url, auth_token).await?;
-            let result = rpc_request(ws_url, auth_token, "chat.list", json!({ "thread_id": thread_id })).await?;
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "chat.list",
+                json!({ "thread_id": thread_id }),
+            )
+            .await?;
             print_json(&result, pretty)
+        }
+    }
+}
+
+async fn handle_todo(
+    command: TodoCommand,
+    ws_url: &str,
+    auth_token: Option<&str>,
+) -> Result<(), CliError> {
+    let thread_id = resolve_current_thread_id(ws_url, auth_token).await?;
+
+    match command {
+        TodoCommand::List { filter } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "todo.list",
+                json!({ "thread_id": thread_id, "filter": filter.as_rpc_value() }),
+            )
+            .await?;
+            print_json(&result, false)
+        }
+        TodoCommand::Add { content, priority } => {
+            if content.trim().is_empty() {
+                return Err(CliError::error("todo content must not be empty"));
+            }
+
+            let mut params = json!({ "thread_id": thread_id, "content": content });
+            if let Some(priority) = priority {
+                params["priority"] = json!(priority.as_rpc_value());
+            }
+
+            let result = rpc_request(ws_url, auth_token, "todo.add", params).await?;
+            print_json(&result, false)
+        }
+        TodoCommand::Update {
+            id,
+            content,
+            priority,
+        } => {
+            let mut params = json!({ "thread_id": thread_id, "todo_id": id });
+            let mut changed = false;
+            if let Some(content) = content {
+                if content.trim().is_empty() {
+                    return Err(CliError::error("todo content must not be empty"));
+                }
+                params["content"] = json!(content);
+                changed = true;
+            }
+            if let Some(priority) = priority {
+                params["priority"] = json!(priority.as_rpc_value());
+                changed = true;
+            }
+            if !changed {
+                return Err(CliError::error(
+                    "todo update requires --content and/or --priority",
+                ));
+            }
+
+            let result = rpc_request(ws_url, auth_token, "todo.update", params).await?;
+            print_json(&result, false)
+        }
+        TodoCommand::Done { id } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "todo.update",
+                json!({ "thread_id": thread_id, "todo_id": id, "completed": true }),
+            )
+            .await?;
+            print_json(&result, false)
+        }
+        TodoCommand::Reopen { id } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "todo.update",
+                json!({ "thread_id": thread_id, "todo_id": id, "completed": false }),
+            )
+            .await?;
+            print_json(&result, false)
+        }
+        TodoCommand::Remove { id } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "todo.remove",
+                json!({ "thread_id": thread_id, "todo_id": id }),
+            )
+            .await?;
+            print_json(&result, false)
+        }
+        TodoCommand::Reorder { ids } => {
+            if ids.is_empty() {
+                return Err(CliError::error("todo reorder requires at least one id"));
+            }
+
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "todo.reorder",
+                json!({ "thread_id": thread_id, "todo_ids": ids }),
+            )
+            .await?;
+            print_json(&result, false)
         }
     }
 }
@@ -563,8 +778,11 @@ async fn resolve_current_thread_id(
     ws_url: &str,
     auth_token: Option<&str>,
 ) -> Result<String, CliError> {
-    let current = env::var("THREADMILL_THREAD")
-        .map_err(|_| CliError::error("THREADMILL_THREAD is not set — run from a threadmill tmux session or agent process"))?;
+    let current = env::var("THREADMILL_THREAD").map_err(|_| {
+        CliError::error(
+            "THREADMILL_THREAD is not set — run from a threadmill tmux session or agent process",
+        )
+    })?;
 
     let list = rpc_request(ws_url, auth_token, "thread.list", json!({})).await?;
     let threads = list
@@ -572,18 +790,32 @@ async fn resolve_current_thread_id(
         .ok_or_else(|| CliError::error("thread.list returned non-array"))?;
 
     // Try by ID first
-    if let Some(thread) = threads.iter().find(|t| t.get("id").and_then(Value::as_str) == Some(&current)) {
-        return thread.get("id").and_then(Value::as_str).map(String::from)
+    if let Some(thread) = threads
+        .iter()
+        .find(|t| t.get("id").and_then(Value::as_str) == Some(&current))
+    {
+        return thread
+            .get("id")
+            .and_then(Value::as_str)
+            .map(String::from)
             .ok_or_else(|| CliError::error("thread missing id"));
     }
 
     // Try by name
-    if let Some(thread) = threads.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(&current)) {
-        return thread.get("id").and_then(Value::as_str).map(String::from)
+    if let Some(thread) = threads
+        .iter()
+        .find(|t| t.get("name").and_then(Value::as_str) == Some(&current))
+    {
+        return thread
+            .get("id")
+            .and_then(Value::as_str)
+            .map(String::from)
             .ok_or_else(|| CliError::error("thread missing id"));
     }
 
-    Err(CliError::error(format!("no thread found for THREADMILL_THREAD={current}")))
+    Err(CliError::error(format!(
+        "no thread found for THREADMILL_THREAD={current}"
+    )))
 }
 
 async fn resolve_project_id(

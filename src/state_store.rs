@@ -59,7 +59,30 @@ impl Project {
                 project::default_presets()
             }
         };
-
+        let agents = match project::load_project_agents(&self.path) {
+            Ok(agents) => agents,
+            Err(err) => {
+                warn!(
+                    project_id = %self.id,
+                    project_path = %self.path,
+                    error = %err,
+                    "failed to load project agents; using empty list"
+                );
+                vec![]
+            }
+        };
+        let default_chat_model = match project::load_project_default_chat_model(&self.path) {
+            Ok(default_chat_model) => default_chat_model,
+            Err(err) => {
+                warn!(
+                    project_id = %self.id,
+                    project_path = %self.path,
+                    error = %err,
+                    "failed to load project default chat model; using none"
+                );
+                None
+            }
+        };
 
         Ok(protocol::Project {
             id: self.id.clone(),
@@ -67,6 +90,8 @@ impl Project {
             path: self.path.clone(),
             default_branch: self.default_branch.clone(),
             presets,
+            agents,
+            default_chat_model,
         })
     }
 }

@@ -8,7 +8,10 @@ use uuid::Uuid;
 
 use crate::{
     protocol,
-    services::{chat::ChatService, preset::PresetService, sanitize_name, short_id},
+    services::{
+        chat::ChatService, checkpoint::CheckpointService, preset::PresetService, sanitize_name,
+        short_id, todo::TodoService,
+    },
     state_store::{port_base_with_offset, thread_env, Thread},
     tmux, AppState,
 };
@@ -29,6 +32,8 @@ pub struct ThreadmillConfig {
     pub agents: HashMap<String, AgentDefinition>,
     #[serde(default)]
     pub ports: PortsConfig,
+    #[serde(default)]
+    pub checkpoints: CheckpointConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +59,27 @@ fn default_base_port() -> u16 {
 
 fn default_port_offset() -> u16 {
     20
+}
+
+fn default_checkpoint_max_count() -> usize {
+    50
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckpointConfig {
+    #[serde(default = "default_checkpoint_max_count")]
+    pub max_count: usize,
+    #[serde(default)]
+    pub max_age_days: Option<u64>,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            max_count: default_checkpoint_max_count(),
+            max_age_days: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -251,6 +277,8 @@ impl ThreadService {
 
         ChatService::stop_all_for_thread(Arc::clone(&state), &thread.id, "thread_closed", true)
             .await?;
+        CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
+        TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
 
         if tmux::session_exists(&thread.tmux_session).await? {
             let _ = tmux::kill_session(&thread.tmux_session).await;
@@ -288,17 +316,21 @@ impl ThreadService {
         state: Arc<AppState>,
         params: protocol::ThreadHideParams,
     ) -> Result<protocol::ThreadHideResult, String> {
-        {
-            let mut store = state.store.lock().await;
-            let thread = store
+        let thread = {
+            let store = state.store.lock().await;
+            store
                 .thread_by_id(&params.thread_id)
                 .ok_or_else(|| format!("thread not found: {}", params.thread_id))?
-                .clone();
+                .clone()
+        };
+        if thread.status == protocol::ThreadStatus::Closed {
+            return Err(format!("thread {} is closed", thread.id));
+        }
+        CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
+        TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
 
-            if thread.status == protocol::ThreadStatus::Closed {
-                return Err(format!("thread {} is closed", thread.id));
-            }
-
+        {
+            let mut store = state.store.lock().await;
             Self::set_status_locked(
                 &state,
                 &mut store,
@@ -629,6 +661,9 @@ fn finalize_threadmill_config(config: ThreadmillConfig) -> Result<ThreadmillConf
     if config.ports.offset == 0 {
         return Err("ports.offset must be greater than zero".to_string());
     }
+    if config.checkpoints.max_count == 0 {
+        return Err("checkpoints.max_count must be greater than zero".to_string());
+    }
 
     Ok(config)
 }
@@ -652,14 +687,11 @@ fn default_threadmill_config() -> ThreadmillConfig {
         presets,
         agents: HashMap::new(),
         ports: PortsConfig::default(),
+        checkpoints: CheckpointConfig::default(),
     }
 }
 
 fn with_default_terminal_preset(mut config: ThreadmillConfig) -> ThreadmillConfig {
-    if config.presets.is_empty() {
-        return default_threadmill_config();
-    }
-
     if !config.presets.contains_key("terminal") {
         config.presets.insert(
             "terminal".to_string(),

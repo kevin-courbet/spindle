@@ -8,9 +8,10 @@ use uuid::Uuid;
 use crate::{
     protocol::{self, RequestDispatch},
     services::{
-        chat::ChatService, file::FileService, opencode::OpencodeService,
-        preset::PresetService, project::ProjectService, system::SystemService, terminal,
-        terminal::TerminalConnectionState, thread::ThreadService,
+        chat::ChatService, checkpoint::CheckpointService, file::FileService, git::GitService,
+        opencode::OpencodeService, preset::PresetService, project::ProjectService,
+        system::SystemService, terminal, terminal::TerminalConnectionState, thread::ThreadService,
+        todo::TodoService,
     },
     AppState, ConnectionSessionState, RpcError,
 };
@@ -225,6 +226,102 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("file.git_status", message))?;
             to_value("file.git_status", result)
         }
+        RequestDispatch::FileDiffSummary(params) => {
+            let result = FileService::diff_summary(state, params)
+                .await
+                .map_err(|message| map_service_error("file.diff_summary", message))?;
+            to_value("file.diff_summary", result)
+        }
+        RequestDispatch::FileDiff(params) => {
+            let result = FileService::diff(state, params)
+                .await
+                .map_err(|message| map_service_error("file.diff", message))?;
+            to_value("file.diff", result)
+        }
+        RequestDispatch::CheckpointSave(params) => {
+            let result = CheckpointService::save(state, params)
+                .await
+                .map_err(|message| map_service_error("checkpoint.save", message))?;
+            to_value("checkpoint.save", result)
+        }
+        RequestDispatch::CheckpointRestore(params) => {
+            let result = CheckpointService::restore(state, params)
+                .await
+                .map_err(|message| map_service_error("checkpoint.restore", message))?;
+            to_value("checkpoint.restore", result)
+        }
+        RequestDispatch::CheckpointList(params) => {
+            let result = CheckpointService::list(state, params)
+                .await
+                .map_err(|message| map_service_error("checkpoint.list", message))?;
+            to_value("checkpoint.list", result)
+        }
+        RequestDispatch::CheckpointDiff(params) => {
+            let result = CheckpointService::diff(state, params)
+                .await
+                .map_err(|message| map_service_error("checkpoint.diff", message))?;
+            to_value("checkpoint.diff", result)
+        }
+        RequestDispatch::GitStatusSummary(params) => {
+            let result = GitService::status_summary(state, params)
+                .await
+                .map_err(|message| map_service_error("git.status_summary", message))?;
+            to_value("git.status_summary", result)
+        }
+        RequestDispatch::GitCommit(params) => {
+            let result = GitService::commit(state, params)
+                .await
+                .map_err(|message| map_service_error("git.commit", message))?;
+            to_value("git.commit", result)
+        }
+        RequestDispatch::GitPush(params) => {
+            let result = GitService::push(state, params)
+                .await
+                .map_err(|message| map_service_error("git.push", message))?;
+            to_value("git.push", result)
+        }
+        RequestDispatch::GitCreatePr(params) => {
+            let result = GitService::create_pr(state, params)
+                .await
+                .map_err(|message| map_service_error("git.create_pr", message))?;
+            to_value("git.create_pr", result)
+        }
+        RequestDispatch::TodoList(params) => {
+            let result = TodoService::list(state, params)
+                .await
+                .map_err(|message| map_service_error("todo.list", message))?;
+            to_value("todo.list", result)
+        }
+        RequestDispatch::TodoAdd(params) => {
+            let result = TodoService::add(state, params)
+                .await
+                .map_err(|message| map_service_error("todo.add", message))?;
+            to_value("todo.add", result)
+        }
+        RequestDispatch::TodoUpdate(params) => {
+            let result = TodoService::update(state, params)
+                .await
+                .map_err(|message| map_service_error("todo.update", message))?;
+            to_value("todo.update", result)
+        }
+        RequestDispatch::TodoToggle(params) => {
+            let result = TodoService::toggle(state, params)
+                .await
+                .map_err(|message| map_service_error("todo.toggle", message))?;
+            to_value("todo.toggle", result)
+        }
+        RequestDispatch::TodoRemove(params) => {
+            let result = TodoService::remove(state, params)
+                .await
+                .map_err(|message| map_service_error("todo.remove", message))?;
+            to_value("todo.remove", result)
+        }
+        RequestDispatch::TodoReorder(params) => {
+            let result = TodoService::reorder(state, params)
+                .await
+                .map_err(|message| map_service_error("todo.reorder", message))?;
+            to_value("todo.reorder", result)
+        }
         RequestDispatch::ThreadCreate(params) => {
             let thread = ThreadService::create(state, params)
                 .await
@@ -403,6 +500,12 @@ fn map_service_error(method: &str, message: String) -> RpcError {
             "preset.not_found"
         } else if method.starts_with("chat.") {
             "chat.not_found"
+        } else if method.starts_with("checkpoint.") {
+            "checkpoint.not_found"
+        } else if method.starts_with("todo.") {
+            "todo.not_found"
+        } else if method.starts_with("git.") {
+            "git.not_found"
         } else {
             "resource.not_found"
         };
