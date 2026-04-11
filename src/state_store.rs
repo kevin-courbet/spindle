@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::{
     protocol,
-    services::{project, thread::load_threadmill_config},
+    services::{project, thread::load_threadmill_config, thread::remove_worktree},
     tmux,
 };
 
@@ -196,6 +196,43 @@ impl StateStore {
             }
 
             if !worktree_exists {
+                thread.status = protocol::ThreadStatus::Closed;
+                continue;
+            }
+
+            // Closing threads were interrupted mid-close (daemon crash or cleanup error).
+            // Finish cleanup: kill tmux if lingering, remove worktree, mark closed.
+            if thread.status == protocol::ThreadStatus::Closing {
+                if tmux_exists {
+                    let _ = tmux::kill_session(&thread.tmux_session).await;
+                }
+                if worktree_exists {
+                    let project_path = projects
+                        .get(&thread.project_id)
+                        .map(|p| p.path.as_str())
+                        .unwrap_or("");
+                    if let Err(err) =
+                        remove_worktree(project_path, &thread.worktree_path, &thread.source_type)
+                            .await
+                    {
+                        // git worktree remove can fail if the directory is orphaned
+                        // (not registered as a worktree). Fall back to plain removal.
+                        warn!(
+                            thread_id = %thread.id,
+                            error = %err,
+                            "reconcile: git worktree remove failed, trying plain removal"
+                        );
+                        if let Err(rm_err) = fs::remove_dir_all(&thread.worktree_path) {
+                            warn!(
+                                thread_id = %thread.id,
+                                error = %rm_err,
+                                "reconcile: plain removal also failed for closing thread"
+                            );
+                            thread.status = protocol::ThreadStatus::Failed;
+                            continue;
+                        }
+                    }
+                }
                 thread.status = protocol::ThreadStatus::Closed;
                 continue;
             }

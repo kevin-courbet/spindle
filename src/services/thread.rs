@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs, path::Path, sync::Arc};
 use chrono::Utc;
 use serde::Deserialize;
 use tokio::process::Command;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -124,6 +124,17 @@ impl ThreadService {
                     thread_name
                 ),
             };
+            if store.data.threads.iter().any(|existing| {
+                existing.project_id == project.id
+                    && existing.name == thread_name
+                    && existing.status != protocol::ThreadStatus::Closed
+                    && existing.status != protocol::ThreadStatus::Failed
+            }) {
+                return Err(format!(
+                    "thread name already exists for project {}: {}",
+                    project.id, thread_name
+                ));
+            }
             let tmux_session = format!(
                 "tm_{}_{}",
                 short_id(&project.id),
@@ -275,6 +286,54 @@ impl ThreadService {
             (thread, project_path)
         };
 
+        let cleanup_result = Self::perform_close_cleanup(
+            Arc::clone(&state),
+            &thread,
+            &project_path,
+        )
+        .await;
+
+        match cleanup_result {
+            Ok(()) => {
+                let mut store = state.store.lock().await;
+                Self::set_status_locked(
+                    &state,
+                    &mut store,
+                    &params.thread_id,
+                    protocol::ThreadStatus::Closed,
+                )?;
+                store.save()?;
+                Ok(protocol::ThreadCloseResult {
+                    status: Some(protocol::ThreadStatus::Closed),
+                })
+            }
+            Err(err) => {
+                warn!(
+                    thread_id = %params.thread_id,
+                    error = %err,
+                    "close cleanup failed, marking thread as failed"
+                );
+                let mut store = state.store.lock().await;
+                let _ = Self::set_status_locked(
+                    &state,
+                    &mut store,
+                    &params.thread_id,
+                    protocol::ThreadStatus::Failed,
+                );
+                let _ = store.save();
+                Err(err)
+            }
+        }
+    }
+
+    /// Best-effort cleanup during thread close. All steps that can fail are
+    /// collected here so the caller can transition to Failed on error instead
+    /// of leaving the thread stranded in Closing.
+    async fn perform_close_cleanup(
+        state: Arc<AppState>,
+        thread: &Thread,
+        project_path: &str,
+    ) -> Result<(), String> {
         ChatService::stop_all_for_thread(Arc::clone(&state), &thread.id, "thread_closed", true)
             .await?;
         CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
@@ -284,32 +343,19 @@ impl ThreadService {
             let _ = tmux::kill_session(&thread.tmux_session).await;
         }
 
-        let config = load_threadmill_config(&thread.worktree_path, &project_path)?;
+        let config = load_threadmill_config(&thread.worktree_path, project_path)?;
         let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
         run_hooks(
             &config.teardown,
             &thread.worktree_path,
-            &project_path,
-            &thread,
+            project_path,
+            thread,
             port_base,
         )
         .await?;
-        remove_worktree(&project_path, &thread.worktree_path, &thread.source_type).await?;
+        remove_worktree(project_path, &thread.worktree_path, &thread.source_type).await?;
 
-        {
-            let mut store = state.store.lock().await;
-            Self::set_status_locked(
-                &state,
-                &mut store,
-                &params.thread_id,
-                protocol::ThreadStatus::Closed,
-            )?;
-            store.save()?;
-        }
-
-        Ok(protocol::ThreadCloseResult {
-            status: Some(protocol::ThreadStatus::Closed),
-        })
+        Ok(())
     }
 
     pub async fn hide(
@@ -729,7 +775,10 @@ async fn create_worktree(
         .map_err(|err| format!("failed to create {}: {err}", worktree_parent.display()))?;
 
     if Path::new(&thread.worktree_path).exists() {
-        return Ok(());
+        return Err(format!(
+            "worktree path already exists: {}",
+            thread.worktree_path
+        ));
     }
 
     match thread.source_type {
@@ -789,7 +838,7 @@ async fn create_worktree(
     Ok(())
 }
 
-async fn remove_worktree(
+pub async fn remove_worktree(
     project_path: &str,
     worktree_path: &str,
     source_type: &protocol::SourceType,

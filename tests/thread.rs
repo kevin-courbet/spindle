@@ -350,6 +350,47 @@ async fn thread_hide_marks_thread_hidden() {
 }
 
 #[tokio::test]
+async fn thread_create_rejects_duplicate_active_name() {
+    if !common::tmux_available().await {
+        eprintln!("skipping thread_create_rejects_duplicate_active_name: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let name = common::unique_name("dup-thread");
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": name,
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create first thread");
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let error = harness
+        .rpc_expect_error(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": name,
+                "source_type": "new_feature"
+            }),
+        )
+        .await;
+
+    assert!(error.contains("thread name already exists"), "{error}");
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
 async fn thread_create_nonexistent_project_returns_error() {
     let mut harness = setup_test_server().await;
 
