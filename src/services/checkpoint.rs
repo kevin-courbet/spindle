@@ -69,6 +69,19 @@ impl CheckpointService {
         state: Arc<AppState>,
         params: protocol::CheckpointSaveParams,
     ) -> Result<protocol::CheckpointSaveResult, String> {
+        Self::save_with_cursor(state, params, None).await
+    }
+
+    /// Save a checkpoint with an optional pre-computed history cursor.
+    /// When `override_cursor` is Some, it is used instead of reading the
+    /// current JSONL line count. This avoids a race where the caller has
+    /// already appended events (e.g. user echo) to the JSONL between
+    /// capturing the cursor and spawning this save.
+    pub async fn save_with_cursor(
+        state: Arc<AppState>,
+        params: protocol::CheckpointSaveParams,
+        override_cursor: Option<u64>,
+    ) -> Result<protocol::CheckpointSaveResult, String> {
         let context = thread_context(&state, &params.thread_id).await?;
         let config = load_threadmill_config(&context.worktree_path, &context.project_path)?;
 
@@ -89,7 +102,9 @@ impl CheckpointService {
             + 1;
         let timestamp = Utc::now().to_rfc3339();
         let head_oid = git_output(&context.worktree_path, &["rev-parse", "HEAD"]).await?;
-        let history_cursor = if let Some(session_id) = params.session_id.as_deref() {
+        let history_cursor = if let Some(cursor) = override_cursor {
+            Some(cursor)
+        } else if let Some(session_id) = params.session_id.as_deref() {
             Some(current_history_cursor(&state, &context.thread_id, session_id).await?)
         } else {
             None

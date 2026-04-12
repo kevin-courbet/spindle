@@ -489,7 +489,7 @@ impl ChatService {
         channel_id: u16,
         payload: Vec<u8>,
     ) -> Result<bool, String> {
-        let (input_tx, transitions, prompt_updates, auto_checkpoints, history_path) = {
+        let (input_tx, transitions, prompt_updates, mut auto_checkpoints, history_path) = {
             let mut chat = state.chat.lock().await;
             let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
                 return Ok(false);
@@ -519,6 +519,23 @@ impl ChatService {
         };
 
         emit_status_transitions(&state, transitions).await;
+
+        // Capture history cursor BEFORE writing user echoes to the JSONL.
+        // Auto-checkpoints need the line count from before the echo so that
+        // checkpoint.restore truncates to a consistent point (without orphan
+        // user echoes that lack agent responses).
+        if !auto_checkpoints.is_empty() && history_path.exists() {
+            match count_lines(&history_path) {
+                Ok(cursor) => {
+                    for checkpoint in &mut auto_checkpoints {
+                        checkpoint.history_cursor = Some(cursor);
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to read history cursor for auto-checkpoint");
+                }
+            }
+        }
 
         if !prompt_updates.is_empty() {
             if let Err(error) = append_updates_to_history(&history_path, &prompt_updates) {
@@ -1156,6 +1173,11 @@ struct AutoCheckpointRequest {
     session_id: String,
     message: String,
     prompt_preview: Option<String>,
+    /// Pre-computed history cursor captured BEFORE the user echo is appended
+    /// to the JSONL. Without this, the auto-checkpoint reads the line count
+    /// after the echo is already written, so checkpoint.restore truncates to
+    /// a point that includes the user echo but not the agent response.
+    history_cursor: Option<u64>,
 }
 
 async fn emit_status_transitions(state: &Arc<AppState>, transitions: Vec<StatusTransition>) {
@@ -1302,6 +1324,7 @@ fn apply_inbound_status_updates(
                 session_id: session.summary.session_id.clone(),
                 message: format!("Auto-checkpoint before prompt {}", session.checkpoint_seq),
                 prompt_preview: prompt_preview_from_message(&message),
+                history_cursor: None, // filled in by handle_inbound_data before JSONL write
             });
             session.active_tools.clear();
             session.summary.worker_count = 0;
@@ -1320,7 +1343,7 @@ fn apply_inbound_status_updates(
 
 fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
     tokio::spawn(async move {
-        if let Err(error) = CheckpointService::save(
+        if let Err(error) = CheckpointService::save_with_cursor(
             state,
             protocol::CheckpointSaveParams {
                 thread_id: request.thread_id,
@@ -1328,6 +1351,7 @@ fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
                 message: Some(request.message),
                 prompt_preview: request.prompt_preview,
             },
+            request.history_cursor,
         )
         .await
         {
@@ -1972,6 +1996,18 @@ pub(crate) fn history_path_for_session(history_root: &Path, thread_id: &str, ses
 
 fn is_safe_history_component(value: &str) -> bool {
     !value.is_empty() && !value.contains('/') && !value.contains('\\') && !value.contains("..")
+}
+
+fn count_lines(path: &Path) -> Result<u64, String> {
+    let file = fs::File::open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut count = 0_u64;
+    for line in reader.lines() {
+        line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn append_updates_to_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
