@@ -336,11 +336,38 @@ impl ThreadService {
     ) -> Result<(), String> {
         ChatService::stop_all_for_thread(Arc::clone(&state), &thread.id, "thread_closed", true)
             .await?;
-        CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
-        TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
 
         if tmux::session_exists(&thread.tmux_session).await? {
             let _ = tmux::kill_session(&thread.tmux_session).await;
+        }
+
+        // Worktree-dependent cleanup: checkpoint refs, todos, config hooks,
+        // and worktree removal all need the directory to exist. If it's already
+        // gone (e.g. manually deleted or stale from a prior failed run), skip
+        // gracefully instead of failing the close.
+        let worktree_exists = Path::new(&thread.worktree_path).is_dir();
+        if !worktree_exists {
+            tracing::info!(
+                thread_id = %thread.id,
+                worktree = %thread.worktree_path,
+                "worktree missing, skipping git-dependent cleanup"
+            );
+            return Ok(());
+        }
+
+        if let Err(err) = CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await {
+            warn!(
+                thread_id = %thread.id,
+                error = %err,
+                "checkpoint cleanup failed during close, continuing"
+            );
+        }
+        if let Err(err) = TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await {
+            warn!(
+                thread_id = %thread.id,
+                error = %err,
+                "todo cleanup failed during close, continuing"
+            );
         }
 
         let config = load_threadmill_config(&thread.worktree_path, project_path)?;
@@ -372,8 +399,10 @@ impl ThreadService {
         if thread.status == protocol::ThreadStatus::Closed {
             return Err(format!("thread {} is closed", thread.id));
         }
-        CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
-        TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
+        if Path::new(&thread.worktree_path).is_dir() {
+            CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
+            TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
+        }
 
         {
             let mut store = state.store.lock().await;

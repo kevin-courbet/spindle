@@ -44,6 +44,7 @@ pub struct TestHarness {
     binaries: VecDeque<Vec<u8>>,
     last_error_response: Option<Value>,
     cleanup_paths: Vec<PathBuf>,
+    config_home: PathBuf,
     previous_config_home: Option<OsString>,
     _guard: MutexGuard<'static, ()>,
 }
@@ -326,6 +327,11 @@ impl TestHarness {
         self.cleanup_paths.push(path);
     }
 
+    pub fn preserve_config_home(&mut self) -> PathBuf {
+        self.cleanup_paths.retain(|path| path != &self.config_home);
+        self.config_home.clone()
+    }
+
     fn take_event(&mut self, method: &str) -> Option<Value> {
         let index = self.events.iter().position(|event| {
             event
@@ -383,6 +389,19 @@ pub async fn setup_test_server() -> TestHarness {
 
     let config_home = unique_temp_path("spindle-config");
     fs::create_dir_all(config_home.join("threadmill")).expect("create test config directory");
+    setup_test_server_with_config_home_inner(guard, config_home).await
+}
+
+pub async fn setup_test_server_with_config_home(config_home: PathBuf) -> TestHarness {
+    let guard = test_mutex().lock().await;
+    fs::create_dir_all(config_home.join("threadmill")).expect("create test config directory");
+    setup_test_server_with_config_home_inner(guard, config_home).await
+}
+
+async fn setup_test_server_with_config_home_inner(
+    guard: MutexGuard<'static, ()>,
+    config_home: PathBuf,
+) -> TestHarness {
     let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
     set_env_var("XDG_CONFIG_HOME", &config_home);
 
@@ -409,6 +428,9 @@ pub async fn setup_test_server() -> TestHarness {
         binaries: VecDeque::new(),
         last_error_response: None,
         cleanup_paths: vec![config_home],
+        config_home: std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .expect("XDG_CONFIG_HOME set"),
         previous_config_home,
         _guard: guard,
     };
