@@ -2331,8 +2331,12 @@ mod tests {
     use crate::state_store::{AppData, Project, StateStore, Thread};
 
     fn make_test_state() -> Arc<AppState> {
+        let state_path = std::env::temp_dir().join(format!(
+            "threadmill-chat-tests-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
         Arc::new(AppState::new(StateStore {
-            path: PathBuf::from("/tmp/threadmill-tests.json"),
+            path: state_path,
             data: AppData {
                 projects: vec![Project {
                     id: "project-1".to_string(),

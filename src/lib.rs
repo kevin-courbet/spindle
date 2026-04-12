@@ -38,19 +38,22 @@ pub struct AppState {
     state_version: Arc<AtomicU64>,
     next_operation_id: Arc<AtomicU64>,
     pub store: Arc<Mutex<StateStore>>,
+    pub workflows: Arc<Mutex<services::workflow::WorkflowStore>>,
     pub chat: Arc<Mutex<services::chat::ChatState>>,
     pub create_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Debug)]
-struct ServerEvent {
-    method: String,
-    params: Value,
+pub(crate) struct ServerEvent {
+    pub(crate) method: String,
+    pub(crate) params: Value,
 }
 
 impl AppState {
     pub fn new(store: StateStore) -> Self {
         let (events_tx, _) = broadcast::channel(256);
+        let workflows = services::workflow::WorkflowStore::load_from_state_store(&store.path)
+            .unwrap_or_else(|err| panic!("failed to load workflow store: {err}"));
         let history_root = store
             .path
             .parent()
@@ -62,6 +65,7 @@ impl AppState {
             state_version: Arc::new(AtomicU64::new(0)),
             next_operation_id: Arc::new(AtomicU64::new(1)),
             store: Arc::new(Mutex::new(store)),
+            workflows: Arc::new(Mutex::new(workflows)),
             chat: Arc::new(Mutex::new(services::chat::ChatState::new(history_root))),
             create_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -100,6 +104,10 @@ impl AppState {
             method: method.into(),
             params,
         });
+    }
+
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
+        self.events_tx.subscribe()
     }
 
     pub fn emit_thread_progress(&self, event: protocol::ThreadProgress) {
@@ -234,6 +242,11 @@ pub async fn serve_listener(listener: TcpListener, mut shutdown_rx: oneshot::Rec
     {
         warn!(error = %err, "failed to recover persisted chat sessions");
     }
+    if let Err(err) = services::workflow::WorkflowService::reconcile_startup(Arc::clone(&state)).await
+    {
+        warn!(error = %err, "failed to reconcile workflows");
+    }
+    services::workflow::WorkflowService::start_event_listener(Arc::clone(&state));
     let local_addr = match listener.local_addr() {
         Ok(addr) => addr,
         Err(err) => {

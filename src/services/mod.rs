@@ -9,6 +9,7 @@ pub mod project;
 pub mod terminal;
 pub mod thread;
 pub mod todo;
+pub mod workflow;
 
 pub fn sanitize_name(value: &str) -> String {
     let mut out = String::with_capacity(value.len());

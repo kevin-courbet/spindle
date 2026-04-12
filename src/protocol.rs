@@ -195,6 +195,222 @@ pub struct ChatStatusParams {
 pub type ChatStatusResult = ChatSessionSummary;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowPhase {
+    #[serde(rename = "PLANNING")]
+    Planning,
+    #[serde(rename = "IMPLEMENTING")]
+    Implementing,
+    #[serde(rename = "TESTING")]
+    Testing,
+    #[serde(rename = "REVIEWING")]
+    Reviewing,
+    #[serde(rename = "FIXING")]
+    Fixing,
+    #[serde(rename = "COMPLETE")]
+    Complete,
+    #[serde(rename = "BLOCKED")]
+    Blocked,
+    #[serde(rename = "FAILED")]
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowWorkerStatus {
+    #[serde(rename = "PLANNED")]
+    Planned,
+    #[serde(rename = "SPAWNING")]
+    Spawning,
+    #[serde(rename = "RUNNING")]
+    Running,
+    #[serde(rename = "COMPLETED")]
+    Completed,
+    #[serde(rename = "FAILED")]
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowFindingSeverity {
+    #[serde(rename = "LOW")]
+    Low,
+    #[serde(rename = "MEDIUM")]
+    Medium,
+    #[serde(rename = "HIGH")]
+    High,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    #[serde(rename = "DONE")]
+    Done,
+    #[serde(rename = "CONTEXT_EXHAUSTED")]
+    ContextExhausted,
+    #[serde(rename = "BLOCKED_NEED_INFO")]
+    BlockedNeedInfo,
+    #[serde(rename = "BLOCKED_TECHNICAL")]
+    BlockedTechnical,
+    #[serde(rename = "QUALITY_CONCERN")]
+    QualityConcern,
+    #[serde(rename = "SCOPE_CREEP")]
+    ScopeCreep,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowHandoff {
+    pub stop_reason: StopReason,
+    #[serde(default)]
+    pub progress: Vec<String>,
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+    pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<String>,
+    pub recorded_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowWorker {
+    pub worker_id: String,
+    pub agent_name: String,
+    pub status: WorkflowWorkerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<WorkflowHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<AgentStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowReviewer {
+    pub reviewer_id: String,
+    pub agent_name: String,
+    pub status: WorkflowWorkerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<AgentStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowFinding {
+    pub finding_id: String,
+    pub severity: WorkflowFindingSeverity,
+    pub summary: String,
+    pub details: String,
+    #[serde(default)]
+    pub source_reviewers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowState {
+    pub workflow_id: String,
+    pub thread_id: String,
+    pub phase: WorkflowPhase,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prd_issue_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementation_issue_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<WorkflowWorker>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<WorkflowReviewer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<WorkflowFinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_started_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowCreatedEvent {
+    pub workflow: WorkflowState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowPhaseChangedEvent {
+    pub workflow_id: String,
+    pub thread_id: String,
+    pub old_phase: WorkflowPhase,
+    pub new_phase: WorkflowPhase,
+    #[serde(default)]
+    pub forced: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowWorkerSpawnedEvent {
+    pub workflow_id: String,
+    pub thread_id: String,
+    pub worker: WorkflowWorker,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowWorkerCompletedEvent {
+    pub workflow_id: String,
+    pub thread_id: String,
+    pub worker: WorkflowWorker,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowReviewStartedEvent {
+    pub workflow_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<WorkflowReviewer>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowReviewerCompletedEvent {
+    pub workflow_id: String,
+    pub thread_id: String,
+    pub reviewer: WorkflowReviewer,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowFindingsRecordedEvent {
+    pub workflow_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<WorkflowFinding>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowCompletedEvent {
+    pub workflow: WorkflowState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ThreadStatus {
     #[serde(rename = "creating")]
     Creating,
@@ -350,6 +566,8 @@ pub struct StateSnapshot {
     pub projects: Vec<Project>,
     pub threads: Vec<Thread>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<WorkflowState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_registry: Vec<crate::services::agent_registry::AgentRegistryEntry>,
 }
 
@@ -402,6 +620,8 @@ pub enum StateDeltaOperationPayload {
         thread_id: String,
         session_id: String,
     },
+    #[serde(rename = "workflow.upsert")]
+    WorkflowUpsert { workflow: WorkflowState },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -659,6 +879,130 @@ pub struct ChatHistoryParams {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowCreateParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prd_issue_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementation_issue_urls: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowStatusParams {
+    pub workflow_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct WorkflowListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowTransitionParams {
+    pub workflow_id: String,
+    pub phase: WorkflowPhase,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowSpawnWorkerParams {
+    pub workflow_id: String,
+    pub agent_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowRecordHandoffParams {
+    pub workflow_id: String,
+    pub worker_id: String,
+    pub stop_reason: StopReason,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
+    pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowReviewerSpec {
+    pub agent_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowStartReviewParams {
+    pub workflow_id: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<WorkflowReviewerSpec>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowSpawnReviewerParams {
+    pub workflow_id: String,
+    pub agent_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowListReviewersParams {
+    pub workflow_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowFindingInput {
+    pub severity: WorkflowFindingSeverity,
+    pub summary: String,
+    pub details: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_reviewers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowRecordFindingsParams {
+    pub workflow_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<WorkflowFindingInput>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowCompleteParams {
+    pub workflow_id: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1094,6 +1438,40 @@ pub struct ChatHistoryResult {
     pub next_cursor: Option<u64>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowCreateResult {
+    pub workflow_id: String,
+}
+
+pub type WorkflowStatusResult = WorkflowState;
+pub type WorkflowListResult = Vec<WorkflowState>;
+pub type WorkflowTransitionResult = WorkflowState;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowSpawnWorkerResult {
+    pub workflow_id: String,
+    pub worker: WorkflowWorker,
+}
+
+pub type WorkflowRecordHandoffResult = WorkflowWorker;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowStartReviewResult {
+    pub workflow: WorkflowState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<WorkflowReviewer>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowSpawnReviewerResult {
+    pub workflow_id: String,
+    pub reviewer: WorkflowReviewer,
+}
+
+pub type WorkflowListReviewersResult = Vec<WorkflowReviewer>;
+pub type WorkflowRecordFindingsResult = Vec<WorkflowFinding>;
+pub type WorkflowCompleteResult = WorkflowState;
+
 pub const METHOD_SESSION_HELLO: &str = "session.hello";
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_STATE_SNAPSHOT: &str = "state.snapshot";
@@ -1159,6 +1537,17 @@ pub const METHOD_CHAT_ATTACH: &str = "chat.attach";
 pub const METHOD_CHAT_DETACH: &str = "chat.detach";
 pub const METHOD_CHAT_HISTORY: &str = "chat.history";
 pub const METHOD_CHAT_STATUS: &str = "chat.status";
+pub const METHOD_WORKFLOW_CREATE: &str = "workflow.create";
+pub const METHOD_WORKFLOW_STATUS: &str = "workflow.status";
+pub const METHOD_WORKFLOW_LIST: &str = "workflow.list";
+pub const METHOD_WORKFLOW_TRANSITION: &str = "workflow.transition";
+pub const METHOD_WORKFLOW_SPAWN_WORKER: &str = "workflow.spawn_worker";
+pub const METHOD_WORKFLOW_RECORD_HANDOFF: &str = "workflow.record_handoff";
+pub const METHOD_WORKFLOW_START_REVIEW: &str = "workflow.start_review";
+pub const METHOD_WORKFLOW_SPAWN_REVIEWER: &str = "workflow.spawn_reviewer";
+pub const METHOD_WORKFLOW_LIST_REVIEWERS: &str = "workflow.list_reviewers";
+pub const METHOD_WORKFLOW_RECORD_FINDINGS: &str = "workflow.record_findings";
+pub const METHOD_WORKFLOW_COMPLETE: &str = "workflow.complete";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -1299,6 +1688,28 @@ pub enum RequestDispatch {
     ChatHistory(ChatHistoryParams),
     #[serde(rename = "chat.status")]
     ChatStatus(ChatStatusParams),
+    #[serde(rename = "workflow.create")]
+    WorkflowCreate(WorkflowCreateParams),
+    #[serde(rename = "workflow.status")]
+    WorkflowStatus(WorkflowStatusParams),
+    #[serde(rename = "workflow.list")]
+    WorkflowList(WorkflowListParams),
+    #[serde(rename = "workflow.transition")]
+    WorkflowTransition(WorkflowTransitionParams),
+    #[serde(rename = "workflow.spawn_worker")]
+    WorkflowSpawnWorker(WorkflowSpawnWorkerParams),
+    #[serde(rename = "workflow.record_handoff")]
+    WorkflowRecordHandoff(WorkflowRecordHandoffParams),
+    #[serde(rename = "workflow.start_review")]
+    WorkflowStartReview(WorkflowStartReviewParams),
+    #[serde(rename = "workflow.spawn_reviewer")]
+    WorkflowSpawnReviewer(WorkflowSpawnReviewerParams),
+    #[serde(rename = "workflow.list_reviewers")]
+    WorkflowListReviewers(WorkflowListReviewersParams),
+    #[serde(rename = "workflow.record_findings")]
+    WorkflowRecordFindings(WorkflowRecordFindingsParams),
+    #[serde(rename = "workflow.complete")]
+    WorkflowComplete(WorkflowCompleteParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
     #[serde(rename = "agent.registry.list")]
@@ -1465,6 +1876,47 @@ pub fn parse_request_dispatch(
         METHOD_CHAT_STATUS => serde_json::from_value::<ChatStatusParams>(params)
             .map(RequestDispatch::ChatStatus)
             .map_err(|err| format!("invalid chat.status params: {err}")),
+        METHOD_WORKFLOW_CREATE => serde_json::from_value::<WorkflowCreateParams>(params)
+            .map(RequestDispatch::WorkflowCreate)
+            .map_err(|err| format!("invalid workflow.create params: {err}")),
+        METHOD_WORKFLOW_STATUS => serde_json::from_value::<WorkflowStatusParams>(params)
+            .map(RequestDispatch::WorkflowStatus)
+            .map_err(|err| format!("invalid workflow.status params: {err}")),
+        METHOD_WORKFLOW_LIST => serde_json::from_value::<WorkflowListParams>(params)
+            .map(RequestDispatch::WorkflowList)
+            .map_err(|err| format!("invalid workflow.list params: {err}")),
+        METHOD_WORKFLOW_TRANSITION => serde_json::from_value::<WorkflowTransitionParams>(params)
+            .map(RequestDispatch::WorkflowTransition)
+            .map_err(|err| format!("invalid workflow.transition params: {err}")),
+        METHOD_WORKFLOW_SPAWN_WORKER => serde_json::from_value::<WorkflowSpawnWorkerParams>(params)
+            .map(RequestDispatch::WorkflowSpawnWorker)
+            .map_err(|err| format!("invalid workflow.spawn_worker params: {err}")),
+        METHOD_WORKFLOW_RECORD_HANDOFF => {
+            serde_json::from_value::<WorkflowRecordHandoffParams>(params)
+                .map(RequestDispatch::WorkflowRecordHandoff)
+                .map_err(|err| format!("invalid workflow.record_handoff params: {err}"))
+        }
+        METHOD_WORKFLOW_START_REVIEW => serde_json::from_value::<WorkflowStartReviewParams>(params)
+            .map(RequestDispatch::WorkflowStartReview)
+            .map_err(|err| format!("invalid workflow.start_review params: {err}")),
+        METHOD_WORKFLOW_SPAWN_REVIEWER => {
+            serde_json::from_value::<WorkflowSpawnReviewerParams>(params)
+                .map(RequestDispatch::WorkflowSpawnReviewer)
+                .map_err(|err| format!("invalid workflow.spawn_reviewer params: {err}"))
+        }
+        METHOD_WORKFLOW_LIST_REVIEWERS => {
+            serde_json::from_value::<WorkflowListReviewersParams>(params)
+                .map(RequestDispatch::WorkflowListReviewers)
+                .map_err(|err| format!("invalid workflow.list_reviewers params: {err}"))
+        }
+        METHOD_WORKFLOW_RECORD_FINDINGS => {
+            serde_json::from_value::<WorkflowRecordFindingsParams>(params)
+                .map(RequestDispatch::WorkflowRecordFindings)
+                .map_err(|err| format!("invalid workflow.record_findings params: {err}"))
+        }
+        METHOD_WORKFLOW_COMPLETE => serde_json::from_value::<WorkflowCompleteParams>(params)
+            .map(RequestDispatch::WorkflowComplete)
+            .map_err(|err| format!("invalid workflow.complete params: {err}")),
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),

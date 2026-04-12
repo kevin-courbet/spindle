@@ -11,7 +11,7 @@ use crate::{
         chat::ChatService, checkpoint::CheckpointService, file::FileService, git::GitService,
         opencode::OpencodeService, preset::PresetService, project::ProjectService,
         system::SystemService, terminal, terminal::TerminalConnectionState, thread::ThreadService,
-        todo::TodoService,
+        todo::TodoService, workflow::WorkflowService,
     },
     AppState, ConnectionSessionState, RpcError,
 };
@@ -142,6 +142,7 @@ pub async fn dispatch_request(
             }
 
             let agent_registry = crate::services::agent_registry::discover_agents();
+            let workflows = WorkflowService::snapshot_workflows(&state).await;
             let snapshot = protocol::StateSnapshot {
                 state_version: state.state_version(),
                 projects: projects
@@ -150,6 +151,7 @@ pub async fn dispatch_request(
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|message| map_service_error("state.snapshot", message))?,
                 threads,
+                workflows,
                 agent_registry,
             };
             to_value("state.snapshot", snapshot)
@@ -435,6 +437,72 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("chat.status", message))?;
             to_value("chat.status", result)
         }
+        RequestDispatch::WorkflowCreate(params) => {
+            let result = WorkflowService::create(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.create", message))?;
+            to_value("workflow.create", result)
+        }
+        RequestDispatch::WorkflowStatus(params) => {
+            let result = WorkflowService::status(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.status", message))?;
+            to_value("workflow.status", result)
+        }
+        RequestDispatch::WorkflowList(params) => {
+            let result = WorkflowService::list(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.list", message))?;
+            to_value("workflow.list", result)
+        }
+        RequestDispatch::WorkflowTransition(params) => {
+            let result = WorkflowService::transition(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.transition", message))?;
+            to_value("workflow.transition", result)
+        }
+        RequestDispatch::WorkflowSpawnWorker(params) => {
+            let result = WorkflowService::spawn_worker(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.spawn_worker", message))?;
+            to_value("workflow.spawn_worker", result)
+        }
+        RequestDispatch::WorkflowRecordHandoff(params) => {
+            let result = WorkflowService::record_handoff(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.record_handoff", message))?;
+            to_value("workflow.record_handoff", result)
+        }
+        RequestDispatch::WorkflowStartReview(params) => {
+            let result = WorkflowService::start_review(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.start_review", message))?;
+            to_value("workflow.start_review", result)
+        }
+        RequestDispatch::WorkflowSpawnReviewer(params) => {
+            let result = WorkflowService::spawn_reviewer(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.spawn_reviewer", message))?;
+            to_value("workflow.spawn_reviewer", result)
+        }
+        RequestDispatch::WorkflowListReviewers(params) => {
+            let result = WorkflowService::list_reviewers(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.list_reviewers", message))?;
+            to_value("workflow.list_reviewers", result)
+        }
+        RequestDispatch::WorkflowRecordFindings(params) => {
+            let result = WorkflowService::record_findings(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.record_findings", message))?;
+            to_value("workflow.record_findings", result)
+        }
+        RequestDispatch::WorkflowComplete(params) => {
+            let result = WorkflowService::complete(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.complete", message))?;
+            to_value("workflow.complete", result)
+        }
         RequestDispatch::AgentRegistryList(_) => {
             let entries = crate::services::agent_registry::discover_agents();
             to_value("agent.registry.list", entries)
@@ -475,6 +543,7 @@ fn normalize_params(method: &str, params: Value) -> Value {
         | protocol::METHOD_OPENCODE_ENSURE
         | protocol::METHOD_PROJECT_LIST
         | protocol::METHOD_THREAD_LIST
+        | protocol::METHOD_WORKFLOW_LIST
         | protocol::METHOD_SYSTEM_STATS
         | protocol::METHOD_AGENT_REGISTRY_LIST => json!({}),
         _ => Value::Null,
@@ -506,6 +575,8 @@ fn map_service_error(method: &str, message: String) -> RpcError {
             "todo.not_found"
         } else if method.starts_with("git.") {
             "git.not_found"
+        } else if method.starts_with("workflow.") {
+            "workflow.not_found"
         } else {
             "resource.not_found"
         };
