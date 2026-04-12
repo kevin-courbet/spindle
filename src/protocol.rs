@@ -386,7 +386,7 @@ pub struct WorkflowWorkerCompletedEvent {
 pub struct WorkflowReviewStartedEvent {
     pub workflow_id: String,
     pub thread_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub reviewers: Vec<WorkflowReviewer>,
 }
 
@@ -401,7 +401,7 @@ pub struct WorkflowReviewerCompletedEvent {
 pub struct WorkflowFindingsRecordedEvent {
     pub workflow_id: String,
     pub thread_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub findings: Vec<WorkflowFinding>,
 }
 
@@ -565,7 +565,7 @@ pub struct StateSnapshot {
     pub state_version: StateVersion,
     pub projects: Vec<Project>,
     pub threads: Vec<Thread>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub workflows: Vec<WorkflowState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_registry: Vec<crate::services::agent_registry::AgentRegistryEntry>,
@@ -1458,7 +1458,7 @@ pub type WorkflowRecordHandoffResult = WorkflowWorker;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorkflowStartReviewResult {
     pub workflow: WorkflowState,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub reviewers: Vec<WorkflowReviewer>,
 }
 
@@ -1929,5 +1929,82 @@ pub fn parse_request_dispatch(
                 .map_err(|err| format!("invalid agent.registry.install params: {err}"))
         }
         _ => Err(format!("unknown method '{method}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_workflow() -> WorkflowState {
+        WorkflowState {
+            workflow_id: "workflow-1".into(),
+            thread_id: "thread-1".into(),
+            phase: WorkflowPhase::Reviewing,
+            created_at: "2026-04-12T00:00:00Z".into(),
+            updated_at: "2026-04-12T00:00:00Z".into(),
+            completed_at: None,
+            prd_issue_url: None,
+            implementation_issue_urls: Vec::new(),
+            workers: Vec::new(),
+            reviewers: Vec::new(),
+            findings: Vec::new(),
+            review_started_at: None,
+        }
+    }
+
+    #[test]
+    fn state_snapshot_serializes_empty_workflows_array() {
+        let snapshot = StateSnapshot {
+            state_version: 1,
+            projects: Vec::new(),
+            threads: Vec::new(),
+            workflows: Vec::new(),
+            agent_registry: Vec::new(),
+        };
+
+        let value = serde_json::to_value(&snapshot).expect("serialize state snapshot");
+
+        assert_eq!(
+            value,
+            json!({
+                "state_version": 1,
+                "projects": [],
+                "threads": [],
+                "workflows": []
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_review_payloads_serialize_empty_required_arrays() {
+        let workflow = sample_workflow();
+
+        let start_review = WorkflowStartReviewResult {
+            workflow: workflow.clone(),
+            reviewers: Vec::new(),
+        };
+        let review_started = WorkflowReviewStartedEvent {
+            workflow_id: workflow.workflow_id.clone(),
+            thread_id: workflow.thread_id.clone(),
+            reviewers: Vec::new(),
+        };
+        let findings_recorded = WorkflowFindingsRecordedEvent {
+            workflow_id: workflow.workflow_id.clone(),
+            thread_id: workflow.thread_id.clone(),
+            findings: Vec::new(),
+        };
+
+        let start_review_value =
+            serde_json::to_value(&start_review).expect("serialize workflow.start_review result");
+        let review_started_value =
+            serde_json::to_value(&review_started).expect("serialize workflow.review_started event");
+        let findings_recorded_value = serde_json::to_value(&findings_recorded)
+            .expect("serialize workflow.findings_recorded event");
+
+        assert_eq!(start_review_value["reviewers"], json!([]));
+        assert_eq!(review_started_value["reviewers"], json!([]));
+        assert_eq!(findings_recorded_value["findings"], json!([]));
     }
 }

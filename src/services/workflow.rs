@@ -30,6 +30,16 @@ fn default_next_index() -> u32 {
     1
 }
 
+#[derive(Clone)]
+struct ReviewStartCheckpoint {
+    thread_id: String,
+    previous_phase: protocol::WorkflowPhase,
+    previous_completed_at: Option<String>,
+    previous_review_started_at: Option<String>,
+    previous_reviewer_count: usize,
+    previous_next_reviewer_index: u32,
+}
+
 pub struct WorkflowStore {
     pub path: PathBuf,
     pub data: WorkflowStoreData,
@@ -155,8 +165,11 @@ impl WorkflowService {
                     }
                 }
 
+                let had_active_sessions = !changed_workers.is_empty() || !changed_reviewers.is_empty();
+
                 let mut phase_change = None;
-                if workflow_is_active_phase(&workflow.state.phase)
+                if had_active_sessions
+                    && workflow_is_active_phase(&workflow.state.phase)
                     && workflow.state.phase != protocol::WorkflowPhase::Blocked
                 {
                     let old_phase = workflow.state.phase.clone();
@@ -407,7 +420,7 @@ impl WorkflowService {
 
         match chat_result {
             Ok(chat_result) => {
-                let worker = {
+                {
                     let mut store = state.workflows.lock().await;
                     let workflow = find_workflow_locked_mut(&mut store, &workflow_id)
                         .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
@@ -424,9 +437,33 @@ impl WorkflowService {
                         worker.started_at = Some(Utc::now().to_rfc3339());
                     }
                     touch_workflow(&mut workflow.state);
-                    let worker = workflow.state.workers[worker_index].clone();
                     store.save()?;
-                    worker
+                }
+
+                let chat_status = ChatService::status(
+                    Arc::clone(&state),
+                    protocol::ChatStatusParams {
+                        session_id: chat_result.session_id.clone(),
+                    },
+                )
+                .await?;
+                reconcile_bound_session_status(
+                    Arc::clone(&state),
+                    &chat_result.session_id,
+                    &chat_status,
+                )
+                .await?;
+
+                let worker = {
+                    let store = state.workflows.lock().await;
+                    let workflow = find_workflow_locked(&store, &workflow_id)
+                        .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
+                    workflow
+                        .workers
+                        .iter()
+                        .find(|worker| worker.worker_id == worker_id)
+                        .cloned()
+                        .ok_or_else(|| format!("worker not found: {worker_id}"))?
                 };
 
                 state.emit_event(
@@ -535,6 +572,7 @@ impl WorkflowService {
         state: Arc<AppState>,
         params: protocol::WorkflowStartReviewParams,
     ) -> Result<protocol::WorkflowStartReviewResult, String> {
+        let checkpoint = snapshot_review_start_checkpoint(&state, &params.workflow_id).await?;
         Self::transition(
             Arc::clone(&state),
             protocol::WorkflowTransitionParams {
@@ -558,7 +596,22 @@ impl WorkflowService {
                     display_name: reviewer.display_name,
                 },
             )
-            .await?;
+            .await;
+            let spawned = match spawned {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    rollback_review_start(
+                        Arc::clone(&state),
+                        &params.workflow_id,
+                        &checkpoint,
+                    )
+                    .await
+                    .map_err(|rollback_error| {
+                        format!("{error}; rollback failed: {rollback_error}")
+                    })?;
+                    return Err(error);
+                }
+            };
             reviewers.push(spawned.reviewer);
         }
 
@@ -641,7 +694,7 @@ impl WorkflowService {
 
         match chat_result {
             Ok(chat_result) => {
-                let reviewer = {
+                {
                     let mut store = state.workflows.lock().await;
                     let workflow = find_workflow_locked_mut(&mut store, &workflow_id)
                         .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
@@ -658,9 +711,32 @@ impl WorkflowService {
                         reviewer.started_at = Some(Utc::now().to_rfc3339());
                     }
                     touch_workflow(&mut workflow.state);
-                    let reviewer = workflow.state.reviewers[reviewer_index].clone();
                     store.save()?;
-                    reviewer
+                }
+                let chat_status = ChatService::status(
+                    Arc::clone(&state),
+                    protocol::ChatStatusParams {
+                        session_id: chat_result.session_id.clone(),
+                    },
+                )
+                .await?;
+                reconcile_bound_session_status(
+                    Arc::clone(&state),
+                    &chat_result.session_id,
+                    &chat_status,
+                )
+                .await?;
+
+                let reviewer = {
+                    let store = state.workflows.lock().await;
+                    let workflow = find_workflow_locked(&store, &workflow_id)
+                        .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
+                    workflow
+                        .reviewers
+                        .iter()
+                        .find(|reviewer| reviewer.reviewer_id == reviewer_id)
+                        .cloned()
+                        .ok_or_else(|| format!("reviewer not found: {reviewer_id}"))?
                 };
                 emit_workflow_state_delta(&state, &workflow_id).await;
                 Ok(protocol::WorkflowSpawnReviewerResult {
@@ -987,6 +1063,105 @@ async fn emit_workflow_state_delta(state: &AppState, workflow_id: &str) {
     }
 }
 
+async fn snapshot_review_start_checkpoint(
+    state: &Arc<AppState>,
+    workflow_id: &str,
+) -> Result<ReviewStartCheckpoint, String> {
+    let store = state.workflows.lock().await;
+    let workflow = find_workflow_locked(&store, workflow_id)
+        .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
+    let persisted = store
+        .data
+        .workflows
+        .iter()
+        .find(|workflow| workflow.state.workflow_id == workflow_id)
+        .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
+    Ok(ReviewStartCheckpoint {
+        thread_id: workflow.thread_id.clone(),
+        previous_phase: workflow.phase.clone(),
+        previous_completed_at: workflow.completed_at.clone(),
+        previous_review_started_at: workflow.review_started_at.clone(),
+        previous_reviewer_count: workflow.reviewers.len(),
+        previous_next_reviewer_index: persisted.next_reviewer_index,
+    })
+}
+
+async fn rollback_review_start(
+    state: Arc<AppState>,
+    workflow_id: &str,
+    checkpoint: &ReviewStartCheckpoint,
+) -> Result<(), String> {
+    let (workflow, phase_change, session_ids) = {
+        let mut store = state.workflows.lock().await;
+        let workflow = find_workflow_locked_mut(&mut store, workflow_id)
+            .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
+        if workflow.state.reviewers.len() < checkpoint.previous_reviewer_count {
+            return Err(format!(
+                "workflow rollback invariant violated: reviewer count {} < checkpoint {}",
+                workflow.state.reviewers.len(),
+                checkpoint.previous_reviewer_count
+            ));
+        }
+
+        let current_phase = workflow.state.phase.clone();
+        let removed_reviewers = workflow
+            .state
+            .reviewers
+            .split_off(checkpoint.previous_reviewer_count);
+        let session_ids = removed_reviewers
+            .into_iter()
+            .filter_map(|reviewer| reviewer.session_id)
+            .collect::<Vec<_>>();
+        workflow.next_reviewer_index = checkpoint.previous_next_reviewer_index;
+        workflow.state.phase = checkpoint.previous_phase.clone();
+        workflow.state.completed_at = checkpoint.previous_completed_at.clone();
+        workflow.state.review_started_at = checkpoint.previous_review_started_at.clone();
+        touch_workflow(&mut workflow.state);
+        let workflow_state = workflow.state.clone();
+        let phase_change = (current_phase != checkpoint.previous_phase).then_some((
+            current_phase,
+            checkpoint.previous_phase.clone(),
+        ));
+        store.save()?;
+        (workflow_state, phase_change, session_ids)
+    };
+
+    if let Some((old_phase, new_phase)) = phase_change {
+        state.emit_event(
+            "workflow.phase_changed",
+            protocol::WorkflowPhaseChangedEvent {
+                workflow_id: workflow.workflow_id.clone(),
+                thread_id: workflow.thread_id.clone(),
+                old_phase,
+                new_phase,
+                forced: true,
+            },
+        );
+    }
+    emit_workflow_upsert(&state, workflow);
+
+    let mut rollback_errors = Vec::new();
+    for session_id in session_ids {
+        if let Err(error) = ChatService::stop(
+            Arc::clone(&state),
+            protocol::ChatStopParams {
+                thread_id: checkpoint.thread_id.clone(),
+                session_id,
+            },
+        )
+        .await
+        {
+            rollback_errors.push(error);
+        }
+    }
+
+    if rollback_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(rollback_errors.join("; "))
+    }
+}
+
 async fn mark_worker_failed(
     state: Arc<AppState>,
     workflow_id: &str,
@@ -1091,6 +1266,25 @@ async fn set_session_running(state: Arc<AppState>, session_id: &str) -> Result<(
 
     if let Some(workflow_id) = workflow_id {
         emit_workflow_state_delta(&state, &workflow_id).await;
+    }
+
+    Ok(())
+}
+
+async fn reconcile_bound_session_status(
+    state: Arc<AppState>,
+    session_id: &str,
+    chat_status: &protocol::ChatStatusResult,
+) -> Result<(), String> {
+    update_session_agent_status(
+        Arc::clone(&state),
+        session_id,
+        chat_status.agent_status.clone(),
+    )
+    .await?;
+
+    if chat_status.status == protocol::ChatSessionStatus::Ready {
+        set_session_running(state, session_id).await?;
     }
 
     Ok(())
@@ -1245,6 +1439,104 @@ enum SessionFailureUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_store::{AppData, StateStore};
+
+    fn make_test_state() -> Arc<AppState> {
+        let state_dir = std::env::temp_dir().join(format!(
+            "threadmill-workflow-tests-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create workflow test dir");
+        let state_path = state_dir.join("threads.json");
+        Arc::new(AppState::new(StateStore {
+            path: state_path,
+            data: AppData::default(),
+        }))
+    }
+
+    async fn insert_workflow_with_worker(
+        state: &Arc<AppState>,
+        workflow_id: &str,
+        worker_id: &str,
+        session_id: &str,
+    ) {
+        let mut store = state.workflows.lock().await;
+        store.data.workflows.push(PersistedWorkflow {
+            state: protocol::WorkflowState {
+                workflow_id: workflow_id.to_string(),
+                thread_id: "thread-1".to_string(),
+                phase: protocol::WorkflowPhase::Implementing,
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                completed_at: None,
+                prd_issue_url: None,
+                implementation_issue_urls: Vec::new(),
+                workers: vec![protocol::WorkflowWorker {
+                    worker_id: worker_id.to_string(),
+                    agent_name: "mock".to_string(),
+                    status: protocol::WorkflowWorkerStatus::Spawning,
+                    session_id: Some(session_id.to_string()),
+                    parent_session_id: None,
+                    display_name: None,
+                    created_at: Utc::now().to_rfc3339(),
+                    started_at: Some(Utc::now().to_rfc3339()),
+                    completed_at: None,
+                    stop_reason: None,
+                    handoff: None,
+                    failure_message: Some("stale error".to_string()),
+                    agent_status: None,
+                }],
+                reviewers: Vec::new(),
+                findings: Vec::new(),
+                review_started_at: None,
+            },
+            next_worker_index: 2,
+            next_reviewer_index: 1,
+            next_finding_index: 1,
+        });
+        store.save().expect("save workflow store");
+    }
+
+    async fn insert_workflow_with_reviewer(
+        state: &Arc<AppState>,
+        workflow_id: &str,
+        reviewer_id: &str,
+        session_id: &str,
+    ) {
+        let mut store = state.workflows.lock().await;
+        store.data.workflows.push(PersistedWorkflow {
+            state: protocol::WorkflowState {
+                workflow_id: workflow_id.to_string(),
+                thread_id: "thread-1".to_string(),
+                phase: protocol::WorkflowPhase::Reviewing,
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                completed_at: None,
+                prd_issue_url: None,
+                implementation_issue_urls: Vec::new(),
+                workers: Vec::new(),
+                reviewers: vec![protocol::WorkflowReviewer {
+                    reviewer_id: reviewer_id.to_string(),
+                    agent_name: "mock".to_string(),
+                    status: protocol::WorkflowWorkerStatus::Spawning,
+                    session_id: Some(session_id.to_string()),
+                    parent_session_id: None,
+                    display_name: None,
+                    created_at: Utc::now().to_rfc3339(),
+                    started_at: Some(Utc::now().to_rfc3339()),
+                    completed_at: None,
+                    failure_message: Some("stale error".to_string()),
+                    agent_status: None,
+                }],
+                findings: Vec::new(),
+                review_started_at: Some(Utc::now().to_rfc3339()),
+            },
+            next_worker_index: 1,
+            next_reviewer_index: 2,
+            next_finding_index: 1,
+        });
+        store.save().expect("save workflow store");
+    }
 
     #[test]
     fn invalid_transition_requires_force() {
@@ -1265,5 +1557,67 @@ mod tests {
             false,
         )
         .expect("fixing -> testing should be allowed");
+    }
+
+    #[tokio::test]
+    async fn reconcile_bound_session_status_marks_worker_running_when_chat_already_ready() {
+        let state = make_test_state();
+        insert_workflow_with_worker(&state, "wf-1", "W001", "session-1").await;
+
+        reconcile_bound_session_status(
+            Arc::clone(&state),
+            "session-1",
+            &protocol::ChatStatusResult {
+                session_id: "session-1".to_string(),
+                agent_type: "mock".to_string(),
+                status: protocol::ChatSessionStatus::Ready,
+                agent_status: protocol::AgentStatus::Busy,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at: Utc::now().to_rfc3339(),
+                display_name: None,
+                parent_session_id: None,
+            },
+        )
+        .await
+        .expect("reconcile ready worker session");
+
+        let store = state.workflows.lock().await;
+        let workflow = find_workflow_locked(&store, "wf-1").expect("workflow");
+        assert_eq!(workflow.workers[0].status, protocol::WorkflowWorkerStatus::Running);
+        assert_eq!(workflow.workers[0].failure_message, None);
+        assert_eq!(workflow.workers[0].agent_status, Some(protocol::AgentStatus::Busy));
+    }
+
+    #[tokio::test]
+    async fn reconcile_bound_session_status_marks_reviewer_running_when_chat_already_ready() {
+        let state = make_test_state();
+        insert_workflow_with_reviewer(&state, "wf-1", "R001", "session-1").await;
+
+        reconcile_bound_session_status(
+            Arc::clone(&state),
+            "session-1",
+            &protocol::ChatStatusResult {
+                session_id: "session-1".to_string(),
+                agent_type: "mock".to_string(),
+                status: protocol::ChatSessionStatus::Ready,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at: Utc::now().to_rfc3339(),
+                display_name: None,
+                parent_session_id: None,
+            },
+        )
+        .await
+        .expect("reconcile ready reviewer session");
+
+        let store = state.workflows.lock().await;
+        let workflow = find_workflow_locked(&store, "wf-1").expect("workflow");
+        assert_eq!(workflow.reviewers[0].status, protocol::WorkflowWorkerStatus::Running);
+        assert_eq!(workflow.reviewers[0].failure_message, None);
+        assert_eq!(workflow.reviewers[0].agent_status, Some(protocol::AgentStatus::Idle));
     }
 }

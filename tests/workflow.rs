@@ -22,7 +22,6 @@ async fn add_project(harness: &mut common::TestHarness) -> (common::TestProject,
         r#"#!/usr/bin/env python3
 import json
 import sys
-import time
 
 for raw in sys.stdin.buffer:
     text = raw.decode("utf-8", "replace").strip()
@@ -36,7 +35,6 @@ for raw in sys.stdin.buffer:
     rid = msg.get("id")
     method = msg.get("method")
     if method == "initialize":
-        time.sleep(0.2)
         result = {"protocolVersion": 1}
     elif method == "session/new":
         result = {
@@ -189,6 +187,50 @@ async fn wait_for_chat_ready(
             }
         }
     }
+}
+
+async fn assert_worker_status(
+    harness: &mut common::TestHarness,
+    workflow_id: &str,
+    worker_id: &str,
+    expected_status: &str,
+) {
+    let status = harness
+        .rpc("workflow.status", json!({ "workflow_id": workflow_id }))
+        .await
+        .expect("workflow.status for worker");
+    assert!(
+        status["workers"]
+            .as_array()
+            .expect("workers array")
+            .iter()
+            .any(|worker| {
+                worker["worker_id"] == worker_id && worker["status"] == expected_status
+            }),
+        "expected worker {worker_id} to be {expected_status}: {status}"
+    );
+}
+
+async fn assert_reviewer_status(
+    harness: &mut common::TestHarness,
+    workflow_id: &str,
+    reviewer_id: &str,
+    expected_status: &str,
+) {
+    let status = harness
+        .rpc("workflow.status", json!({ "workflow_id": workflow_id }))
+        .await
+        .expect("workflow.status for reviewer");
+    assert!(
+        status["reviewers"]
+            .as_array()
+            .expect("reviewers array")
+            .iter()
+            .any(|reviewer| {
+                reviewer["reviewer_id"] == reviewer_id && reviewer["status"] == expected_status
+            }),
+        "expected reviewer {reviewer_id} to be {expected_status}: {status}"
+    );
 }
 
 async fn cleanup_thread_project(harness: &mut common::TestHarness, thread_id: &str, project_id: &str) {
@@ -385,6 +427,7 @@ async fn workflow_spawn_worker_records_handoff_and_updates_on_external_end() {
     assert_eq!(first_worker["worker_id"], "W001");
 
     wait_for_chat_ready(&mut harness, &thread_id, &first_session_id).await;
+    assert_worker_status(&mut harness, &workflow_id, "W001", "RUNNING").await;
 
     let handoff = harness
         .rpc(
@@ -484,6 +527,133 @@ async fn workflow_spawn_worker_records_handoff_and_updates_on_external_end() {
 }
 
 #[tokio::test]
+async fn workflow_restart_reconciliation_keeps_idle_active_phase() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping workflow_restart_reconciliation_keeps_idle_active_phase: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+    let workflow_id = create_workflow(&mut harness, &thread_id).await;
+
+    harness
+        .rpc(
+            "workflow.transition",
+            json!({
+                "workflow_id": workflow_id,
+                "phase": "IMPLEMENTING"
+            }),
+        )
+        .await
+        .expect("transition workflow to IMPLEMENTING");
+
+    let config_home = harness.preserve_config_home();
+    drop(harness);
+
+    let mut harness = common::setup_test_server_with_config_home(config_home).await;
+    let snapshot = harness
+        .rpc("state.snapshot", json!({}))
+        .await
+        .expect("state.snapshot after restart");
+    let restarted = snapshot["workflows"]
+        .as_array()
+        .expect("workflows array after restart")
+        .iter()
+        .find(|workflow| workflow["workflow_id"] == workflow_id)
+        .cloned()
+        .expect("workflow in restarted snapshot");
+    assert_eq!(restarted["phase"], "IMPLEMENTING");
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn workflow_start_review_rolls_back_partial_reviewer_spawns_on_error() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping workflow_start_review_rolls_back_partial_reviewer_spawns_on_error: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+    let workflow_id = create_workflow(&mut harness, &thread_id).await;
+
+    harness
+        .rpc(
+            "workflow.transition",
+            json!({
+                "workflow_id": workflow_id,
+                "phase": "IMPLEMENTING"
+            }),
+        )
+        .await
+        .expect("transition workflow to IMPLEMENTING");
+    harness
+        .rpc(
+            "workflow.transition",
+            json!({
+                "workflow_id": workflow_id,
+                "phase": "TESTING"
+            }),
+        )
+        .await
+        .expect("transition workflow to TESTING");
+
+    let error = harness
+        .rpc_expect_error(
+            "workflow.start_review",
+            json!({
+                "workflow_id": workflow_id,
+                "reviewers": [
+                    {
+                        "agent_name": "mock",
+                        "parent_session_id": "orchestrator-session",
+                        "system_prompt": "Review worker output",
+                        "initial_prompt": "Review implementation",
+                        "display_name": "Reviewer: R001"
+                    },
+                    {
+                        "agent_name": "missing-agent",
+                        "parent_session_id": "orchestrator-session",
+                        "system_prompt": "Review worker output",
+                        "initial_prompt": "Review implementation",
+                        "display_name": "Reviewer: R002"
+                    }
+                ]
+            }),
+        )
+        .await;
+    assert!(error.contains("agent not found: missing-agent"));
+
+    let status = harness
+        .rpc("workflow.status", json!({ "workflow_id": workflow_id }))
+        .await
+        .expect("workflow.status after failed review start");
+    assert_eq!(status["phase"], "TESTING");
+    assert!(status["review_started_at"].is_null());
+
+    let reviewers = harness
+        .rpc("workflow.list_reviewers", json!({ "workflow_id": workflow_id }))
+        .await
+        .expect("workflow.list_reviewers after failed review start");
+    assert!(reviewers
+        .as_array()
+        .expect("reviewers array from workflow.list_reviewers")
+        .is_empty());
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
 async fn workflow_review_records_findings_and_reconciles_after_restart() {
     if !common::tmux_available().await {
         eprintln!(
@@ -542,6 +712,7 @@ async fn workflow_review_records_findings_and_reconciles_after_restart() {
         .expect("reviewer session id")
         .to_string();
     wait_for_chat_ready(&mut harness, &thread_id, &reviewer_session_id).await;
+    assert_reviewer_status(&mut harness, &workflow_id, "R001", "RUNNING").await;
 
     let reviewers = harness
         .rpc("workflow.list_reviewers", json!({ "workflow_id": workflow_id }))
