@@ -279,8 +279,7 @@ async fn wait_for_injection_complete(
             .wait_for_event("chat.injection_complete", Duration::from_secs(10))
             .await
             .expect("chat.injection_complete");
-        if event["params"]["thread_id"] == thread_id
-            && event["params"]["session_id"] == session_id
+        if event["params"]["thread_id"] == thread_id && event["params"]["session_id"] == session_id
         {
             return;
         }
@@ -294,6 +293,15 @@ fn chat_history_path(thread_id: &str, session_id: &str) -> std::path::PathBuf {
         .join("chat")
         .join(thread_id)
         .join(format!("{session_id}.jsonl"))
+}
+
+fn chat_metadata_path(thread_id: &str, session_id: &str) -> std::path::PathBuf {
+    let config_home = std::env::var("XDG_CONFIG_HOME").expect("XDG_CONFIG_HOME set by harness");
+    std::path::Path::new(&config_home)
+        .join("threadmill")
+        .join("chat")
+        .join(thread_id)
+        .join(format!("{session_id}.metadata.json"))
 }
 
 #[tokio::test]
@@ -597,6 +605,11 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
     rewritten.extend(lines.map(str::to_string));
     std::fs::write(&history_path, format!("{}\n", rewritten.join("\n")))
         .expect("rewrite chat history without ACP session id");
+    std::fs::write(
+        chat_metadata_path(&thread_id, &session_id),
+        "{\"acp_session_id\":null}\n",
+    )
+    .expect("rewrite chat metadata without ACP session id");
 
     drop(harness);
 
@@ -637,9 +650,7 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .expect("read mock chat agent log");
     let log_entries = agent_log
         .lines()
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).expect("parse agent log entry")
-        })
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse agent log entry"))
         .collect::<Vec<_>>();
     let session_new_count = log_entries
         .iter()
@@ -649,8 +660,14 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .iter()
         .filter(|entry| entry["method"] == "session/load")
         .count();
-    assert_eq!(session_new_count, 2, "start + recovery load should both use session/new");
-    assert_eq!(session_load_count, 0, "missing ACP session id must not use session/load");
+    assert_eq!(
+        session_new_count, 2,
+        "start + recovery load should both use session/new"
+    );
+    assert_eq!(
+        session_load_count, 0,
+        "missing ACP session id must not use session/load"
+    );
     assert!(log_entries.iter().any(|entry| {
         entry["method"] == "session/prompt"
             && entry["params"]["prompt"]

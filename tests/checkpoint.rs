@@ -901,6 +901,170 @@ async fn checkpoint_restore_reloads_chat_from_truncated_context_only() {
 }
 
 #[tokio::test]
+async fn checkpoint_restore_restart_before_load_uses_session_new() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping checkpoint_restore_restart_before_load_uses_session_new: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_chat_project(&mut harness).await;
+    let created = create_thread(&mut harness, &project_id).await;
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = PathBuf::from(created["worktree_path"].as_str().expect("worktree path"));
+
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({ "thread_id": &thread_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({ "thread_id": &thread_id, "session_id": &session_id }),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel id") as u16;
+
+    send_test_update(&mut harness, channel_id, "history-before-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-before-checkpoint",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for first history marker");
+
+    harness
+        .rpc(
+            "checkpoint.save",
+            json!({
+                "thread_id": &thread_id,
+                "session_id": &session_id,
+                "message": "checkpoint before restart"
+            }),
+        )
+        .await
+        .expect("checkpoint.save");
+
+    send_test_update(&mut harness, channel_id, "history-after-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-after-checkpoint",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for second history marker");
+
+    harness
+        .rpc(
+            "checkpoint.restore",
+            json!({ "thread_id": &thread_id, "seq": 1 }),
+        )
+        .await
+        .expect("checkpoint.restore");
+
+    let config_home = harness.preserve_config_home();
+    harness.preserve_path(&project.root_dir);
+    drop(harness);
+
+    let mut recovered = common::setup_test_server_with_config_home(config_home).await;
+    recovered.register_cleanup_path(project.root_dir.clone());
+
+    let listed = recovered
+        .rpc("chat.list", json!({ "thread_id": &thread_id }))
+        .await
+        .expect("chat.list after restore restart");
+    assert!(listed
+        .as_array()
+        .expect("chat.list array")
+        .iter()
+        .any(|entry| entry["session_id"] == session_id));
+
+    let loaded = recovered
+        .rpc(
+            "chat.load",
+            json!({ "thread_id": &thread_id, "session_id": &session_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.load after restart");
+    assert_eq!(loaded["status"], "starting");
+    wait_for_chat_ready(&mut recovered, &thread_id, &session_id).await;
+
+    let reattached = recovered
+        .rpc(
+            "chat.attach",
+            json!({ "thread_id": &thread_id, "session_id": &session_id }),
+        )
+        .await
+        .expect("chat.attach after restart load");
+    let reattached_channel_id = reattached["channel_id"].as_u64().expect("channel id") as u16;
+
+    send_user_prompt(
+        &mut recovered,
+        reattached_channel_id,
+        &session_id,
+        "resume from checkpoint after restart",
+    )
+    .await;
+
+    let log_entries = wait_for_mock_chat_agent_log(&worktree_path, |entries| {
+        entries
+            .iter()
+            .any(|entry| entry["method"] == "session/prompt")
+    })
+    .await;
+
+    let session_new_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/new")
+        .count();
+    let session_load_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/load")
+        .count();
+    assert!(
+        session_new_count >= 2,
+        "restore flow should use session/new before and after daemon restart"
+    );
+    assert_eq!(
+        session_load_count, 0,
+        "restored session must not use session/load after daemon restart"
+    );
+
+    let injected_prompt = log_entries
+        .iter()
+        .rev()
+        .find(|entry| entry["method"] == "session/prompt")
+        .and_then(|entry| entry["params"]["prompt"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    assert!(injected_prompt.contains("<conversation-history>"));
+    assert!(injected_prompt.contains("history-before-checkpoint"));
+    assert!(!injected_prompt.contains("history-after-checkpoint"));
+    assert!(injected_prompt.contains("resume from checkpoint after restart"));
+
+    cleanup_thread_project(&mut recovered, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
 async fn thread_hide_cleans_checkpoint_refs() {
     if !common::tmux_available().await {
         eprintln!("skipping thread_hide_cleans_checkpoint_refs: tmux unavailable");

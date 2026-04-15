@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -113,6 +114,11 @@ struct HandshakeResult {
     model_id: Option<String>,
     /// Notifications collected during session/load replay. Empty for session/new.
     replay_notifications: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedChatSessionMetadata {
+    acp_session_id: Option<String>,
 }
 
 impl ChatService {
@@ -349,6 +355,14 @@ impl ChatService {
         };
         let history_path = history_path_for_session(&history_root, thread_id, session_id);
         let conversation_context = build_conversation_context(&history_path, None);
+        if let Err(error) = persist_session_metadata(&history_root, thread_id, session_id, None) {
+            warn!(
+                thread_id,
+                session_id,
+                error = %error,
+                "failed to persist restored chat session metadata"
+            );
+        }
 
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
@@ -1358,38 +1372,21 @@ fn apply_inbound_status_updates(
                 .and_then(|params| params.get("sessionId"))
                 .cloned()
                 .unwrap_or_else(|| Value::String(String::new()));
-            let original_prompt_text = extract_prompt_text_from_params(params);
             let prompt_preview = prompt_preview_from_params(params);
+            let prompt_updates = user_prompt_history_updates(session_id_value.clone(), params);
 
             if let Some(id) = request_id_key(message.get("id")) {
                 session.pending_prompt_ids.insert(id);
             }
 
             if let Some(conversation_context) = session.conversation_context.take() {
-                let combined_prompt =
-                    format!("{conversation_context}\n\n---\n\n{original_prompt_text}");
-                if rewrite_prompt_text_message(message, &combined_prompt) {
+                let context_block = format!("{conversation_context}\n\n---\n\n");
+                if prepend_prompt_text_block(message, &context_block) {
                     payload_rewritten = true;
                 }
-                history_updates.push(user_prompt_history_update(
-                    session_id_value.clone(),
-                    &original_prompt_text,
-                ));
-            } else {
-                // Persist user prompt as a synthetic userMessageChunk for history hydration.
-                // ACP session/prompt params: { sessionId, prompt: [{ type: "text", text: "..." }] }
-                if let Some(prompt_array) = params
-                    .and_then(|params| params.get("prompt"))
-                    .and_then(Value::as_array)
-                {
-                    for block in prompt_array {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            history_updates
-                                .push(user_prompt_history_update(session_id_value.clone(), text));
-                        }
-                    }
-                }
             }
+
+            history_updates.extend(prompt_updates);
 
             session.checkpoint_seq += 1;
             auto_checkpoints.push(AutoCheckpointRequest {
@@ -1466,7 +1463,7 @@ fn prompt_preview_from_params(params: Option<&Value>) -> Option<String> {
     Some(preview)
 }
 
-fn extract_prompt_text_from_params(params: Option<&Value>) -> String {
+fn user_prompt_history_updates(session_id_value: Value, params: Option<&Value>) -> Vec<Value> {
     params
         .and_then(|params| params.get("prompt"))
         .and_then(Value::as_array)
@@ -1474,12 +1471,13 @@ fn extract_prompt_text_from_params(params: Option<&Value>) -> String {
             prompt
                 .iter()
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<String>()
+                .map(|text| user_prompt_history_update(session_id_value.clone(), text))
+                .collect()
         })
         .unwrap_or_default()
 }
 
-fn rewrite_prompt_text_message(message: &mut Value, prompt_text: &str) -> bool {
+fn prepend_prompt_text_block(message: &mut Value, prompt_text: &str) -> bool {
     let Some(message_object) = message.as_object_mut() else {
         return false;
     };
@@ -1489,10 +1487,15 @@ fn rewrite_prompt_text_message(message: &mut Value, prompt_text: &str) -> bool {
     let Some(params_object) = params.as_object_mut() else {
         return false;
     };
-    params_object.insert(
-        "prompt".to_string(),
-        json!([{ "type": "text", "text": prompt_text }]),
-    );
+    let prompt = params_object
+        .entry("prompt".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+
+    if let Some(prompt_array) = prompt.as_array_mut() {
+        prompt_array.insert(0, json!({ "type": "text", "text": prompt_text }));
+    } else {
+        *prompt = json!([{ "type": "text", "text": prompt_text }]);
+    }
     true
 }
 
@@ -1866,6 +1869,23 @@ async fn mark_session_ready(
     handshake: &HandshakeResult,
 ) {
     tracing::info!(thread_id, session_id, model = ?handshake.model_id, "chat_session_ready");
+    let history_root = {
+        let chat = state.chat.lock().await;
+        chat.history_root.clone()
+    };
+    if let Err(error) = persist_session_metadata(
+        &history_root,
+        thread_id,
+        session_id,
+        Some(handshake.acp_session_id.as_str()),
+    ) {
+        warn!(
+            thread_id,
+            session_id,
+            error = %error,
+            "failed to persist chat session metadata"
+        );
+    }
     {
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
@@ -2126,6 +2146,75 @@ pub(crate) fn history_path_for_session(
     history_root
         .join(thread_id)
         .join(format!("{session_id}.jsonl"))
+}
+
+fn history_metadata_path_for_session(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> PathBuf {
+    history_root
+        .join(thread_id)
+        .join(format!("{session_id}.metadata.json"))
+}
+
+fn persist_session_metadata(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+    acp_session_id: Option<&str>,
+) -> Result<(), String> {
+    let metadata_path = history_metadata_path_for_session(history_root, thread_id, session_id);
+    let parent = metadata_path.parent().ok_or_else(|| {
+        format!(
+            "invalid chat session metadata path: {}",
+            metadata_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+
+    let metadata = PersistedChatSessionMetadata {
+        acp_session_id: acp_session_id.map(ToOwned::to_owned),
+    };
+    let mut file = fs::File::create(&metadata_path)
+        .map_err(|err| format!("failed to create {}: {err}", metadata_path.display()))?;
+    serde_json::to_writer(&mut file, &metadata)
+        .map_err(|err| format!("failed to encode {}: {err}", metadata_path.display()))?;
+    file.write_all(b"\n")
+        .map_err(|err| format!("failed to finalize {}: {err}", metadata_path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("failed to fsync {}: {err}", metadata_path.display()))
+}
+
+fn read_persisted_session_metadata(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<Option<PersistedChatSessionMetadata>, String> {
+    let metadata_path = history_metadata_path_for_session(history_root, thread_id, session_id);
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+
+    let file = fs::File::open(&metadata_path)
+        .map_err(|err| format!("failed to open {}: {err}", metadata_path.display()))?;
+    let reader = BufReader::new(file);
+    serde_json::from_reader(reader)
+        .map(Some)
+        .map_err(|err| format!("failed to parse {}: {err}", metadata_path.display()))
+}
+
+fn read_history_acp_session_id(history_path: &Path) -> Option<String> {
+    fs::File::open(history_path).ok().and_then(|file| {
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .next()?
+            .ok()
+            .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+            .and_then(|value| value.get("sessionId")?.as_str().map(ToOwned::to_owned))
+    })
 }
 
 fn is_safe_history_component(value: &str) -> bool {
@@ -2767,17 +2856,25 @@ fn discover_history_sessions(
                 .unwrap_or_else(Utc::now)
                 .to_rfc3339();
 
-            // Extract the ACP session ID from the first JSONL entry.
-            // Updates are persisted before session ID rewriting, so the
-            // sessionId field contains the agent-side ACP session ID.
-            let acp_session_id = fs::File::open(&path)
-                .ok()
-                .and_then(|file| {
-                    let reader = BufReader::new(file);
-                    reader.lines().next()?.ok()
-                })
-                .and_then(|line| serde_json::from_str::<Value>(&line).ok())
-                .and_then(|value| value.get("sessionId")?.as_str().map(ToOwned::to_owned));
+            let acp_session_id =
+                match read_persisted_session_metadata(history_root, &thread_id, stem) {
+                    Ok(Some(metadata)) => metadata.acp_session_id,
+                    Ok(None) => {
+                        // Legacy sessions derive ACP session ID from first JSONL entry.
+                        // Restored sessions persist metadata with acp_session_id = null so
+                        // recovery durably falls back to session/new after daemon restart.
+                        read_history_acp_session_id(&path)
+                    }
+                    Err(error) => {
+                        warn!(
+                            thread_id,
+                            session_id = stem,
+                            error = %error,
+                            "failed to read persisted chat session metadata"
+                        );
+                        read_history_acp_session_id(&path)
+                    }
+                };
 
             recovered.push(ChatSessionRuntime {
                 summary: protocol::ChatSessionSummary {
@@ -3091,7 +3188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_prompt_injects_conversation_context_once_and_persists_original_prompt() {
+    async fn inbound_prompt_prepends_context_block_and_persists_original_text_blocks() {
         let state = make_test_state();
         let mut session = make_test_session();
         session.conversation_context = Some("prior context".to_string());
@@ -3102,7 +3199,11 @@ mod tests {
             "method": "session/prompt",
             "params": {
                 "sessionId": "session-1",
-                "prompt": [{"type": "text", "text": "new prompt"}]
+                "prompt": [
+                    {"type": "text", "text": "first block"},
+                    {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}},
+                    {"type": "text", "text": "second block"}
+                ]
             }
         });
 
@@ -3114,20 +3215,34 @@ mod tests {
             serde_json::from_slice(&replacement_payload).expect("parse replacement payload");
         assert_eq!(
             rewritten["params"]["prompt"],
-            json!([{
-                "type": "text",
-                "text": "prior context\n\n---\n\nnew prompt"
-            }])
+            json!([
+                {
+                    "type": "text",
+                    "text": "prior context\n\n---\n\n"
+                },
+                {"type": "text", "text": "first block"},
+                {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}},
+                {"type": "text", "text": "second block"}
+            ])
         );
         assert_eq!(
             prompt_updates,
-            vec![json!({
-                "sessionId": "session-1",
-                "update": {
-                    "sessionUpdate": "user_message_chunk",
-                    "content": { "type": "text", "text": "new prompt" }
-                }
-            })]
+            vec![
+                json!({
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": { "type": "text", "text": "first block" }
+                    }
+                }),
+                json!({
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": { "type": "text", "text": "second block" }
+                    }
+                })
+            ]
         );
         assert_eq!(session.conversation_context, None);
 
@@ -3135,7 +3250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_binary_frame_forwards_combined_prompt_but_persists_original_history() {
+    async fn handle_binary_frame_prepends_context_block_but_persists_original_history() {
         let state = make_test_state();
         let (temp_root, history_path) = write_history_file(&[]);
         let mut session = make_test_session();
@@ -3171,10 +3286,13 @@ mod tests {
         assert_eq!(rewritten["params"]["sessionId"], "acp-session-1");
         assert_eq!(
             rewritten["params"]["prompt"],
-            json!([{
-                "type": "text",
-                "text": "prior context\n\n---\n\nnew prompt"
-            }])
+            json!([
+                {
+                    "type": "text",
+                    "text": "prior context\n\n---\n\n"
+                },
+                {"type": "text", "text": "new prompt"}
+            ])
         );
 
         let persisted = fs::read_to_string(&history_path).expect("read persisted history");
@@ -3184,6 +3302,59 @@ mod tests {
             serde_json::from_str(persisted_lines[0]).expect("parse history entry");
         assert_eq!(persisted_entry["sessionId"], "session-1");
         assert_eq!(persisted_entry["update"]["content"]["text"], "new prompt");
+
+        cancel_registered_stall_timer(&state, "session-1").await;
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn handle_binary_frame_preserves_non_text_prompt_blocks_when_context_injected() {
+        let state = make_test_state();
+        let (temp_root, history_path) = write_history_file(&[]);
+        let mut session = make_test_session();
+        session.history_path = history_path.clone();
+        session.conversation_context = Some("prior context".to_string());
+
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 9, session).await;
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "image", "source": {"mediaType": "image/png", "data": "abc"}}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let handled = ChatService::handle_binary_frame(Arc::clone(&state), 9, payload)
+            .await
+            .expect("handle binary frame");
+
+        assert!(handled);
+
+        let forwarded = input_rx.recv().await.expect("forwarded payload");
+        let rewritten: Value = serde_json::from_slice(&forwarded).expect("parse forwarded payload");
+        assert_eq!(rewritten["params"]["sessionId"], "acp-session-1");
+        assert_eq!(
+            rewritten["params"]["prompt"],
+            json!([
+                {
+                    "type": "text",
+                    "text": "prior context\n\n---\n\n"
+                },
+                {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}}
+            ])
+        );
+
+        let persisted = fs::read_to_string(&history_path).expect("read persisted history");
+        assert!(persisted.is_empty());
 
         cancel_registered_stall_timer(&state, "session-1").await;
         let _ = fs::remove_dir_all(temp_root);
@@ -3276,10 +3447,111 @@ mod tests {
         ChatService::prepare_restored_session_context(Arc::clone(&state), "thread-1", &session_id)
             .await;
 
+        let metadata = read_persisted_session_metadata(&history_root, "thread-1", &session_id)
+            .expect("read restored session metadata")
+            .expect("restored session metadata");
+        assert_eq!(metadata.acp_session_id, None);
+
         let chat = state.chat.lock().await;
         let session = chat.sessions.get(&session_id).expect("registered session");
         assert_eq!(session.acp_session_id, None);
         assert_eq!(session.conversation_context, expected_context);
+    }
+
+    #[tokio::test]
+    async fn mark_session_ready_persists_acp_session_metadata() {
+        let state = make_test_state();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let history_path = history_path_for_session(&history_root, "thread-1", &session_id);
+        fs::create_dir_all(history_path.parent().expect("history parent"))
+            .expect("create history dir");
+
+        let mut session = make_test_session();
+        session.summary.session_id = session_id.clone();
+        session.history_path = history_path;
+        register_test_session(&state, 10, session).await;
+
+        let handshake = HandshakeResult {
+            acp_session_id: "acp-session-2".to_string(),
+            modes: None,
+            models: None,
+            config_options: None,
+            title: Some("Recovered title".to_string()),
+            model_id: Some("model-2".to_string()),
+            replay_notifications: Vec::new(),
+        };
+
+        mark_session_ready(Arc::clone(&state), "thread-1", &session_id, &handshake).await;
+
+        let metadata = read_persisted_session_metadata(&history_root, "thread-1", &session_id)
+            .expect("read ready session metadata")
+            .expect("ready session metadata");
+        assert_eq!(metadata.acp_session_id.as_deref(), Some("acp-session-2"));
+    }
+
+    #[tokio::test]
+    async fn recover_persisted_sessions_respects_restored_metadata_without_acp_session() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "spindle-chat-recovery-restored-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_dir = temp_root.join("threadmill");
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let thread_id = "thread-recovery".to_string();
+        let session_id = "session-recovery".to_string();
+        let history_root = state_dir.join("chat");
+        let history_path = history_path_for_session(&history_root, &thread_id, &session_id);
+        fs::create_dir_all(
+            history_path
+                .parent()
+                .expect("history path should have parent"),
+        )
+        .expect("create history parent dir");
+        fs::write(
+            &history_path,
+            "{\"sessionId\":\"acp-session-1\",\"update\":{\"kind\":\"agent_message_chunk\",\"content\":\"hello\"}}\n",
+        )
+        .expect("write persisted history");
+        persist_session_metadata(&history_root, &thread_id, &session_id, None)
+            .expect("persist restored metadata");
+
+        let state = Arc::new(AppState::new(StateStore {
+            path: state_dir.join("threads.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: thread_id.clone(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Closed,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }));
+
+        ChatService::recover_persisted_sessions(Arc::clone(&state))
+            .await
+            .expect("recover persisted sessions");
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id, None);
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[tokio::test]
