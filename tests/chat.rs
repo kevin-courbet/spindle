@@ -1,6 +1,6 @@
 mod common;
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use serde_json::json;
 
@@ -21,6 +21,7 @@ async fn add_project(harness: &mut common::TestHarness) -> (common::TestProject,
         project.repo_path.join("mock-chat-agent.sh"),
         r#"#!/usr/bin/env python3
 import json
+import os
 import sys
 import time
 
@@ -35,6 +36,11 @@ for raw in sys.stdin.buffer:
 
     rid = msg.get("id")
     method = msg.get("method")
+    with open(os.path.join(os.getcwd(), "mock-chat-agent-log.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "method": method,
+            "params": msg.get("params"),
+        }) + "\n")
     if method == "initialize":
         time.sleep(0.2)
         result = {"protocolVersion": 1}
@@ -156,6 +162,35 @@ async fn create_thread(harness: &mut common::TestHarness, project_id: &str) -> S
         .to_string()
 }
 
+async fn create_thread_with_worktree(
+    harness: &mut common::TestHarness,
+    project_id: &str,
+) -> (String, PathBuf) {
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("chat"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create thread");
+
+    (
+        created["id"]
+            .as_str()
+            .expect("thread id in create response")
+            .to_string(),
+        PathBuf::from(
+            created["worktree_path"]
+                .as_str()
+                .expect("worktree path in create response"),
+        ),
+    )
+}
+
 async fn wait_for_thread_ready(harness: &mut common::TestHarness, thread_id: &str) {
     loop {
         let event = harness
@@ -232,6 +267,24 @@ async fn send_test_update(harness: &mut common::TestHarness, channel_id: u16, ma
         .send_binary(channel_id, format!("{}\n", request).as_bytes())
         .await
         .expect("send test update request");
+}
+
+async fn wait_for_injection_complete(
+    harness: &mut common::TestHarness,
+    thread_id: &str,
+    session_id: &str,
+) {
+    loop {
+        let event = harness
+            .wait_for_event("chat.injection_complete", Duration::from_secs(10))
+            .await
+            .expect("chat.injection_complete");
+        if event["params"]["thread_id"] == thread_id
+            && event["params"]["session_id"] == session_id
+        {
+            return;
+        }
+    }
 }
 
 fn chat_history_path(thread_id: &str, session_id: &str) -> std::path::PathBuf {
@@ -463,6 +516,152 @@ async fn chat_load_restarts_archived_session() {
     wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping chat_load_recovers_session_without_acp_session_id_via_session_new: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_project(&mut harness).await;
+    let (thread_id, worktree_path) = create_thread_with_worktree(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({"thread_id": thread_id, "agent_name": "mock"}),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel_id") as u16;
+
+    send_test_update(&mut harness, channel_id, "persisted-before-recovery").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"persisted-before-recovery",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for persisted output");
+
+    harness
+        .rpc(
+            "chat.stop",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.stop");
+    harness
+        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .await
+        .expect("chat.session_ended");
+
+    let config_home = harness.preserve_config_home();
+    harness.preserve_path(&project.root_dir);
+    std::fs::write(
+        config_home.join("threadmill").join("system-prompt.md"),
+        "platform prompt marker\n",
+    )
+    .expect("write system prompt");
+    let history_path = chat_history_path(&thread_id, &session_id);
+    let history = std::fs::read_to_string(&history_path).expect("read chat history");
+    let mut lines = history.lines();
+    let first_line = lines.next().expect("history first line");
+    let mut first_entry: serde_json::Value =
+        serde_json::from_str(first_line).expect("parse history first line");
+    first_entry
+        .as_object_mut()
+        .expect("history entry object")
+        .remove("sessionId");
+    let mut rewritten = vec![serde_json::to_string(&first_entry).expect("serialize history entry")];
+    rewritten.extend(lines.map(str::to_string));
+    std::fs::write(&history_path, format!("{}\n", rewritten.join("\n")))
+        .expect("rewrite chat history without ACP session id");
+
+    drop(harness);
+
+    let mut recovered = common::setup_test_server_with_config_home(config_home).await;
+    recovered.register_cleanup_path(project.root_dir.clone());
+    let listed = recovered
+        .rpc("chat.list", json!({"thread_id": thread_id}))
+        .await
+        .expect("chat.list after recovery");
+    assert!(listed
+        .as_array()
+        .expect("chat.list array")
+        .iter()
+        .any(|entry| entry["session_id"] == session_id));
+
+    let loaded = recovered
+        .rpc(
+            "chat.load",
+            json!({"thread_id": thread_id, "session_id": session_id, "agent_name": "mock"}),
+        )
+        .await
+        .expect("chat.load");
+    assert_eq!(loaded["session_id"], session_id);
+    assert_eq!(loaded["status"], "starting");
+    wait_for_chat_ready(&mut recovered, &thread_id, &session_id).await;
+    wait_for_injection_complete(&mut recovered, &thread_id, &session_id).await;
+
+    let reattached = recovered
+        .rpc(
+            "chat.attach",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.attach after recovery load");
+    assert_eq!(reattached["acp_session_id"], "acp-session-1");
+
+    let agent_log = std::fs::read_to_string(worktree_path.join("mock-chat-agent-log.jsonl"))
+        .expect("read mock chat agent log");
+    let log_entries = agent_log
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("parse agent log entry")
+        })
+        .collect::<Vec<_>>();
+    let session_new_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/new")
+        .count();
+    let session_load_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/load")
+        .count();
+    assert_eq!(session_new_count, 2, "start + recovery load should both use session/new");
+    assert_eq!(session_load_count, 0, "missing ACP session id must not use session/load");
+    assert!(log_entries.iter().any(|entry| {
+        entry["method"] == "session/prompt"
+            && entry["params"]["prompt"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|block| block["text"].as_str())
+                .any(|text| text.contains("platform prompt marker"))
+    }));
+
+    cleanup_thread_project(&mut recovered, &thread_id, &project_id).await;
 }
 
 #[tokio::test]

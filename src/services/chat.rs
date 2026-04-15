@@ -56,6 +56,7 @@ struct ChatSessionRuntime {
     parent_session_id: Option<String>,
     system_prompt: Option<String>,
     initial_prompt: Option<String>,
+    conversation_context: Option<String>,
     acp_session_id: Option<String>,
     attached_channels: HashSet<u16>,
     input_tx: Option<mpsc::Sender<Vec<u8>>>,
@@ -145,6 +146,7 @@ impl ChatService {
                 parent_session_id: params.parent_session_id.clone(),
                 system_prompt: params.system_prompt.clone(),
                 initial_prompt: params.initial_prompt.clone(),
+                conversation_context: None,
                 acp_session_id: None,
                 attached_channels: HashSet::new(),
                 input_tx: None,
@@ -207,7 +209,7 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatLoadParams,
     ) -> Result<protocol::ChatLoadResult, String> {
-        let (agent_type, acp_session_id, stop_tx) = {
+        let (agent_type, load_session_id, stop_tx, history_path) = {
             let mut chat = state.chat.lock().await;
             let session = chat
                 .sessions
@@ -226,15 +228,31 @@ impl ChatService {
                 });
             }
 
-            let acp_session_id = session.acp_session_id.clone().ok_or_else(|| {
-                format!("chat session {} has no ACP session id", params.session_id)
-            })?;
+            let load_session_id = session.acp_session_id.clone();
             session.summary.status = protocol::ChatSessionStatus::Starting;
             session.input_tx = None;
             let stop_tx = session.stop_tx.take();
             session.ended_emitted = false;
-            (session.summary.agent_type.clone(), acp_session_id, stop_tx)
+            (
+                session.summary.agent_type.clone(),
+                load_session_id,
+                stop_tx,
+                session.history_path.clone(),
+            )
         };
+
+        let conversation_context = if load_session_id.is_none() {
+            build_conversation_context(&history_path, None)
+        } else {
+            None
+        };
+
+        {
+            let mut chat = state.chat.lock().await;
+            if let Some(session) = chat.sessions.get_mut(&params.session_id) {
+                session.conversation_context = conversation_context;
+            }
+        }
 
         if let Some(stop_tx) = stop_tx {
             let _ = stop_tx.send(());
@@ -264,7 +282,7 @@ impl ChatService {
             project_path,
             command,
             cwd,
-            Some(acp_session_id),
+            load_session_id,
             preferred_model.clone(),
         );
 
@@ -489,7 +507,7 @@ impl ChatService {
         channel_id: u16,
         payload: Vec<u8>,
     ) -> Result<bool, String> {
-        let (input_tx, transitions, prompt_updates, mut auto_checkpoints, history_path) = {
+        let (input_tx, transitions, replacement_payload, prompt_updates, mut auto_checkpoints, history_path) = {
             let mut chat = state.chat.lock().await;
             let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
                 return Ok(false);
@@ -507,11 +525,12 @@ impl ChatService {
                 .clone();
             let history_path = session.history_path.clone();
             let messages = extract_json_messages(&mut session.input_buffer, &payload, "input");
-            let (transitions, prompt_updates, auto_checkpoints) =
+            let (transitions, replacement_payload, prompt_updates, auto_checkpoints) =
                 apply_inbound_status_updates(&state, session, messages);
             (
                 input_tx,
                 transitions,
+                replacement_payload,
                 prompt_updates,
                 auto_checkpoints,
                 history_path,
@@ -549,12 +568,14 @@ impl ChatService {
 
         // Rewrite Spindle session ID to ACP session ID in the payload
         // so the agent receives its own session ID namespace
+        let outbound_payload = replacement_payload.unwrap_or(payload);
+
         let rewritten_payload = {
             let chat = state.chat.lock().await;
             if let Some(sid) = chat.channel_to_session.get(&channel_id) {
                 if let Some(session) = chat.sessions.get(sid) {
                     if let Some(ref acp_id) = session.acp_session_id {
-                        rewrite_session_id(&payload, sid, acp_id)
+                        rewrite_session_id(&outbound_payload, sid, acp_id)
                     } else {
                         None
                     }
@@ -565,7 +586,7 @@ impl ChatService {
                 None
             }
         };
-        let final_payload = rewritten_payload.unwrap_or(payload);
+        let final_payload = rewritten_payload.unwrap_or(outbound_payload);
 
         if let Ok(s) = std::str::from_utf8(&final_payload) {
             warn!(
@@ -1280,50 +1301,68 @@ fn apply_inbound_status_updates(
     messages: Vec<Value>,
 ) -> (
     Vec<StatusTransition>,
+    Option<Vec<u8>>,
     Vec<Value>,
     Vec<AutoCheckpointRequest>,
 ) {
     let mut transitions = Vec::new();
+    let mut messages = messages;
+    let mut replacement_payload = None;
+    let mut payload_rewritten = false;
     let mut history_updates = Vec::new();
     let mut auto_checkpoints = Vec::new();
 
-    for message in messages {
+    for message in &mut messages {
         let method = message
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
 
         if method == CHAT_PROMPT_METHOD {
+            let params = message.get("params");
+            let session_id_value = params
+                .and_then(|params| params.get("sessionId"))
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new()));
+            let original_prompt_text = extract_prompt_text_from_params(params);
+            let prompt_preview = prompt_preview_from_params(params);
+
             if let Some(id) = request_id_key(message.get("id")) {
                 session.pending_prompt_ids.insert(id);
             }
-            // Persist user prompt as a synthetic userMessageChunk for history hydration.
-            // ACP session/prompt params: { sessionId, prompt: [{ type: "text", text: "..." }] }
-            if let Some(params) = message.get("params") {
-                let session_id_value = params
-                    .get("sessionId")
-                    .cloned()
-                    .unwrap_or_else(|| Value::String(String::new()));
-                if let Some(prompt_array) = params.get("prompt").and_then(Value::as_array) {
+
+            if let Some(conversation_context) = session.conversation_context.take() {
+                let combined_prompt = format!(
+                    "{conversation_context}\n\n---\n\n{original_prompt_text}"
+                );
+                if rewrite_prompt_text_message(message, &combined_prompt) {
+                    payload_rewritten = true;
+                }
+                history_updates.push(user_prompt_history_update(
+                    session_id_value.clone(),
+                    &original_prompt_text,
+                ));
+            } else {
+                // Persist user prompt as a synthetic userMessageChunk for history hydration.
+                // ACP session/prompt params: { sessionId, prompt: [{ type: "text", text: "..." }] }
+                if let Some(prompt_array) = params.and_then(|params| params.get("prompt")).and_then(Value::as_array) {
                     for block in prompt_array {
                         if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            history_updates.push(json!({
-                                "sessionId": session_id_value,
-                                "update": {
-                                    "sessionUpdate": "user_message_chunk",
-                                    "content": { "type": "text", "text": text }
-                                }
-                            }));
+                            history_updates.push(user_prompt_history_update(
+                                session_id_value.clone(),
+                                text,
+                            ));
                         }
                     }
                 }
             }
+
             session.checkpoint_seq += 1;
             auto_checkpoints.push(AutoCheckpointRequest {
                 thread_id: session.thread_id.clone(),
                 session_id: session.summary.session_id.clone(),
                 message: format!("Auto-checkpoint before prompt {}", session.checkpoint_seq),
-                prompt_preview: prompt_preview_from_message(&message),
+                prompt_preview,
                 history_cursor: None, // filled in by handle_inbound_data before JSONL write
             });
             session.active_tools.clear();
@@ -1338,7 +1377,11 @@ fn apply_inbound_status_updates(
         }
     }
 
-    (transitions, history_updates, auto_checkpoints)
+    if payload_rewritten {
+        replacement_payload = serialize_json_messages(&messages);
+    }
+
+    (transitions, replacement_payload, history_updates, auto_checkpoints)
 }
 
 fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
@@ -1360,9 +1403,8 @@ fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
     });
 }
 
-fn prompt_preview_from_message(message: &Value) -> Option<String> {
-    let prompt = message
-        .get("params")
+fn prompt_preview_from_params(params: Option<&Value>) -> Option<String> {
+    let prompt = params
         .and_then(|params| params.get("prompt"))
         .and_then(Value::as_array)?;
     let preview = prompt
@@ -1383,6 +1425,55 @@ fn prompt_preview_from_message(message: &Value) -> Option<String> {
         preview.push('…');
     }
     Some(preview)
+}
+
+fn extract_prompt_text_from_params(params: Option<&Value>) -> String {
+    params
+        .and_then(|params| params.get("prompt"))
+        .and_then(Value::as_array)
+        .map(|prompt| {
+            prompt
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+fn rewrite_prompt_text_message(message: &mut Value, prompt_text: &str) -> bool {
+    let Some(message_object) = message.as_object_mut() else {
+        return false;
+    };
+    let params = message_object
+        .entry("params".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(params_object) = params.as_object_mut() else {
+        return false;
+    };
+    params_object.insert(
+        "prompt".to_string(),
+        json!([{ "type": "text", "text": prompt_text }]),
+    );
+    true
+}
+
+fn serialize_json_messages(messages: &[Value]) -> Option<Vec<u8>> {
+    let mut payload = Vec::new();
+    for message in messages {
+        serde_json::to_writer(&mut payload, message).ok()?;
+        payload.push(b'\n');
+    }
+    Some(payload)
+}
+
+fn user_prompt_history_update(session_id_value: Value, text: &str) -> Value {
+    json!({
+        "sessionId": session_id_value,
+        "update": {
+            "sessionUpdate": "user_message_chunk",
+            "content": { "type": "text", "text": text }
+        }
+    })
 }
 
 /// Returns (status_transitions, injection_just_completed).
@@ -2653,6 +2744,7 @@ fn discover_history_sessions(
                 parent_session_id: None,
                 system_prompt: None,
                 initial_prompt: None,
+                conversation_context: None,
                 acp_session_id,
                 attached_channels: HashSet::new(),
                 input_tx: None,
@@ -2804,6 +2896,24 @@ mod tests {
     use super::*;
     use crate::state_store::{AppData, Project, StateStore, Thread};
 
+    async fn register_test_session(
+        state: &Arc<AppState>,
+        channel_id: u16,
+        session: ChatSessionRuntime,
+    ) {
+        let session_id = session.summary.session_id.clone();
+        let mut chat = state.chat.lock().await;
+        chat.channel_to_session.insert(channel_id, session_id.clone());
+        chat.sessions.insert(session_id, session);
+    }
+
+    async fn cancel_registered_stall_timer(state: &Arc<AppState>, session_id: &str) {
+        let mut chat = state.chat.lock().await;
+        if let Some(session) = chat.sessions.get_mut(session_id) {
+            cancel_stall_timer(session);
+        }
+    }
+
     fn write_history_file(lines: &[&str]) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "spindle-chat-history-tests-{}",
@@ -2869,6 +2979,7 @@ mod tests {
             parent_session_id: None,
             system_prompt: None,
             initial_prompt: None,
+            conversation_context: None,
             acp_session_id: Some("acp-session-1".to_string()),
             attached_channels: HashSet::new(),
             input_tx: None,
@@ -2900,7 +3011,7 @@ mod tests {
         let state = make_test_state();
         let mut session = make_test_session();
 
-        let (transitions, _prompt_updates, auto_checkpoints) = apply_inbound_status_updates(
+        let (transitions, replacement_payload, _prompt_updates, auto_checkpoints) = apply_inbound_status_updates(
             &state,
             &mut session,
             vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
@@ -2916,11 +3027,166 @@ mod tests {
             "Auto-checkpoint before prompt 1"
         );
         assert_eq!(auto_checkpoints[0].prompt_preview, None);
+        assert_eq!(replacement_payload, None);
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].old_status, protocol::AgentStatus::Idle);
         assert_eq!(transitions[0].new_status, protocol::AgentStatus::Busy);
 
         cancel_stall_timer(&mut session);
+    }
+
+    #[tokio::test]
+    async fn inbound_prompt_injects_conversation_context_once_and_persists_original_prompt() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.conversation_context = Some("prior context".to_string());
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "session-1",
+                "prompt": [{"type": "text", "text": "new prompt"}]
+            }
+        });
+
+        let (_transitions, replacement_payload, prompt_updates, _auto_checkpoints) =
+            apply_inbound_status_updates(&state, &mut session, vec![message]);
+
+        let replacement_payload = replacement_payload.expect("replacement payload");
+        let rewritten: Value = serde_json::from_slice(&replacement_payload).expect("parse replacement payload");
+        assert_eq!(
+            rewritten["params"]["prompt"],
+            json!([{
+                "type": "text",
+                "text": "prior context\n\n---\n\nnew prompt"
+            }])
+        );
+        assert_eq!(
+            prompt_updates,
+            vec![json!({
+                "sessionId": "session-1",
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": { "type": "text", "text": "new prompt" }
+                }
+            })]
+        );
+        assert_eq!(session.conversation_context, None);
+
+        cancel_stall_timer(&mut session);
+    }
+
+    #[tokio::test]
+    async fn handle_binary_frame_forwards_combined_prompt_but_persists_original_history() {
+        let state = make_test_state();
+        let (temp_root, history_path) = write_history_file(&[]);
+        let mut session = make_test_session();
+        session.history_path = history_path.clone();
+        session.conversation_context = Some("prior context".to_string());
+
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 7, session).await;
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "text", "text": "new prompt"}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let handled = ChatService::handle_binary_frame(Arc::clone(&state), 7, payload)
+            .await
+            .expect("handle binary frame");
+
+        assert!(handled);
+
+        let forwarded = input_rx.recv().await.expect("forwarded payload");
+        let rewritten: Value =
+            serde_json::from_slice(&forwarded).expect("parse forwarded payload");
+        assert_eq!(rewritten["params"]["sessionId"], "acp-session-1");
+        assert_eq!(
+            rewritten["params"]["prompt"],
+            json!([{
+                "type": "text",
+                "text": "prior context\n\n---\n\nnew prompt"
+            }])
+        );
+
+        let persisted = fs::read_to_string(&history_path).expect("read persisted history");
+        let persisted_lines = persisted.lines().collect::<Vec<_>>();
+        assert_eq!(persisted_lines.len(), 1);
+        let persisted_entry: Value =
+            serde_json::from_str(persisted_lines[0]).expect("parse history entry");
+        assert_eq!(persisted_entry["sessionId"], "session-1");
+        assert_eq!(persisted_entry["update"]["content"]["text"], "new prompt");
+
+        cancel_registered_stall_timer(&state, "session-1").await;
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn handle_binary_frame_keeps_normal_prompt_flow_when_context_absent() {
+        let state = make_test_state();
+        let (temp_root, history_path) = write_history_file(&[]);
+        let mut session = make_test_session();
+        session.history_path = history_path.clone();
+
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 8, session).await;
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "text", "text": "plain prompt"}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let handled = ChatService::handle_binary_frame(Arc::clone(&state), 8, payload)
+            .await
+            .expect("handle binary frame");
+
+        assert!(handled);
+
+        let forwarded = input_rx.recv().await.expect("forwarded payload");
+        let forwarded_message: Value =
+            serde_json::from_slice(&forwarded).expect("parse forwarded payload");
+        assert_eq!(forwarded_message["params"]["sessionId"], "acp-session-1");
+        assert_eq!(
+            forwarded_message["params"]["prompt"],
+            json!([{
+                "type": "text",
+                "text": "plain prompt"
+            }])
+        );
+
+        let persisted = fs::read_to_string(&history_path).expect("read persisted history");
+        let persisted_lines = persisted.lines().collect::<Vec<_>>();
+        assert_eq!(persisted_lines.len(), 1);
+        let persisted_entry: Value =
+            serde_json::from_str(persisted_lines[0]).expect("parse history entry");
+        assert_eq!(persisted_entry["sessionId"], "session-1");
+        assert_eq!(persisted_entry["update"]["content"]["text"], "plain prompt");
+
+        cancel_registered_stall_timer(&state, "session-1").await;
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[tokio::test]

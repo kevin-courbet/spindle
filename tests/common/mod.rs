@@ -332,6 +332,10 @@ impl TestHarness {
         self.config_home.clone()
     }
 
+    pub fn preserve_path(&mut self, path: &Path) {
+        self.cleanup_paths.retain(|candidate| candidate != path);
+    }
+
     fn take_event(&mut self, method: &str) -> Option<Value> {
         let index = self.events.iter().position(|event| {
             event
