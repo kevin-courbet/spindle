@@ -231,7 +231,7 @@ async fn cleanup_thread_project(
 async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str, session_id: &str) {
     loop {
         let ready = harness
-            .wait_for_event("chat.session_ready", Duration::from_secs(10))
+            .wait_for_event("chat.session_ready", Duration::from_secs(5))
             .await;
         if let Ok(event) = ready {
             if event["params"]["thread_id"] == thread_id
@@ -276,11 +276,10 @@ async fn wait_for_injection_complete(
 ) {
     loop {
         let event = harness
-            .wait_for_event("chat.injection_complete", Duration::from_secs(10))
+            .wait_for_event("chat.injection_complete", Duration::from_secs(5))
             .await
             .expect("chat.injection_complete");
-        if event["params"]["thread_id"] == thread_id
-            && event["params"]["session_id"] == session_id
+        if event["params"]["thread_id"] == thread_id && event["params"]["session_id"] == session_id
         {
             return;
         }
@@ -294,6 +293,15 @@ fn chat_history_path(thread_id: &str, session_id: &str) -> std::path::PathBuf {
         .join("chat")
         .join(thread_id)
         .join(format!("{session_id}.jsonl"))
+}
+
+fn chat_metadata_path(thread_id: &str, session_id: &str) -> std::path::PathBuf {
+    let config_home = std::env::var("XDG_CONFIG_HOME").expect("XDG_CONFIG_HOME set by harness");
+    std::path::Path::new(&config_home)
+        .join("threadmill")
+        .join("chat")
+        .join(thread_id)
+        .join(format!("{session_id}.metadata.json"))
 }
 
 #[tokio::test]
@@ -501,7 +509,7 @@ async fn chat_load_restarts_archived_session() {
         .await
         .expect("chat.stop");
     let _ = harness
-        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .wait_for_event("chat.session_ended", Duration::from_secs(5))
         .await
         .expect("chat.session_ended");
 
@@ -559,7 +567,7 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .wait_for_channel_output_contains(
             channel_id,
             b"persisted-before-recovery",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for persisted output");
@@ -572,7 +580,7 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .await
         .expect("chat.stop");
     harness
-        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .wait_for_event("chat.session_ended", Duration::from_secs(5))
         .await
         .expect("chat.session_ended");
 
@@ -597,6 +605,11 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
     rewritten.extend(lines.map(str::to_string));
     std::fs::write(&history_path, format!("{}\n", rewritten.join("\n")))
         .expect("rewrite chat history without ACP session id");
+    std::fs::write(
+        chat_metadata_path(&thread_id, &session_id),
+        "{\"acp_session_id\":null}\n",
+    )
+    .expect("rewrite chat metadata without ACP session id");
 
     drop(harness);
 
@@ -637,9 +650,7 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .expect("read mock chat agent log");
     let log_entries = agent_log
         .lines()
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).expect("parse agent log entry")
-        })
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse agent log entry"))
         .collect::<Vec<_>>();
     let session_new_count = log_entries
         .iter()
@@ -649,8 +660,14 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .iter()
         .filter(|entry| entry["method"] == "session/load")
         .count();
-    assert_eq!(session_new_count, 2, "start + recovery load should both use session/new");
-    assert_eq!(session_load_count, 0, "missing ACP session id must not use session/load");
+    assert_eq!(
+        session_new_count, 2,
+        "start + recovery load should both use session/new"
+    );
+    assert_eq!(
+        session_load_count, 0,
+        "missing ACP session id must not use session/load"
+    );
     assert!(log_entries.iter().any(|entry| {
         entry["method"] == "session/prompt"
             && entry["params"]["prompt"]
@@ -940,7 +957,7 @@ async fn chat_history_jsonl_preserves_acp_session_id_for_recovery() {
         .wait_for_channel_output_contains(
             channel_id,
             b"recovery-test-marker",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for marker output");
@@ -976,7 +993,7 @@ async fn chat_history_jsonl_preserves_acp_session_id_for_recovery() {
         .await
         .expect("chat.stop");
     harness
-        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .wait_for_event("chat.session_ended", Duration::from_secs(5))
         .await
         .expect("chat.session_ended");
 

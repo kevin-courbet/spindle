@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -22,7 +23,9 @@ use uuid::Uuid;
 use crate::{
     protocol,
     services::{
-        agent_registry, checkpoint::CheckpointService, project::{load_project_default_chat_model, project_agent_command},
+        agent_registry,
+        checkpoint::CheckpointService,
+        project::{load_project_default_chat_model, project_agent_command},
         terminal::TerminalConnectionState,
     },
     state_store, AppState,
@@ -111,6 +114,11 @@ struct HandshakeResult {
     model_id: Option<String>,
     /// Notifications collected during session/load replay. Empty for session/new.
     replay_notifications: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedChatSessionMetadata {
+    acp_session_id: Option<String>,
 }
 
 impl ChatService {
@@ -209,6 +217,13 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatLoadParams,
     ) -> Result<protocol::ChatLoadResult, String> {
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let force_new_session =
+            restored_session_marker_exists(&history_root, &params.thread_id, &params.session_id)?;
+
         let (agent_type, load_session_id, stop_tx, history_path) = {
             let mut chat = state.chat.lock().await;
             let session = chat
@@ -228,7 +243,11 @@ impl ChatService {
                 });
             }
 
-            let load_session_id = session.acp_session_id.clone();
+            let load_session_id = if force_new_session {
+                None
+            } else {
+                session.acp_session_id.clone()
+            };
             session.summary.status = protocol::ChatSessionStatus::Starting;
             session.input_tx = None;
             let stop_tx = session.stop_tx.take();
@@ -334,6 +353,39 @@ impl ChatService {
         let history_path =
             history_path_for_session(&history_root, &params.thread_id, &params.session_id);
         read_history_page(&history_path, params.cursor)
+    }
+
+    pub(crate) async fn prepare_restored_session_context(
+        state: Arc<AppState>,
+        thread_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let history_path = history_path_for_session(&history_root, thread_id, session_id);
+        let conversation_context = build_conversation_context(&history_path, None);
+
+        let session_updated = {
+            let mut chat = state.chat.lock().await;
+            if let Some(session) = chat.sessions.get_mut(session_id) {
+                session.acp_session_id = None;
+                session.conversation_context = conversation_context.clone();
+                true
+            } else {
+                false
+            }
+        };
+
+        if !session_updated {
+            return Ok(());
+        }
+
+        persist_restored_session_marker(&history_root, thread_id, session_id)?;
+        persist_session_metadata(&history_root, thread_id, session_id, None)?;
+
+        Ok(())
     }
 
     pub async fn status(
@@ -507,7 +559,17 @@ impl ChatService {
         channel_id: u16,
         payload: Vec<u8>,
     ) -> Result<bool, String> {
-        let (input_tx, transitions, replacement_payload, prompt_updates, mut auto_checkpoints, history_path) = {
+        let (
+            thread_id,
+            session_id,
+            input_tx,
+            transitions,
+            replacement_payload,
+            prompt_updates,
+            mut auto_checkpoints,
+            history_path,
+            consumed_conversation_context,
+        ) = {
             let mut chat = state.chat.lock().await;
             let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
                 return Ok(false);
@@ -525,15 +587,23 @@ impl ChatService {
                 .clone();
             let history_path = session.history_path.clone();
             let messages = extract_json_messages(&mut session.input_buffer, &payload, "input");
-            let (transitions, replacement_payload, prompt_updates, auto_checkpoints) =
-                apply_inbound_status_updates(&state, session, messages);
+            let (
+                transitions,
+                replacement_payload,
+                prompt_updates,
+                auto_checkpoints,
+                consumed_conversation_context,
+            ) = apply_inbound_status_updates(&state, session, messages);
             (
+                session.thread_id.clone(),
+                session_id,
                 input_tx,
                 transitions,
                 replacement_payload,
                 prompt_updates,
                 auto_checkpoints,
                 history_path,
+                consumed_conversation_context,
             )
         };
 
@@ -600,6 +670,11 @@ impl ChatService {
         input_tx
             .try_send(final_payload)
             .map_err(|err| format!("failed to queue chat input for channel {channel_id}: {err}"))?;
+
+        if consumed_conversation_context {
+            clear_pending_conversation_context(&state, &thread_id, &session_id).await?;
+        }
+
         Ok(true)
     }
     pub async fn cleanup_connection_channels(
@@ -800,7 +875,13 @@ async fn run_session_task(
     let is_new_session = load_session_id.is_none();
     let handshake = timeout(
         CHAT_HANDSHAKE_TIMEOUT,
-        perform_handshake(&input_tx, &mut stdout, load_session_id, &cwd, preferred_model.as_deref()),
+        perform_handshake(
+            &input_tx,
+            &mut stdout,
+            load_session_id,
+            &cwd,
+            preferred_model.as_deref(),
+        ),
     )
     .await
     .map_err(|_| "chat handshake timed out after 30s".to_string())?;
@@ -1304,6 +1385,7 @@ fn apply_inbound_status_updates(
     Option<Vec<u8>>,
     Vec<Value>,
     Vec<AutoCheckpointRequest>,
+    bool,
 ) {
     let mut transitions = Vec::new();
     let mut messages = messages;
@@ -1311,6 +1393,7 @@ fn apply_inbound_status_updates(
     let mut payload_rewritten = false;
     let mut history_updates = Vec::new();
     let mut auto_checkpoints = Vec::new();
+    let mut consumed_conversation_context = false;
 
     for message in &mut messages {
         let method = message
@@ -1324,38 +1407,22 @@ fn apply_inbound_status_updates(
                 .and_then(|params| params.get("sessionId"))
                 .cloned()
                 .unwrap_or_else(|| Value::String(String::new()));
-            let original_prompt_text = extract_prompt_text_from_params(params);
             let prompt_preview = prompt_preview_from_params(params);
+            let prompt_updates = user_prompt_history_updates(session_id_value.clone(), params);
 
             if let Some(id) = request_id_key(message.get("id")) {
                 session.pending_prompt_ids.insert(id);
             }
 
-            if let Some(conversation_context) = session.conversation_context.take() {
-                let combined_prompt = format!(
-                    "{conversation_context}\n\n---\n\n{original_prompt_text}"
-                );
-                if rewrite_prompt_text_message(message, &combined_prompt) {
+            if let Some(conversation_context) = session.conversation_context.as_deref() {
+                let context_block = format!("{conversation_context}\n\n---\n\n");
+                if prepend_prompt_text_block(message, &context_block) {
                     payload_rewritten = true;
-                }
-                history_updates.push(user_prompt_history_update(
-                    session_id_value.clone(),
-                    &original_prompt_text,
-                ));
-            } else {
-                // Persist user prompt as a synthetic userMessageChunk for history hydration.
-                // ACP session/prompt params: { sessionId, prompt: [{ type: "text", text: "..." }] }
-                if let Some(prompt_array) = params.and_then(|params| params.get("prompt")).and_then(Value::as_array) {
-                    for block in prompt_array {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            history_updates.push(user_prompt_history_update(
-                                session_id_value.clone(),
-                                text,
-                            ));
-                        }
-                    }
+                    consumed_conversation_context = true;
                 }
             }
+
+            history_updates.extend(prompt_updates);
 
             session.checkpoint_seq += 1;
             auto_checkpoints.push(AutoCheckpointRequest {
@@ -1381,7 +1448,13 @@ fn apply_inbound_status_updates(
         replacement_payload = serialize_json_messages(&messages);
     }
 
-    (transitions, replacement_payload, history_updates, auto_checkpoints)
+    (
+        transitions,
+        replacement_payload,
+        history_updates,
+        auto_checkpoints,
+        consumed_conversation_context,
+    )
 }
 
 fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
@@ -1427,7 +1500,7 @@ fn prompt_preview_from_params(params: Option<&Value>) -> Option<String> {
     Some(preview)
 }
 
-fn extract_prompt_text_from_params(params: Option<&Value>) -> String {
+fn user_prompt_history_updates(session_id_value: Value, params: Option<&Value>) -> Vec<Value> {
     params
         .and_then(|params| params.get("prompt"))
         .and_then(Value::as_array)
@@ -1435,12 +1508,13 @@ fn extract_prompt_text_from_params(params: Option<&Value>) -> String {
             prompt
                 .iter()
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<String>()
+                .map(|text| user_prompt_history_update(session_id_value.clone(), text))
+                .collect()
         })
         .unwrap_or_default()
 }
 
-fn rewrite_prompt_text_message(message: &mut Value, prompt_text: &str) -> bool {
+fn prepend_prompt_text_block(message: &mut Value, prompt_text: &str) -> bool {
     let Some(message_object) = message.as_object_mut() else {
         return false;
     };
@@ -1450,10 +1524,15 @@ fn rewrite_prompt_text_message(message: &mut Value, prompt_text: &str) -> bool {
     let Some(params_object) = params.as_object_mut() else {
         return false;
     };
-    params_object.insert(
-        "prompt".to_string(),
-        json!([{ "type": "text", "text": prompt_text }]),
-    );
+    let prompt = params_object
+        .entry("prompt".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+
+    if let Some(prompt_array) = prompt.as_array_mut() {
+        prompt_array.insert(0, json!({ "type": "text", "text": prompt_text }));
+    } else {
+        *prompt = json!([{ "type": "text", "text": prompt_text }]);
+    }
     true
 }
 
@@ -1827,6 +1906,26 @@ async fn mark_session_ready(
     handshake: &HandshakeResult,
 ) {
     tracing::info!(thread_id, session_id, model = ?handshake.model_id, "chat_session_ready");
+    let history_root = {
+        let chat = state.chat.lock().await;
+        chat.history_root.clone()
+    };
+    match persist_session_metadata(
+        &history_root,
+        thread_id,
+        session_id,
+        Some(handshake.acp_session_id.as_str()),
+    ) {
+        Ok(()) => {}
+        Err(error) => {
+            warn!(
+                thread_id,
+                session_id,
+                error = %error,
+                "failed to persist chat session metadata"
+            );
+        }
+    }
     {
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
@@ -1850,6 +1949,25 @@ async fn mark_session_ready(
         config_options: handshake.config_options.clone(),
     });
     emit_state_delta_updated(&state, thread_id, session_id).await;
+}
+
+async fn clear_pending_conversation_context(
+    state: &Arc<AppState>,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let history_root = {
+        let chat = state.chat.lock().await;
+        chat.history_root_path().to_path_buf()
+    };
+    clear_restored_session_marker(&history_root, thread_id, session_id)?;
+
+    let mut chat = state.chat.lock().await;
+    if let Some(session) = chat.sessions.get_mut(session_id) {
+        session.conversation_context = None;
+    }
+
+    Ok(())
 }
 
 async fn mark_session_failed(
@@ -2079,10 +2197,144 @@ fn chat_status_name(status: &protocol::ChatSessionStatus) -> &'static str {
     }
 }
 
-pub(crate) fn history_path_for_session(history_root: &Path, thread_id: &str, session_id: &str) -> PathBuf {
+pub(crate) fn history_path_for_session(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> PathBuf {
     history_root
         .join(thread_id)
         .join(format!("{session_id}.jsonl"))
+}
+
+fn history_metadata_path_for_session(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> PathBuf {
+    history_root
+        .join(thread_id)
+        .join(format!("{session_id}.metadata.json"))
+}
+
+fn restored_session_marker_path_for_session(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> PathBuf {
+    history_root
+        .join(thread_id)
+        .join(format!("{session_id}.restore-session-new"))
+}
+
+fn persist_restored_session_marker(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let marker_path = restored_session_marker_path_for_session(history_root, thread_id, session_id);
+    let parent = marker_path.parent().ok_or_else(|| {
+        format!(
+            "invalid restored session marker path: {}",
+            marker_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+
+    let mut file = fs::File::create(&marker_path)
+        .map_err(|err| format!("failed to create {}: {err}", marker_path.display()))?;
+    file.write_all(b"session/new\n")
+        .map_err(|err| format!("failed to write {}: {err}", marker_path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("failed to fsync {}: {err}", marker_path.display()))
+}
+
+fn restored_session_marker_exists(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    restored_session_marker_path_for_session(history_root, thread_id, session_id)
+        .try_exists()
+        .map_err(|err| {
+            format!(
+                "failed to stat restored session marker for {}: {err}",
+                session_id
+            )
+        })
+}
+
+fn clear_restored_session_marker(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let marker_path = restored_session_marker_path_for_session(history_root, thread_id, session_id);
+    match fs::remove_file(&marker_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to remove {}: {err}", marker_path.display())),
+    }
+}
+
+fn persist_session_metadata(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+    acp_session_id: Option<&str>,
+) -> Result<(), String> {
+    let metadata_path = history_metadata_path_for_session(history_root, thread_id, session_id);
+    let parent = metadata_path.parent().ok_or_else(|| {
+        format!(
+            "invalid chat session metadata path: {}",
+            metadata_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+
+    let metadata = PersistedChatSessionMetadata {
+        acp_session_id: acp_session_id.map(ToOwned::to_owned),
+    };
+    let mut file = fs::File::create(&metadata_path)
+        .map_err(|err| format!("failed to create {}: {err}", metadata_path.display()))?;
+    serde_json::to_writer(&mut file, &metadata)
+        .map_err(|err| format!("failed to encode {}: {err}", metadata_path.display()))?;
+    file.write_all(b"\n")
+        .map_err(|err| format!("failed to finalize {}: {err}", metadata_path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("failed to fsync {}: {err}", metadata_path.display()))
+}
+
+fn read_persisted_session_metadata(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<Option<PersistedChatSessionMetadata>, String> {
+    let metadata_path = history_metadata_path_for_session(history_root, thread_id, session_id);
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+
+    let file = fs::File::open(&metadata_path)
+        .map_err(|err| format!("failed to open {}: {err}", metadata_path.display()))?;
+    let reader = BufReader::new(file);
+    serde_json::from_reader(reader)
+        .map(Some)
+        .map_err(|err| format!("failed to parse {}: {err}", metadata_path.display()))
+}
+
+fn read_history_acp_session_id(history_path: &Path) -> Option<String> {
+    fs::File::open(history_path).ok().and_then(|file| {
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .next()?
+            .ok()
+            .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+            .and_then(|value| value.get("sessionId")?.as_str().map(ToOwned::to_owned))
+    })
 }
 
 fn is_safe_history_component(value: &str) -> bool {
@@ -2090,8 +2342,8 @@ fn is_safe_history_component(value: &str) -> bool {
 }
 
 fn count_lines(path: &Path) -> Result<u64, String> {
-    let file = fs::File::open(path)
-        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let file =
+        fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let reader = BufReader::new(file);
     let mut count = 0_u64;
     for line in reader.lines() {
@@ -2192,7 +2444,10 @@ fn read_history_page(
     })
 }
 
-pub(crate) fn build_conversation_context(history_path: &Path, cursor: Option<u64>) -> Option<String> {
+pub(crate) fn build_conversation_context(
+    history_path: &Path,
+    cursor: Option<u64>,
+) -> Option<String> {
     if !history_path.exists() {
         return None;
     }
@@ -2258,7 +2513,9 @@ pub(crate) fn build_conversation_context(history_path: &Path, cursor: Option<u64
                 extract_inline_text(update.get("content")),
             ),
             Some("tool_call") => upsert_tool_call_entry(&mut entries, &mut tool_indices, update),
-            Some("tool_call_update") => apply_tool_call_update_entry(&mut entries, &mut tool_indices, update),
+            Some("tool_call_update") => {
+                apply_tool_call_update_entry(&mut entries, &mut tool_indices, update)
+            }
             Some("plan") => {
                 if let Some(plan) = format_plan_update(update) {
                     entries.push(ConversationContextEntry::Plan(plan));
@@ -2395,8 +2652,9 @@ fn append_message_entry(
     if let Some(message_id) = message_id {
         let key = format!("{label}:{message_id}");
         if let Some(index) = message_indices.get(&key).copied() {
-            if let Some(ConversationContextEntry::Message { content: existing, .. }) =
-                entries.get_mut(index)
+            if let Some(ConversationContextEntry::Message {
+                content: existing, ..
+            }) = entries.get_mut(index)
             {
                 existing.push_str(&content);
                 return;
@@ -2584,7 +2842,11 @@ fn format_plan_update(update: &Value) -> Option<String> {
         else {
             continue;
         };
-        let marker = match entry.get("status").and_then(Value::as_str).unwrap_or("pending") {
+        let marker = match entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+        {
             "completed" => "[x]",
             "in_progress" | "inProgress" => "[-]",
             "cancelled" => "[/]",
@@ -2714,17 +2976,39 @@ fn discover_history_sessions(
                 .unwrap_or_else(Utc::now)
                 .to_rfc3339();
 
-            // Extract the ACP session ID from the first JSONL entry.
-            // Updates are persisted before session ID rewriting, so the
-            // sessionId field contains the agent-side ACP session ID.
-            let acp_session_id = fs::File::open(&path)
-                .ok()
-                .and_then(|file| {
-                    let reader = BufReader::new(file);
-                    reader.lines().next()?.ok()
-                })
-                .and_then(|line| serde_json::from_str::<Value>(&line).ok())
-                .and_then(|value| value.get("sessionId")?.as_str().map(ToOwned::to_owned));
+            let acp_session_id =
+                match restored_session_marker_exists(history_root, &thread_id, stem) {
+                    Ok(true) => None,
+                    Ok(false) => {
+                        match read_persisted_session_metadata(history_root, &thread_id, stem) {
+                            Ok(Some(metadata)) => metadata.acp_session_id,
+                            Ok(None) => {
+                                // Legacy sessions derive ACP session ID from first JSONL entry.
+                                // Restored sessions persist metadata with acp_session_id = null so
+                                // recovery durably falls back to session/new after daemon restart.
+                                read_history_acp_session_id(&path)
+                            }
+                            Err(error) => {
+                                warn!(
+                                    thread_id,
+                                    session_id = stem,
+                                    error = %error,
+                                    "failed to read persisted chat session metadata"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            thread_id,
+                            session_id = stem,
+                            error = %error,
+                            "failed to read restored chat session marker"
+                        );
+                        None
+                    }
+                };
 
             recovered.push(ChatSessionRuntime {
                 summary: protocol::ChatSessionSummary {
@@ -2903,7 +3187,8 @@ mod tests {
     ) {
         let session_id = session.summary.session_id.clone();
         let mut chat = state.chat.lock().await;
-        chat.channel_to_session.insert(channel_id, session_id.clone());
+        chat.channel_to_session
+            .insert(channel_id, session_id.clone());
         chat.sessions.insert(session_id, session);
     }
 
@@ -3011,11 +3296,12 @@ mod tests {
         let state = make_test_state();
         let mut session = make_test_session();
 
-        let (transitions, replacement_payload, _prompt_updates, auto_checkpoints) = apply_inbound_status_updates(
-            &state,
-            &mut session,
-            vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
-        );
+        let (transitions, replacement_payload, _prompt_updates, auto_checkpoints, consumed) =
+            apply_inbound_status_updates(
+                &state,
+                &mut session,
+                vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
+            );
 
         assert_eq!(session.summary.agent_status, protocol::AgentStatus::Busy);
         assert!(session.pending_prompt_ids.contains("42"));
@@ -3028,6 +3314,7 @@ mod tests {
         );
         assert_eq!(auto_checkpoints[0].prompt_preview, None);
         assert_eq!(replacement_payload, None);
+        assert!(!consumed);
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].old_status, protocol::AgentStatus::Idle);
         assert_eq!(transitions[0].new_status, protocol::AgentStatus::Busy);
@@ -3036,7 +3323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_prompt_injects_conversation_context_once_and_persists_original_prompt() {
+    async fn inbound_prompt_prepends_context_block_and_persists_original_text_blocks() {
         let state = make_test_state();
         let mut session = make_test_session();
         session.conversation_context = Some("prior context".to_string());
@@ -3047,41 +3334,70 @@ mod tests {
             "method": "session/prompt",
             "params": {
                 "sessionId": "session-1",
-                "prompt": [{"type": "text", "text": "new prompt"}]
+                "prompt": [
+                    {"type": "text", "text": "first block"},
+                    {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}},
+                    {"type": "text", "text": "second block"}
+                ]
             }
         });
 
-        let (_transitions, replacement_payload, prompt_updates, _auto_checkpoints) =
+        let (_transitions, replacement_payload, prompt_updates, _auto_checkpoints, consumed) =
             apply_inbound_status_updates(&state, &mut session, vec![message]);
 
         let replacement_payload = replacement_payload.expect("replacement payload");
-        let rewritten: Value = serde_json::from_slice(&replacement_payload).expect("parse replacement payload");
+        let rewritten: Value =
+            serde_json::from_slice(&replacement_payload).expect("parse replacement payload");
         assert_eq!(
             rewritten["params"]["prompt"],
-            json!([{
-                "type": "text",
-                "text": "prior context\n\n---\n\nnew prompt"
-            }])
+            json!([
+                {
+                    "type": "text",
+                    "text": "prior context\n\n---\n\n"
+                },
+                {"type": "text", "text": "first block"},
+                {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}},
+                {"type": "text", "text": "second block"}
+            ])
         );
         assert_eq!(
             prompt_updates,
-            vec![json!({
-                "sessionId": "session-1",
-                "update": {
-                    "sessionUpdate": "user_message_chunk",
-                    "content": { "type": "text", "text": "new prompt" }
-                }
-            })]
+            vec![
+                json!({
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": { "type": "text", "text": "first block" }
+                    }
+                }),
+                json!({
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": { "type": "text", "text": "second block" }
+                    }
+                })
+            ]
         );
-        assert_eq!(session.conversation_context, None);
+        assert!(consumed);
+        assert_eq!(
+            session.conversation_context.as_deref(),
+            Some("prior context")
+        );
 
         cancel_stall_timer(&mut session);
     }
 
     #[tokio::test]
-    async fn handle_binary_frame_forwards_combined_prompt_but_persists_original_history() {
+    async fn handle_binary_frame_prepends_context_block_but_persists_original_history() {
         let state = make_test_state();
         let (temp_root, history_path) = write_history_file(&[]);
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        persist_restored_session_marker(&history_root, "thread-1", "session-1")
+            .expect("persist restore marker");
         let mut session = make_test_session();
         session.history_path = history_path.clone();
         session.conversation_context = Some("prior context".to_string());
@@ -3111,15 +3427,17 @@ mod tests {
         assert!(handled);
 
         let forwarded = input_rx.recv().await.expect("forwarded payload");
-        let rewritten: Value =
-            serde_json::from_slice(&forwarded).expect("parse forwarded payload");
+        let rewritten: Value = serde_json::from_slice(&forwarded).expect("parse forwarded payload");
         assert_eq!(rewritten["params"]["sessionId"], "acp-session-1");
         assert_eq!(
             rewritten["params"]["prompt"],
-            json!([{
-                "type": "text",
-                "text": "prior context\n\n---\n\nnew prompt"
-            }])
+            json!([
+                {
+                    "type": "text",
+                    "text": "prior context\n\n---\n\n"
+                },
+                {"type": "text", "text": "new prompt"}
+            ])
         );
 
         let persisted = fs::read_to_string(&history_path).expect("read persisted history");
@@ -3129,6 +3447,127 @@ mod tests {
             serde_json::from_str(persisted_lines[0]).expect("parse history entry");
         assert_eq!(persisted_entry["sessionId"], "session-1");
         assert_eq!(persisted_entry["update"]["content"]["text"], "new prompt");
+
+        assert!(
+            !restored_session_marker_exists(&history_root, "thread-1", "session-1")
+                .expect("read restore marker state")
+        );
+        {
+            let chat = state.chat.lock().await;
+            let session = chat.sessions.get("session-1").expect("registered session");
+            assert_eq!(session.conversation_context, None);
+        }
+
+        cancel_registered_stall_timer(&state, "session-1").await;
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn handle_binary_frame_keeps_restore_state_when_prompt_queue_fails() {
+        let state = make_test_state();
+        let (temp_root, history_path) = write_history_file(&[]);
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        persist_restored_session_marker(&history_root, "thread-1", "session-1")
+            .expect("persist restore marker");
+
+        let mut session = make_test_session();
+        session.history_path = history_path;
+        session.conversation_context = Some("prior context".to_string());
+
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        input_tx
+            .try_send(Vec::from("occupied"))
+            .expect("fill prompt queue");
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 12, session).await;
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 45,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "text", "text": "new prompt"}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let error = ChatService::handle_binary_frame(Arc::clone(&state), 12, payload)
+            .await
+            .expect_err("prompt queue should reject full channel");
+        assert!(error.contains("failed to queue chat input"));
+
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", "session-1")
+                .expect("read restore marker state")
+        );
+        {
+            let chat = state.chat.lock().await;
+            let session = chat.sessions.get("session-1").expect("registered session");
+            assert_eq!(
+                session.conversation_context.as_deref(),
+                Some("prior context")
+            );
+        }
+
+        cancel_registered_stall_timer(&state, "session-1").await;
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn handle_binary_frame_preserves_non_text_prompt_blocks_when_context_injected() {
+        let state = make_test_state();
+        let (temp_root, history_path) = write_history_file(&[]);
+        let mut session = make_test_session();
+        session.history_path = history_path.clone();
+        session.conversation_context = Some("prior context".to_string());
+
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 9, session).await;
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "image", "source": {"mediaType": "image/png", "data": "abc"}}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let handled = ChatService::handle_binary_frame(Arc::clone(&state), 9, payload)
+            .await
+            .expect("handle binary frame");
+
+        assert!(handled);
+
+        let forwarded = input_rx.recv().await.expect("forwarded payload");
+        let rewritten: Value = serde_json::from_slice(&forwarded).expect("parse forwarded payload");
+        assert_eq!(rewritten["params"]["sessionId"], "acp-session-1");
+        assert_eq!(
+            rewritten["params"]["prompt"],
+            json!([
+                {
+                    "type": "text",
+                    "text": "prior context\n\n---\n\n"
+                },
+                {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}}
+            ])
+        );
+
+        let persisted = fs::read_to_string(&history_path).expect("read persisted history");
+        assert!(persisted.is_empty());
 
         cancel_registered_stall_timer(&state, "session-1").await;
         let _ = fs::remove_dir_all(temp_root);
@@ -3187,6 +3626,395 @@ mod tests {
 
         cancel_registered_stall_timer(&state, "session-1").await;
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn prepare_restored_session_context_builds_context_and_clears_acp_session_id() {
+        let state = make_test_state();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let history_path = history_path_for_session(&history_root, "thread-1", &session_id);
+        fs::create_dir_all(history_path.parent().expect("history parent"))
+            .expect("create history dir");
+        fs::write(
+            &history_path,
+            concat!(
+                r#"{"sessionId":"acp-session-1","update":{"sessionUpdate":"user_message_chunk","messageId":"user-1","content":"before restore"}}"#,
+                "\n",
+                r#"{"sessionId":"acp-session-1","update":{"kind":"agent_message_chunk","messageId":"assistant-1","content":"kept reply"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write history file");
+        let expected_context = build_conversation_context(&history_path, None);
+
+        let mut session = make_test_session();
+        session.summary.session_id = session_id.clone();
+        session.history_path = history_path;
+        session.conversation_context = Some("stale context".to_string());
+        register_test_session(&state, 9, session).await;
+
+        ChatService::prepare_restored_session_context(Arc::clone(&state), "thread-1", &session_id)
+            .await
+            .expect("prepare restored session context");
+
+        let metadata = read_persisted_session_metadata(&history_root, "thread-1", &session_id)
+            .expect("read restored session metadata")
+            .expect("restored session metadata");
+        assert_eq!(metadata.acp_session_id, None);
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
+        );
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("registered session");
+        assert_eq!(session.acp_session_id, None);
+        assert_eq!(session.conversation_context, expected_context);
+    }
+
+    #[tokio::test]
+    async fn prepare_restored_session_context_returns_error_when_metadata_persist_fails() {
+        let state = make_test_state();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let history_path = history_path_for_session(&history_root, "thread-1", &session_id);
+        fs::create_dir_all(history_path.parent().expect("history parent"))
+            .expect("create history dir");
+        fs::write(
+            &history_path,
+            concat!(
+                r#"{"sessionId":"acp-session-1","update":{"kind":"user_message_chunk","content":"kept prompt"}}"#,
+                "\n",
+                r#"{"sessionId":"acp-session-1","update":{"kind":"agent_message_chunk","content":"kept reply"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write history file");
+        persist_session_metadata(
+            &history_root,
+            "thread-1",
+            &session_id,
+            Some("acp-session-1"),
+        )
+        .expect("persist initial metadata");
+        let metadata_path =
+            history_metadata_path_for_session(&history_root, "thread-1", &session_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&metadata_path)
+                .expect("read metadata permissions")
+                .permissions();
+            permissions.set_mode(0o444);
+            fs::set_permissions(&metadata_path, permissions).expect("chmod metadata read only");
+        }
+
+        let mut session = make_test_session();
+        session.summary.session_id = session_id.clone();
+        session.history_path = history_path;
+        session.acp_session_id = Some("stale-acp-session".to_string());
+        session.conversation_context = Some("stale context".to_string());
+        register_test_session(&state, 11, session).await;
+
+        let error = ChatService::prepare_restored_session_context(
+            Arc::clone(&state),
+            "thread-1",
+            &session_id,
+        )
+        .await
+        .expect_err("metadata persistence should fail");
+        assert!(error.contains(&metadata_path.display().to_string()));
+
+        let expected_context = build_conversation_context(
+            &history_path_for_session(&history_root, "thread-1", &session_id),
+            None,
+        );
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
+        );
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("registered session");
+        assert_eq!(session.acp_session_id, None);
+        assert_eq!(session.conversation_context, expected_context);
+    }
+
+    #[tokio::test]
+    async fn mark_session_ready_persists_acp_session_metadata_without_clearing_restore_marker() {
+        let state = make_test_state();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let history_path = history_path_for_session(&history_root, "thread-1", &session_id);
+        fs::create_dir_all(history_path.parent().expect("history parent"))
+            .expect("create history dir");
+        persist_restored_session_marker(&history_root, "thread-1", &session_id)
+            .expect("persist restore marker");
+
+        let mut session = make_test_session();
+        session.summary.session_id = session_id.clone();
+        session.history_path = history_path;
+        register_test_session(&state, 10, session).await;
+
+        let handshake = HandshakeResult {
+            acp_session_id: "acp-session-2".to_string(),
+            modes: None,
+            models: None,
+            config_options: None,
+            title: Some("Recovered title".to_string()),
+            model_id: Some("model-2".to_string()),
+            replay_notifications: Vec::new(),
+        };
+
+        mark_session_ready(Arc::clone(&state), "thread-1", &session_id, &handshake).await;
+
+        let metadata = read_persisted_session_metadata(&history_root, "thread-1", &session_id)
+            .expect("read ready session metadata")
+            .expect("ready session metadata");
+        assert_eq!(metadata.acp_session_id.as_deref(), Some("acp-session-2"));
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_persisted_sessions_respects_restored_metadata_without_acp_session() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "spindle-chat-recovery-restored-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_dir = temp_root.join("threadmill");
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let thread_id = "thread-recovery".to_string();
+        let session_id = "session-recovery".to_string();
+        let history_root = state_dir.join("chat");
+        let history_path = history_path_for_session(&history_root, &thread_id, &session_id);
+        fs::create_dir_all(
+            history_path
+                .parent()
+                .expect("history path should have parent"),
+        )
+        .expect("create history parent dir");
+        fs::write(
+            &history_path,
+            "{\"sessionId\":\"acp-session-1\",\"update\":{\"kind\":\"agent_message_chunk\",\"content\":\"hello\"}}\n",
+        )
+        .expect("write persisted history");
+        persist_session_metadata(&history_root, &thread_id, &session_id, None)
+            .expect("persist restored metadata");
+
+        let state = Arc::new(AppState::new(StateStore {
+            path: state_dir.join("threads.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: thread_id.clone(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Closed,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }));
+
+        ChatService::recover_persisted_sessions(Arc::clone(&state))
+            .await
+            .expect("recover persisted sessions");
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id, None);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn recover_persisted_sessions_prefers_restore_marker_over_stale_metadata() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "spindle-chat-recovery-restore-marker-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_dir = temp_root.join("threadmill");
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let thread_id = "thread-recovery".to_string();
+        let session_id = "session-recovery".to_string();
+        let history_root = state_dir.join("chat");
+        let history_path = history_path_for_session(&history_root, &thread_id, &session_id);
+        fs::create_dir_all(
+            history_path
+                .parent()
+                .expect("history path should have parent"),
+        )
+        .expect("create history parent dir");
+        fs::write(
+            &history_path,
+            r#"{"sessionId":"acp-session-1","update":{"kind":"agent_message_chunk","content":"hello"}}
+"#,
+        )
+        .expect("write persisted history");
+        persist_session_metadata(
+            &history_root,
+            &thread_id,
+            &session_id,
+            Some("acp-session-1"),
+        )
+        .expect("persist stale metadata");
+        persist_restored_session_marker(&history_root, &thread_id, &session_id)
+            .expect("persist restore marker");
+
+        let state = Arc::new(AppState::new(StateStore {
+            path: state_dir.join("threads.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: thread_id.clone(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Closed,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }));
+
+        ChatService::recover_persisted_sessions(Arc::clone(&state))
+            .await
+            .expect("recover persisted sessions");
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id, None);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn recover_persisted_sessions_does_not_fallback_to_history_when_metadata_is_corrupt() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "spindle-chat-recovery-corrupt-metadata-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_dir = temp_root.join("threadmill");
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let thread_id = "thread-recovery".to_string();
+        let session_id = "session-recovery".to_string();
+        let history_root = state_dir.join("chat");
+        let history_path = history_path_for_session(&history_root, &thread_id, &session_id);
+        fs::create_dir_all(
+            history_path
+                .parent()
+                .expect("history path should have parent"),
+        )
+        .expect("create history parent dir");
+        fs::write(
+            &history_path,
+            "{\"sessionId\":\"acp-session-1\",\"update\":{\"kind\":\"agent_message_chunk\",\"content\":\"hello\"}}
+",
+        )
+        .expect("write persisted history");
+        let metadata_path =
+            history_metadata_path_for_session(&history_root, &thread_id, &session_id);
+        fs::write(&metadata_path, "{not json").expect("write corrupt session metadata");
+
+        let state = Arc::new(AppState::new(StateStore {
+            path: state_dir.join("threads.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: thread_id.clone(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Closed,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }));
+
+        ChatService::recover_persisted_sessions(Arc::clone(&state))
+            .await
+            .expect("recover persisted sessions");
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id, None);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn prepare_restored_session_context_skips_missing_runtime_session() {
+        let state = make_test_state();
+        let session_id = format!("missing-session-{}", uuid::Uuid::new_v4().simple());
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let history_path = history_path_for_session(&history_root, "thread-1", &session_id);
+        fs::create_dir_all(history_path.parent().expect("history parent"))
+            .expect("create history dir");
+        fs::write(
+            &history_path,
+            r#"{"sessionId":"acp-session-1","update":{"kind":"agent_message_chunk","content":"orphaned"}}"#,
+        )
+        .expect("write history file");
+
+        ChatService::prepare_restored_session_context(Arc::clone(&state), "thread-1", &session_id)
+            .await
+            .expect("prepare restored context for missing session");
+
+        assert!(
+            !restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
+        );
+        assert!(
+            read_persisted_session_metadata(&history_root, "thread-1", &session_id)
+                .expect("read restored session metadata")
+                .is_none()
+        );
+
+        let chat = state.chat.lock().await;
+        assert!(chat.sessions.get(&session_id).is_none());
     }
 
     #[tokio::test]
@@ -3435,6 +4263,11 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, session_id);
         assert_eq!(listed[0].status, protocol::ChatSessionStatus::Ended);
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id.as_deref(), Some("acp-session-1"));
+        drop(chat);
 
         let history = ChatService::history(
             Arc::clone(&state),

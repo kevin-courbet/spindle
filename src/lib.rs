@@ -242,7 +242,8 @@ pub async fn serve_listener(listener: TcpListener, mut shutdown_rx: oneshot::Rec
     {
         warn!(error = %err, "failed to recover persisted chat sessions");
     }
-    if let Err(err) = services::workflow::WorkflowService::reconcile_startup(Arc::clone(&state)).await
+    if let Err(err) =
+        services::workflow::WorkflowService::reconcile_startup(Arc::clone(&state)).await
     {
         warn!(error = %err, "failed to reconcile workflows");
     }

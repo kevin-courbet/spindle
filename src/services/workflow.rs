@@ -1,4 +1,8 @@
-use std::{fs, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -54,13 +58,15 @@ impl WorkflowStore {
     }
 
     pub fn load() -> Result<Self, String> {
-        let config_dir = dirs::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
+        let config_dir =
+            dirs::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
         let dir = config_dir.join("threadmill");
         Self::load_from_dir(&dir)
     }
 
     pub fn load_from_dir(dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+        fs::create_dir_all(dir)
+            .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
 
         let path = dir.join("workflows.json");
         if !path.exists() {
@@ -145,9 +151,8 @@ impl WorkflowService {
                     if worker_is_active(&worker.status) {
                         worker.status = protocol::WorkflowWorkerStatus::Failed;
                         worker.completed_at = Some(now.clone());
-                        worker.failure_message = Some(
-                            "Spindle restarted before worker completed".to_string(),
-                        );
+                        worker.failure_message =
+                            Some("Spindle restarted before worker completed".to_string());
                         changed_workers.push(worker.clone());
                         workflow_changed = true;
                     }
@@ -157,15 +162,15 @@ impl WorkflowService {
                     if worker_is_active(&reviewer.status) {
                         reviewer.status = protocol::WorkflowWorkerStatus::Failed;
                         reviewer.completed_at = Some(now.clone());
-                        reviewer.failure_message = Some(
-                            "Spindle restarted before reviewer completed".to_string(),
-                        );
+                        reviewer.failure_message =
+                            Some("Spindle restarted before reviewer completed".to_string());
                         changed_reviewers.push(reviewer.clone());
                         workflow_changed = true;
                     }
                 }
 
-                let had_active_sessions = !changed_workers.is_empty() || !changed_reviewers.is_empty();
+                let had_active_sessions =
+                    !changed_workers.is_empty() || !changed_reviewers.is_empty();
 
                 let mut phase_change = None;
                 if had_active_sessions
@@ -475,16 +480,15 @@ impl WorkflowService {
                     },
                 );
                 emit_workflow_state_delta(&state, &workflow_id).await;
-                Ok(protocol::WorkflowSpawnWorkerResult { workflow_id, worker })
+                Ok(protocol::WorkflowSpawnWorkerResult {
+                    workflow_id,
+                    worker,
+                })
             }
             Err(error) => {
-                let failed_worker = mark_worker_failed(
-                    Arc::clone(&state),
-                    &workflow_id,
-                    &worker_id,
-                    &error,
-                )
-                .await?;
+                let failed_worker =
+                    mark_worker_failed(Arc::clone(&state), &workflow_id, &worker_id, &error)
+                        .await?;
                 state.emit_event(
                     "workflow.worker_completed",
                     protocol::WorkflowWorkerCompletedEvent {
@@ -600,15 +604,11 @@ impl WorkflowService {
             let spawned = match spawned {
                 Ok(spawned) => spawned,
                 Err(error) => {
-                    rollback_review_start(
-                        Arc::clone(&state),
-                        &params.workflow_id,
-                        &checkpoint,
-                    )
-                    .await
-                    .map_err(|rollback_error| {
-                        format!("{error}; rollback failed: {rollback_error}")
-                    })?;
+                    rollback_review_start(Arc::clone(&state), &params.workflow_id, &checkpoint)
+                        .await
+                        .map_err(|rollback_error| {
+                            format!("{error}; rollback failed: {rollback_error}")
+                        })?;
                     return Err(error);
                 }
             };
@@ -631,7 +631,10 @@ impl WorkflowService {
             },
         );
         emit_workflow_upsert(&state, workflow.clone());
-        Ok(protocol::WorkflowStartReviewResult { workflow, reviewers })
+        Ok(protocol::WorkflowStartReviewResult {
+            workflow,
+            reviewers,
+        })
     }
 
     pub async fn spawn_reviewer(
@@ -745,13 +748,9 @@ impl WorkflowService {
                 })
             }
             Err(error) => {
-                let failed_reviewer = mark_reviewer_failed(
-                    Arc::clone(&state),
-                    &workflow_id,
-                    &reviewer_id,
-                    &error,
-                )
-                .await?;
+                let failed_reviewer =
+                    mark_reviewer_failed(Arc::clone(&state), &workflow_id, &reviewer_id, &error)
+                        .await?;
                 state.emit_event(
                     "workflow.reviewer_completed",
                     protocol::WorkflowReviewerCompletedEvent {
@@ -878,10 +877,12 @@ async fn handle_server_event(
             let event: protocol::StateDeltaEvent = serde_json::from_value(event.params)
                 .map_err(|err| format!("invalid state.delta payload: {err}"))?;
             for operation in event.operations {
-                if let protocol::StateDeltaOperationPayload::ChatSessionRemoved { session_id, .. } =
-                    operation.payload
+                if let protocol::StateDeltaOperationPayload::ChatSessionRemoved {
+                    session_id, ..
+                } = operation.payload
                 {
-                    set_session_failed(Arc::clone(&state), &session_id, "chat session removed").await?;
+                    set_session_failed(Arc::clone(&state), &session_id, "chat session removed")
+                        .await?;
                 }
             }
         }
@@ -891,7 +892,10 @@ async fn handle_server_event(
     Ok(())
 }
 
-async fn ensure_thread_can_host_workflow(state: &Arc<AppState>, thread_id: &str) -> Result<(), String> {
+async fn ensure_thread_can_host_workflow(
+    state: &Arc<AppState>,
+    thread_id: &str,
+) -> Result<(), String> {
     let store = state.store.lock().await;
     let thread = store
         .thread_by_id(thread_id)
@@ -912,17 +916,20 @@ fn ensure_spawn_allowed(phase: &protocol::WorkflowPhase) -> Result<(), String> {
         | protocol::WorkflowPhase::Testing
         | protocol::WorkflowPhase::Fixing
         | protocol::WorkflowPhase::Blocked => Ok(()),
-        protocol::WorkflowPhase::Reviewing => {
-            Err("invalid workflow phase transition: workers cannot spawn during REVIEWING".to_string())
-        }
-        protocol::WorkflowPhase::Complete | protocol::WorkflowPhase::Failed => {
-            Err(format!("invalid workflow phase transition: cannot spawn in {phase:?}"))
-        }
+        protocol::WorkflowPhase::Reviewing => Err(
+            "invalid workflow phase transition: workers cannot spawn during REVIEWING".to_string(),
+        ),
+        protocol::WorkflowPhase::Complete | protocol::WorkflowPhase::Failed => Err(format!(
+            "invalid workflow phase transition: cannot spawn in {phase:?}"
+        )),
     }
 }
 
 fn workflow_is_active_phase(phase: &protocol::WorkflowPhase) -> bool {
-    !matches!(phase, protocol::WorkflowPhase::Complete | protocol::WorkflowPhase::Failed)
+    !matches!(
+        phase,
+        protocol::WorkflowPhase::Complete | protocol::WorkflowPhase::Failed
+    )
 }
 
 fn worker_is_active(status: &protocol::WorkflowWorkerStatus) -> bool {
@@ -956,7 +963,10 @@ fn validate_phase_transition(
 
     let valid = match current {
         protocol::WorkflowPhase::Planning => {
-            matches!(next, protocol::WorkflowPhase::Implementing | protocol::WorkflowPhase::Blocked)
+            matches!(
+                next,
+                protocol::WorkflowPhase::Implementing | protocol::WorkflowPhase::Blocked
+            )
         }
         protocol::WorkflowPhase::Implementing => matches!(
             next,
@@ -1118,10 +1128,8 @@ async fn rollback_review_start(
         workflow.state.review_started_at = checkpoint.previous_review_started_at.clone();
         touch_workflow(&mut workflow.state);
         let workflow_state = workflow.state.clone();
-        let phase_change = (current_phase != checkpoint.previous_phase).then_some((
-            current_phase,
-            checkpoint.previous_phase.clone(),
-        ));
+        let phase_change = (current_phase != checkpoint.previous_phase)
+            .then_some((current_phase, checkpoint.previous_phase.clone()));
         store.save()?;
         (workflow_state, phase_change, session_ids)
     };
@@ -1227,7 +1235,9 @@ async fn set_session_running(state: Arc<AppState>, session_id: &str) -> Result<(
                 .iter()
                 .position(|worker| worker.session_id.as_deref() == Some(session_id))
             {
-                if workflow.state.workers[worker_index].status != protocol::WorkflowWorkerStatus::Running {
+                if workflow.state.workers[worker_index].status
+                    != protocol::WorkflowWorkerStatus::Running
+                {
                     {
                         let worker = &mut workflow.state.workers[worker_index];
                         worker.status = protocol::WorkflowWorkerStatus::Running;
@@ -1585,9 +1595,15 @@ mod tests {
 
         let store = state.workflows.lock().await;
         let workflow = find_workflow_locked(&store, "wf-1").expect("workflow");
-        assert_eq!(workflow.workers[0].status, protocol::WorkflowWorkerStatus::Running);
+        assert_eq!(
+            workflow.workers[0].status,
+            protocol::WorkflowWorkerStatus::Running
+        );
         assert_eq!(workflow.workers[0].failure_message, None);
-        assert_eq!(workflow.workers[0].agent_status, Some(protocol::AgentStatus::Busy));
+        assert_eq!(
+            workflow.workers[0].agent_status,
+            Some(protocol::AgentStatus::Busy)
+        );
     }
 
     #[tokio::test]
@@ -1616,8 +1632,14 @@ mod tests {
 
         let store = state.workflows.lock().await;
         let workflow = find_workflow_locked(&store, "wf-1").expect("workflow");
-        assert_eq!(workflow.reviewers[0].status, protocol::WorkflowWorkerStatus::Running);
+        assert_eq!(
+            workflow.reviewers[0].status,
+            protocol::WorkflowWorkerStatus::Running
+        );
         assert_eq!(workflow.reviewers[0].failure_message, None);
-        assert_eq!(workflow.reviewers[0].agent_status, Some(protocol::AgentStatus::Idle));
+        assert_eq!(
+            workflow.reviewers[0].agent_status,
+            Some(protocol::AgentStatus::Idle)
+        );
     }
 }
