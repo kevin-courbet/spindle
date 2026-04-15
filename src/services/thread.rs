@@ -286,12 +286,8 @@ impl ThreadService {
             (thread, project_path)
         };
 
-        let cleanup_result = Self::perform_close_cleanup(
-            Arc::clone(&state),
-            &thread,
-            &project_path,
-        )
-        .await;
+        let cleanup_result =
+            Self::perform_close_cleanup(Arc::clone(&state), &thread, &project_path).await;
 
         match cleanup_result {
             Ok(()) => {

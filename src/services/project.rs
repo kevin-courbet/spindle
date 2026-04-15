@@ -381,7 +381,9 @@ pub fn load_project_presets(project_path: &str) -> Result<Vec<protocol::PresetCo
     Ok(presets)
 }
 
-pub fn load_project_agents(project_path: &str) -> Result<Vec<protocol::ProjectAgentConfig>, String> {
+pub fn load_project_agents(
+    project_path: &str,
+) -> Result<Vec<protocol::ProjectAgentConfig>, String> {
     let Some(parsed) = load_project_config(project_path)? else {
         return Ok(vec![]);
     };

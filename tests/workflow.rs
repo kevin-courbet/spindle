@@ -159,11 +159,7 @@ async fn wait_for_thread_ready(harness: &mut common::TestHarness, thread_id: &st
     }
 }
 
-async fn wait_for_chat_ready(
-    harness: &mut common::TestHarness,
-    thread_id: &str,
-    session_id: &str,
-) {
+async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str, session_id: &str) {
     loop {
         let ready = harness
             .wait_for_event("chat.session_ready", Duration::from_secs(10))
@@ -233,7 +229,11 @@ async fn assert_reviewer_status(
     );
 }
 
-async fn cleanup_thread_project(harness: &mut common::TestHarness, thread_id: &str, project_id: &str) {
+async fn cleanup_thread_project(
+    harness: &mut common::TestHarness,
+    thread_id: &str,
+    project_id: &str,
+) {
     let _ = harness
         .rpc(
             "thread.close",
@@ -292,7 +292,10 @@ async fn workflow_create_persists_and_appears_in_state_snapshot() {
         .wait_for_event("workflow.created", Duration::from_secs(5))
         .await
         .expect("workflow.created event");
-    assert_eq!(created_event["params"]["workflow"]["workflow_id"], workflow_id);
+    assert_eq!(
+        created_event["params"]["workflow"]["workflow_id"],
+        workflow_id
+    );
 
     let snapshot = harness
         .rpc("state.snapshot", json!({}))
@@ -309,7 +312,10 @@ async fn workflow_create_persists_and_appears_in_state_snapshot() {
     );
 
     let raw = fs::read_to_string(workflows_path()).expect("read workflows.json");
-    assert!(raw.contains(&workflow_id), "workflow should persist to workflows.json");
+    assert!(
+        raw.contains(&workflow_id),
+        "workflow should persist to workflows.json"
+    );
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
@@ -642,7 +648,10 @@ async fn workflow_start_review_rolls_back_partial_reviewer_spawns_on_error() {
     assert!(status["review_started_at"].is_null());
 
     let reviewers = harness
-        .rpc("workflow.list_reviewers", json!({ "workflow_id": workflow_id }))
+        .rpc(
+            "workflow.list_reviewers",
+            json!({ "workflow_id": workflow_id }),
+        )
         .await
         .expect("workflow.list_reviewers after failed review start");
     assert!(reviewers
@@ -715,7 +724,10 @@ async fn workflow_review_records_findings_and_reconciles_after_restart() {
     assert_reviewer_status(&mut harness, &workflow_id, "R001", "RUNNING").await;
 
     let reviewers = harness
-        .rpc("workflow.list_reviewers", json!({ "workflow_id": workflow_id }))
+        .rpc(
+            "workflow.list_reviewers",
+            json!({ "workflow_id": workflow_id }),
+        )
         .await
         .expect("workflow.list_reviewers");
     assert_eq!(reviewers.as_array().expect("reviewers array").len(), 1);
