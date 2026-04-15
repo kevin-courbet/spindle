@@ -30,8 +30,8 @@ jobs:
             use_zigbuild: true
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+        # submodule `threadmill` is only needed by codegen/generate.sh; the
+        # generated src/protocol.rs is committed, so cargo builds don't need it.
 
       - name: Cache cargo + target
         uses: actions/cache@v4
