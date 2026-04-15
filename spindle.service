@@ -1,10 +1,10 @@
 [Unit]
-Description=Threadmill daemon
-After=network.target
+Description=Spindle daemon for Threadmill
+After=default.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/spindle
+ExecStart=%h/.local/bin/spindle
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
