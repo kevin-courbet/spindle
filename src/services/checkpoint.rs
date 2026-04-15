@@ -185,7 +185,14 @@ impl CheckpointService {
             checkpoint.summary.session_id.as_deref(),
             checkpoint.history_cursor(),
         ) {
-            truncate_history_to_cursor(&state, &context.thread_id, session_id, history_cursor).await?;
+            truncate_history_to_cursor(&state, &context.thread_id, session_id, history_cursor)
+                .await?;
+            ChatService::prepare_restored_session_context(
+                Arc::clone(&state),
+                &context.thread_id,
+                session_id,
+            )
+            .await;
         }
 
         Ok(protocol::CheckpointRestoreResult {

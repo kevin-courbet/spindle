@@ -70,6 +70,7 @@ fn write_mock_chat_agent(repo_path: &Path) {
         repo_path.join("mock-chat-agent.sh"),
         r#"#!/usr/bin/env python3
 import json
+import os
 import sys
 import time
 
@@ -84,6 +85,11 @@ for raw in sys.stdin.buffer:
 
     rid = msg.get("id")
     method = msg.get("method")
+    with open(os.path.join(os.getcwd(), "mock-chat-agent-log.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "method": method,
+            "params": msg.get("params"),
+        }) + "\n")
     if method == "initialize":
         time.sleep(0.2)
         result = {"protocolVersion": 1}
@@ -262,6 +268,53 @@ async fn send_test_update(harness: &mut common::TestHarness, channel_id: u16, ma
         .send_binary(channel_id, format!("{}\n", request).as_bytes())
         .await
         .expect("send test update request");
+}
+
+async fn send_user_prompt(
+    harness: &mut common::TestHarness,
+    channel_id: u16,
+    session_id: &str,
+    prompt: &str,
+) {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": prompt }]
+        }
+    });
+    harness
+        .send_binary(channel_id, format!("{}\n", request).as_bytes())
+        .await
+        .expect("send session prompt request");
+}
+
+fn read_mock_chat_agent_log(worktree_path: &Path) -> Vec<serde_json::Value> {
+    let log_path = worktree_path.join("mock-chat-agent-log.jsonl");
+    let Ok(raw) = fs::read_to_string(&log_path) else {
+        return Vec::new();
+    };
+
+    raw.lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse agent log entry"))
+        .collect()
+}
+
+async fn wait_for_mock_chat_agent_log(
+    worktree_path: &Path,
+    predicate: impl Fn(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    for _ in 0..50 {
+        let entries = read_mock_chat_agent_log(worktree_path);
+        if predicate(&entries) {
+            return entries;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("timed out waiting for mock chat agent log state");
 }
 
 async fn run_git(repo: &Path, args: &[&str]) -> String {
@@ -597,11 +650,12 @@ async fn chat_prompt_auto_saves_checkpoint() {
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
 
-
 #[tokio::test]
 async fn checkpoint_restore_truncates_chat_history_to_checkpoint() {
     if !common::tmux_available().await {
-        eprintln!("skipping checkpoint_restore_truncates_chat_history_to_checkpoint: tmux unavailable");
+        eprintln!(
+            "skipping checkpoint_restore_truncates_chat_history_to_checkpoint: tmux unavailable"
+        );
         return;
     }
 
@@ -697,6 +751,151 @@ async fn checkpoint_restore_truncates_chat_history_to_checkpoint() {
         after_updates[0]["update"]["content"].as_str(),
         Some("history-before-checkpoint")
     );
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn checkpoint_restore_reloads_chat_from_truncated_context_only() {
+    if !common::tmux_available().await {
+        eprintln!("skipping checkpoint_restore_reloads_chat_from_truncated_context_only: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_chat_project(&mut harness).await;
+    let created = create_thread(&mut harness, &project_id).await;
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = PathBuf::from(created["worktree_path"].as_str().expect("worktree path"));
+
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({ "thread_id": &thread_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({ "thread_id": &thread_id, "session_id": &session_id }),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel id") as u16;
+
+    send_test_update(&mut harness, channel_id, "history-before-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-before-checkpoint",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for first history marker");
+
+    harness
+        .rpc(
+            "checkpoint.save",
+            json!({
+                "thread_id": &thread_id,
+                "session_id": &session_id,
+                "message": "checkpoint after first history marker"
+            }),
+        )
+        .await
+        .expect("checkpoint.save after first marker");
+
+    send_test_update(&mut harness, channel_id, "history-after-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-after-checkpoint",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("wait for second history marker");
+
+    harness
+        .rpc(
+            "checkpoint.restore",
+            json!({ "thread_id": &thread_id, "seq": 1 }),
+        )
+        .await
+        .expect("checkpoint.restore");
+
+    let loaded = harness
+        .rpc(
+            "chat.load",
+            json!({ "thread_id": &thread_id, "session_id": &session_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.load after restore");
+    assert_eq!(loaded["status"], "starting");
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let reattached = harness
+        .rpc(
+            "chat.attach",
+            json!({ "thread_id": &thread_id, "session_id": &session_id }),
+        )
+        .await
+        .expect("chat.attach after restore load");
+    let reattached_channel_id = reattached["channel_id"].as_u64().expect("channel id") as u16;
+
+    send_user_prompt(
+        &mut harness,
+        reattached_channel_id,
+        &session_id,
+        "resume from checkpoint",
+    )
+    .await;
+
+    let log_entries = wait_for_mock_chat_agent_log(&worktree_path, |entries| {
+        entries
+            .iter()
+            .any(|entry| entry["method"] == "session/prompt")
+    })
+    .await;
+
+    let session_new_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/new")
+        .count();
+    let session_load_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/load")
+        .count();
+    assert!(
+        session_new_count >= 2,
+        "restore flow should use session/new for initial start and reload"
+    );
+    assert_eq!(
+        session_load_count, 0,
+        "restore reload must not use session/load"
+    );
+
+    let injected_prompt = log_entries
+        .iter()
+        .rev()
+        .find(|entry| entry["method"] == "session/prompt")
+        .and_then(|entry| entry["params"]["prompt"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    assert!(injected_prompt.contains("<conversation-history>"));
+    assert!(injected_prompt.contains("history-before-checkpoint"));
+    assert!(!injected_prompt.contains("history-after-checkpoint"));
+    assert!(injected_prompt.contains("resume from checkpoint"));
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
