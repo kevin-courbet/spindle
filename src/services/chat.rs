@@ -355,13 +355,16 @@ impl ChatService {
         };
         let history_path = history_path_for_session(&history_root, thread_id, session_id);
         let conversation_context = build_conversation_context(&history_path, None);
-        persist_session_metadata(&history_root, thread_id, session_id, None)?;
 
-        let mut chat = state.chat.lock().await;
-        if let Some(session) = chat.sessions.get_mut(session_id) {
-            session.acp_session_id = None;
-            session.conversation_context = conversation_context;
+        {
+            let mut chat = state.chat.lock().await;
+            if let Some(session) = chat.sessions.get_mut(session_id) {
+                session.acp_session_id = None;
+                session.conversation_context = conversation_context.clone();
+            }
         }
+
+        persist_session_metadata(&history_root, thread_id, session_id, None)?;
 
         Ok(())
     }
@@ -3505,10 +3508,15 @@ mod tests {
         .expect_err("metadata persistence should fail");
         assert!(error.contains(&metadata_path.display().to_string()));
 
+        let expected_context = build_conversation_context(
+            &history_path_for_session(&history_root, "thread-1", &session_id),
+            None,
+        );
+
         let chat = state.chat.lock().await;
         let session = chat.sessions.get(&session_id).expect("registered session");
-        assert_eq!(session.acp_session_id.as_deref(), Some("stale-acp-session"));
-        assert_eq!(session.conversation_context.as_deref(), Some("stale context"));
+        assert_eq!(session.acp_session_id, None);
+        assert_eq!(session.conversation_context, expected_context);
     }
 
     #[tokio::test]

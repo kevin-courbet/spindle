@@ -394,7 +394,6 @@ async fn checkpoint_save_list_diff_and_restore_round_trip() {
     let created = create_thread(&mut harness, &project_id).await;
     let thread_id = created["id"].as_str().expect("thread id").to_string();
     let worktree_path = PathBuf::from(created["worktree_path"].as_str().expect("worktree path"));
-
     wait_for_thread_ready(&mut harness, &thread_id).await;
 
     let readme = worktree_path.join("README.md");
@@ -515,7 +514,6 @@ async fn checkpoint_save_skips_when_git_is_busy() {
     let created = create_thread(&mut harness, &project_id).await;
     let thread_id = created["id"].as_str().expect("thread id").to_string();
     let worktree_path = PathBuf::from(created["worktree_path"].as_str().expect("worktree path"));
-
     wait_for_thread_ready(&mut harness, &thread_id).await;
 
     let git_dir = git_dir(&worktree_path).await;
@@ -1096,6 +1094,7 @@ async fn checkpoint_restore_returns_error_when_restored_metadata_persist_fails()
     let (_project, project_id) = add_chat_project(&mut harness).await;
     let created = create_thread(&mut harness, &project_id).await;
     let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = PathBuf::from(created["worktree_path"].as_str().expect("worktree path"));
 
     wait_for_thread_ready(&mut harness, &thread_id).await;
 
@@ -1167,6 +1166,71 @@ async fn checkpoint_restore_returns_error_when_restored_metadata_persist_fails()
 
     #[cfg(unix)]
     set_read_only(&metadata_path, false);
+
+    let loaded = harness
+        .rpc(
+            "chat.load",
+            json!({ "thread_id": &thread_id, "session_id": &session_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.load after failed restore");
+    assert_eq!(loaded["status"], "starting");
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let reattached = harness
+        .rpc(
+            "chat.attach",
+            json!({ "thread_id": &thread_id, "session_id": &session_id }),
+        )
+        .await
+        .expect("chat.attach after failed restore load");
+    let reattached_channel_id = reattached["channel_id"].as_u64().expect("channel id") as u16;
+
+    send_user_prompt(
+        &mut harness,
+        reattached_channel_id,
+        &session_id,
+        "resume after failed restore",
+    )
+    .await;
+
+    let log_entries = wait_for_mock_chat_agent_log(&worktree_path, |entries| {
+        entries
+            .iter()
+            .any(|entry| entry["method"] == "session/prompt")
+    })
+    .await;
+
+    let session_new_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/new")
+        .count();
+    let session_load_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/load")
+        .count();
+    assert!(
+        session_new_count >= 2,
+        "failed restore should still reload with session/new in same process"
+    );
+    assert_eq!(
+        session_load_count, 0,
+        "failed restore reload must not use session/load"
+    );
+
+    let injected_prompt = log_entries
+        .iter()
+        .rev()
+        .find(|entry| entry["method"] == "session/prompt")
+        .and_then(|entry| entry["params"]["prompt"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    assert!(injected_prompt.contains("<conversation-history>"));
+    assert!(injected_prompt.contains("history-before-checkpoint"));
+    assert!(!injected_prompt.contains("history-after-checkpoint"));
+    assert!(injected_prompt.contains("resume after failed restore"));
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
