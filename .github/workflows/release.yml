@@ -44,15 +44,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-${{ matrix.triple }}-
 
-      - name: Install zig (Linux targets only)
+      - name: Install zig + cargo-zigbuild (Linux targets only)
         if: matrix.use_zigbuild
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.15.2
-
-      - name: Install cargo-zigbuild (Linux targets only)
-        if: matrix.use_zigbuild
-        run: cargo install cargo-zigbuild --locked
+        run: |
+          brew install zig
+          zig version
+          cargo install cargo-zigbuild --locked
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.triple }}
