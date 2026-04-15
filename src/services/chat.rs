@@ -928,8 +928,7 @@ async fn run_session_task(
 
         // Read platform system prompt from ~/.config/threadmill/system-prompt.md
         let platform_prompt = {
-            let config_dir =
-                dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("/home/wsl/.config"));
+            let config_dir = dirs::config_dir().unwrap_or_else(std::path::PathBuf::new);
             let platform_path = config_dir.join("threadmill").join("system-prompt.md");
             match std::fs::read_to_string(&platform_path) {
                 Ok(content) => {

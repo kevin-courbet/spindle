@@ -488,7 +488,7 @@ fn resolve_clone_destination(url: &str, requested_path: Option<&str>) -> Result<
 
             Ok(destination)
         }
-        None => Ok(PathBuf::from("/home/wsl/dev").join(repo_name)),
+        None => Ok(crate::config::workspace_root().join(repo_name)),
     }
 }
 

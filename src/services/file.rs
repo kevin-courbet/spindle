@@ -33,7 +33,7 @@ impl FileService {
                 ));
             }
 
-            let read_dir = fs::read_dir(proc_fd_path(&opened.file))
+            let read_dir = fs::read_dir(fd_path(&opened.file)?)
                 .map_err(|err| format!("failed to read {}: {err}", opened.canonical.display()))?;
 
             let mut entries = Vec::new();
@@ -873,12 +873,40 @@ fn open_authorized_path(authorized: &AuthorizedPath) -> Result<OpenedAuthorizedP
 }
 
 fn canonicalize_open_file(file: &fs::File) -> Result<PathBuf, String> {
-    fs::canonicalize(proc_fd_path(file))
+    let path = fd_path(file)?;
+    fs::canonicalize(path)
         .map_err(|err| format!("failed to resolve opened file descriptor: {err}"))
 }
 
-fn proc_fd_path(file: &fs::File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+#[cfg(target_os = "linux")]
+fn fd_path(file: &fs::File) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
+}
+
+#[cfg(target_os = "macos")]
+fn fd_path(file: &fs::File) -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // MAXPATHLEN on macOS is 1024; allocate a full buffer and trim trailing NULs.
+    const MAXPATHLEN: usize = 1024;
+    let mut buf = vec![0u8; MAXPATHLEN];
+    let ret = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_GETPATH,
+            buf.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if ret != 0 {
+        return Err(format!(
+            "fcntl F_GETPATH failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(nul_pos);
+    Ok(PathBuf::from(OsString::from_vec(buf)))
 }
 
 async fn allowed_roots(state: Arc<AppState>) -> Result<Vec<PathBuf>, String> {

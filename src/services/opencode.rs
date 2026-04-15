@@ -12,7 +12,11 @@ use crate::protocol;
 const OPENCODE_HOST: &str = "127.0.0.1";
 const OPENCODE_PORT: u16 = 4101;
 const OPENCODE_URL: &str = "http://127.0.0.1:4101";
+
+#[cfg(target_os = "linux")]
 const DEFAULT_OPENCODE_BIN: &str = "/home/wsl/.bun/bin/opencode";
+#[cfg(target_os = "macos")]
+const DEFAULT_OPENCODE_BIN: &str = "opencode";
 
 fn opencode_bin() -> String {
     env::var("OPENCODE_BIN").unwrap_or_else(|_| DEFAULT_OPENCODE_BIN.to_string())

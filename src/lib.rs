@@ -19,6 +19,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+pub mod config;
 pub mod protocol;
 pub mod rpc_router;
 pub mod services;

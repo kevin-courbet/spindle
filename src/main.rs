@@ -34,6 +34,8 @@ async fn main() -> Result<(), spindle::DaemonError> {
         }
     });
 
-    info!(address = spindle::DEFAULT_ADDR, "starting daemon");
-    spindle::serve(spindle::DEFAULT_ADDR, shutdown_rx).await
+    let addr =
+        std::env::var("SPINDLE_ADDR").unwrap_or_else(|_| spindle::DEFAULT_ADDR.to_string());
+    info!(address = %addr, "starting daemon");
+    spindle::serve(&addr, shutdown_rx).await
 }

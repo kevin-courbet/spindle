@@ -118,11 +118,12 @@ impl ThreadService {
             let branch = resolve_branch(&params, &thread_name)?;
             let worktree_path = match &params.source_type {
                 protocol::SourceType::MainCheckout => project.path.clone(),
-                _ => format!(
-                    "/home/wsl/dev/.threadmill/{}/{}",
-                    sanitize_name(&project.name),
-                    thread_name
-                ),
+                _ => crate::config::workspace_root()
+                    .join(".threadmill")
+                    .join(sanitize_name(&project.name))
+                    .join(&thread_name)
+                    .to_string_lossy()
+                    .into_owned(),
             };
             if store.data.threads.iter().any(|existing| {
                 existing.project_id == project.id

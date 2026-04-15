@@ -1,14 +1,16 @@
 use std::path::Path;
 
 use crate::protocol::{self, SystemStatsResult};
+use sysinfo::System;
 use tokio::process::Command;
 
 pub struct SystemService;
 
 impl SystemService {
     pub async fn stats(_params: protocol::SystemStatsParams) -> Result<SystemStatsResult, String> {
-        let ((total_mb, used_mb), load_avg_1m, opencode_instances) =
-            tokio::join!(get_memory_stats(), get_load_avg(), get_opencode_instances());
+        let (total_mb, used_mb) = get_memory_stats();
+        let load_avg_1m = get_load_avg();
+        let opencode_instances = get_opencode_instances().await;
 
         Ok(SystemStatsResult {
             load_avg_1m,
@@ -19,61 +21,14 @@ impl SystemService {
     }
 }
 
-async fn get_memory_stats() -> (u32, u32) {
-    match tokio::fs::read_to_string("/proc/meminfo").await {
-        Ok(content) => parse_memory_stats(&content),
-        Err(_) => (0, 0),
-    }
+fn get_memory_stats() -> (u32, u32) {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    (bytes_to_mb(sys.total_memory()), bytes_to_mb(sys.used_memory()))
 }
 
-fn parse_memory_stats(content: &str) -> (u32, u32) {
-    let mut total_kb = 0_u64;
-    let mut free_kb = 0_u64;
-    let mut buffers_kb = 0_u64;
-    let mut cached_kb = 0_u64;
-
-    for line in content.lines() {
-        let mut parts = line.split_whitespace();
-        let Some(name) = parts.next() else {
-            continue;
-        };
-        let Some(value_raw) = parts.next() else {
-            continue;
-        };
-        let Ok(value_kb) = value_raw.parse::<u64>() else {
-            continue;
-        };
-
-        match name {
-            "MemTotal:" => total_kb = value_kb,
-            "MemFree:" => free_kb = value_kb,
-            "Buffers:" => buffers_kb = value_kb,
-            "Cached:" => cached_kb = value_kb,
-            _ => {}
-        }
-    }
-
-    let used_kb = total_kb
-        .saturating_sub(free_kb)
-        .saturating_sub(buffers_kb)
-        .saturating_sub(cached_kb);
-
-    (to_mb(total_kb), to_mb(used_kb))
-}
-
-async fn get_load_avg() -> f64 {
-    match tokio::fs::read_to_string("/proc/loadavg").await {
-        Ok(content) => parse_load_avg(&content),
-        Err(_) => 0.0,
-    }
-}
-
-fn parse_load_avg(content: &str) -> f64 {
-    content
-        .split_whitespace()
-        .next()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.0)
+fn get_load_avg() -> f64 {
+    System::load_average().one
 }
 
 async fn get_opencode_instances() -> u32 {
@@ -125,7 +80,7 @@ fn executable_name(token: &str) -> &str {
         .unwrap_or(token)
 }
 
-fn to_mb(value_kb: u64) -> u32 {
-    let mb = value_kb / 1024;
+fn bytes_to_mb(value_bytes: u64) -> u32 {
+    let mb = value_bytes / (1024 * 1024);
     u32::try_from(mb).unwrap_or(u32::MAX)
 }
