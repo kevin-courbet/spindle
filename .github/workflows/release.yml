@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.triple }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: aarch64-apple-darwin
+            build_target: aarch64-apple-darwin
+            use_zigbuild: false
+          - triple: x86_64-apple-darwin
+            build_target: x86_64-apple-darwin
+            use_zigbuild: false
+          - triple: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-gnu.2.31
+            use_zigbuild: true
+          - triple: aarch64-unknown-linux-gnu
+            build_target: aarch64-unknown-linux-gnu.2.31
+            use_zigbuild: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.triple }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.triple }}-
+
+      - name: Install zig (Linux targets only)
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Install cargo-zigbuild (Linux targets only)
+        if: matrix.use_zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.triple }}
+
+      - name: Build (zigbuild for Linux, cargo for mac)
+        run: |
+          if [ "${{ matrix.use_zigbuild }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.build_target }} --bin spindle --bin threadmill-cli --locked
+          else
+            cargo build --release --target ${{ matrix.build_target }} --bin spindle --bin threadmill-cli --locked
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-workflow-dispatch}"
+          BIN_DIR="target/${{ matrix.triple }}/release"
+          STAGE_ROOT="$(mktemp -d)"
+          STAGE="${STAGE_ROOT}/spindle-${VERSION}-${{ matrix.triple }}"
+          mkdir -p "$STAGE"
+          cp "$BIN_DIR/spindle" "$BIN_DIR/threadmill-cli" "$STAGE/"
+          ARCHIVE="spindle-${VERSION}-${{ matrix.triple }}.tar.gz"
+          tar -czf "$ARCHIVE" -C "$STAGE_ROOT" "spindle-${VERSION}-${{ matrix.triple }}"
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindle-${{ matrix.triple }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish on tag pushes, not on workflow_dispatch dry runs.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la ./artifacts
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --repo "$GITHUB_REPOSITORY" \
+            ./artifacts/*.tar.gz ./artifacts/*.sha256
