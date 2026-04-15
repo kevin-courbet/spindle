@@ -174,6 +174,20 @@ impl CheckpointService {
         .await?;
         stop_all_presets_for_thread(Arc::clone(&state), &context).await?;
 
+        let restored_session = checkpoint
+            .summary
+            .session_id
+            .as_deref()
+            .zip(checkpoint.history_cursor());
+        if let Some((session_id, _)) = restored_session {
+            ChatService::mark_restored_session_for_new_session(
+                Arc::clone(&state),
+                &context.thread_id,
+                session_id,
+            )
+            .await?;
+        }
+
         git_output(
             &context.worktree_path,
             &["reset", "--hard", &checkpoint.summary.git_ref],
@@ -181,10 +195,7 @@ impl CheckpointService {
         .await?;
         git_output(&context.worktree_path, &["clean", "-fd"]).await?;
 
-        if let (Some(session_id), Some(history_cursor)) = (
-            checkpoint.summary.session_id.as_deref(),
-            checkpoint.history_cursor(),
-        ) {
+        if let Some((session_id, history_cursor)) = restored_session {
             truncate_history_to_cursor(&state, &context.thread_id, session_id, history_cursor)
                 .await?;
             ChatService::prepare_restored_session_context(

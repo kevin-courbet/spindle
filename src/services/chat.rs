@@ -369,6 +369,18 @@ impl ChatService {
         Ok(())
     }
 
+    pub(crate) async fn mark_restored_session_for_new_session(
+        state: Arc<AppState>,
+        thread_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        persist_restored_session_marker(&history_root, thread_id, session_id)
+    }
+
     pub async fn status(
         state: Arc<AppState>,
         params: protocol::ChatStatusParams,
@@ -1871,18 +1883,31 @@ async fn mark_session_ready(
         let chat = state.chat.lock().await;
         chat.history_root.clone()
     };
-    if let Err(error) = persist_session_metadata(
+    match persist_session_metadata(
         &history_root,
         thread_id,
         session_id,
         Some(handshake.acp_session_id.as_str()),
     ) {
-        warn!(
-            thread_id,
-            session_id,
-            error = %error,
-            "failed to persist chat session metadata"
-        );
+        Ok(()) => {
+            if let Err(error) = clear_restored_session_marker(&history_root, thread_id, session_id)
+            {
+                warn!(
+                    thread_id,
+                    session_id,
+                    error = %error,
+                    "failed to clear restored chat session marker"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                thread_id,
+                session_id,
+                error = %error,
+                "failed to persist chat session metadata"
+            );
+        }
     }
     {
         let mut chat = state.chat.lock().await;
@@ -2154,6 +2179,67 @@ fn history_metadata_path_for_session(
     history_root
         .join(thread_id)
         .join(format!("{session_id}.metadata.json"))
+}
+
+fn restored_session_marker_path_for_session(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> PathBuf {
+    history_root
+        .join(thread_id)
+        .join(format!("{session_id}.restore-session-new"))
+}
+
+fn persist_restored_session_marker(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let marker_path = restored_session_marker_path_for_session(history_root, thread_id, session_id);
+    let parent = marker_path.parent().ok_or_else(|| {
+        format!(
+            "invalid restored session marker path: {}",
+            marker_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+
+    let mut file = fs::File::create(&marker_path)
+        .map_err(|err| format!("failed to create {}: {err}", marker_path.display()))?;
+    file.write_all(b"session/new\n")
+        .map_err(|err| format!("failed to write {}: {err}", marker_path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("failed to fsync {}: {err}", marker_path.display()))
+}
+
+fn restored_session_marker_exists(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    restored_session_marker_path_for_session(history_root, thread_id, session_id)
+        .try_exists()
+        .map_err(|err| {
+            format!(
+                "failed to stat restored session marker for {}: {err}",
+                session_id
+            )
+        })
+}
+
+fn clear_restored_session_marker(
+    history_root: &Path,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let marker_path = restored_session_marker_path_for_session(history_root, thread_id, session_id);
+    match fs::remove_file(&marker_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to remove {}: {err}", marker_path.display())),
+    }
 }
 
 fn persist_session_metadata(
@@ -2855,20 +2941,34 @@ fn discover_history_sessions(
                 .to_rfc3339();
 
             let acp_session_id =
-                match read_persisted_session_metadata(history_root, &thread_id, stem) {
-                    Ok(Some(metadata)) => metadata.acp_session_id,
-                    Ok(None) => {
-                        // Legacy sessions derive ACP session ID from first JSONL entry.
-                        // Restored sessions persist metadata with acp_session_id = null so
-                        // recovery durably falls back to session/new after daemon restart.
-                        read_history_acp_session_id(&path)
+                match restored_session_marker_exists(history_root, &thread_id, stem) {
+                    Ok(true) => None,
+                    Ok(false) => {
+                        match read_persisted_session_metadata(history_root, &thread_id, stem) {
+                            Ok(Some(metadata)) => metadata.acp_session_id,
+                            Ok(None) => {
+                                // Legacy sessions derive ACP session ID from first JSONL entry.
+                                // Restored sessions persist metadata with acp_session_id = null so
+                                // recovery durably falls back to session/new after daemon restart.
+                                read_history_acp_session_id(&path)
+                            }
+                            Err(error) => {
+                                warn!(
+                                    thread_id,
+                                    session_id = stem,
+                                    error = %error,
+                                    "failed to read persisted chat session metadata"
+                                );
+                                None
+                            }
+                        }
                     }
                     Err(error) => {
                         warn!(
                             thread_id,
                             session_id = stem,
                             error = %error,
-                            "failed to read persisted chat session metadata"
+                            "failed to read restored chat session marker"
                         );
                         None
                     }
@@ -3478,9 +3578,15 @@ mod tests {
             ),
         )
         .expect("write history file");
-        persist_session_metadata(&history_root, "thread-1", &session_id, Some("acp-session-1"))
-            .expect("persist initial metadata");
-        let metadata_path = history_metadata_path_for_session(&history_root, "thread-1", &session_id);
+        persist_session_metadata(
+            &history_root,
+            "thread-1",
+            &session_id,
+            Some("acp-session-1"),
+        )
+        .expect("persist initial metadata");
+        let metadata_path =
+            history_metadata_path_for_session(&history_root, "thread-1", &session_id);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3579,6 +3685,75 @@ mod tests {
         .expect("write persisted history");
         persist_session_metadata(&history_root, &thread_id, &session_id, None)
             .expect("persist restored metadata");
+
+        let state = Arc::new(AppState::new(StateStore {
+            path: state_dir.join("threads.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: thread_id.clone(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Closed,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }));
+
+        ChatService::recover_persisted_sessions(Arc::clone(&state))
+            .await
+            .expect("recover persisted sessions");
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id, None);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn recover_persisted_sessions_prefers_restore_marker_over_stale_metadata() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "spindle-chat-recovery-restore-marker-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_dir = temp_root.join("threadmill");
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let thread_id = "thread-recovery".to_string();
+        let session_id = "session-recovery".to_string();
+        let history_root = state_dir.join("chat");
+        let history_path = history_path_for_session(&history_root, &thread_id, &session_id);
+        fs::create_dir_all(
+            history_path
+                .parent()
+                .expect("history path should have parent"),
+        )
+        .expect("create history parent dir");
+        fs::write(
+            &history_path,
+            r#"{"sessionId":"acp-session-1","update":{"kind":"agent_message_chunk","content":"hello"}}
+"#,
+        )
+        .expect("write persisted history");
+        persist_session_metadata(
+            &history_root,
+            &thread_id,
+            &session_id,
+            Some("acp-session-1"),
+        )
+        .expect("persist stale metadata");
+        persist_restored_session_marker(&history_root, &thread_id, &session_id)
+            .expect("persist restore marker");
 
         let state = Arc::new(AppState::new(StateStore {
             path: state_dir.join("threads.json"),
