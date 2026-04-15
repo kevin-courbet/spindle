@@ -207,7 +207,7 @@ async fn cleanup_thread_project(
 async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str, session_id: &str) {
     loop {
         let ready = harness
-            .wait_for_event("chat.session_ready", Duration::from_secs(10))
+            .wait_for_event("chat.session_ready", Duration::from_secs(5))
             .await;
         if let Ok(event) = ready {
             if event["params"]["thread_id"] == thread_id
@@ -693,7 +693,7 @@ async fn checkpoint_restore_truncates_chat_history_to_checkpoint() {
         .wait_for_channel_output_contains(
             channel_id,
             b"history-before-checkpoint",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for first history marker");
@@ -715,7 +715,7 @@ async fn checkpoint_restore_truncates_chat_history_to_checkpoint() {
         .wait_for_channel_output_contains(
             channel_id,
             b"history-after-checkpoint",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for second history marker");
@@ -797,7 +797,7 @@ async fn checkpoint_restore_reloads_chat_from_truncated_context_only() {
         .wait_for_channel_output_contains(
             channel_id,
             b"history-before-checkpoint",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for first history marker");
@@ -819,7 +819,7 @@ async fn checkpoint_restore_reloads_chat_from_truncated_context_only() {
         .wait_for_channel_output_contains(
             channel_id,
             b"history-after-checkpoint",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for second history marker");
@@ -944,7 +944,7 @@ async fn checkpoint_restore_restart_before_load_uses_session_new() {
         .wait_for_channel_output_contains(
             channel_id,
             b"history-before-checkpoint",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for first history marker");
@@ -966,7 +966,7 @@ async fn checkpoint_restore_restart_before_load_uses_session_new() {
         .wait_for_channel_output_contains(
             channel_id,
             b"history-after-checkpoint",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for second history marker");

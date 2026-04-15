@@ -231,7 +231,7 @@ async fn cleanup_thread_project(
 async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str, session_id: &str) {
     loop {
         let ready = harness
-            .wait_for_event("chat.session_ready", Duration::from_secs(10))
+            .wait_for_event("chat.session_ready", Duration::from_secs(5))
             .await;
         if let Ok(event) = ready {
             if event["params"]["thread_id"] == thread_id
@@ -276,7 +276,7 @@ async fn wait_for_injection_complete(
 ) {
     loop {
         let event = harness
-            .wait_for_event("chat.injection_complete", Duration::from_secs(10))
+            .wait_for_event("chat.injection_complete", Duration::from_secs(5))
             .await
             .expect("chat.injection_complete");
         if event["params"]["thread_id"] == thread_id && event["params"]["session_id"] == session_id
@@ -509,7 +509,7 @@ async fn chat_load_restarts_archived_session() {
         .await
         .expect("chat.stop");
     let _ = harness
-        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .wait_for_event("chat.session_ended", Duration::from_secs(5))
         .await
         .expect("chat.session_ended");
 
@@ -567,7 +567,7 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .wait_for_channel_output_contains(
             channel_id,
             b"persisted-before-recovery",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for persisted output");
@@ -580,7 +580,7 @@ async fn chat_load_recovers_session_without_acp_session_id_via_session_new() {
         .await
         .expect("chat.stop");
     harness
-        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .wait_for_event("chat.session_ended", Duration::from_secs(5))
         .await
         .expect("chat.session_ended");
 
@@ -957,7 +957,7 @@ async fn chat_history_jsonl_preserves_acp_session_id_for_recovery() {
         .wait_for_channel_output_contains(
             channel_id,
             b"recovery-test-marker",
-            Duration::from_secs(10),
+            Duration::from_secs(5),
         )
         .await
         .expect("wait for marker output");
@@ -993,7 +993,7 @@ async fn chat_history_jsonl_preserves_acp_session_id_for_recovery() {
         .await
         .expect("chat.stop");
     harness
-        .wait_for_event("chat.session_ended", Duration::from_secs(10))
+        .wait_for_event("chat.session_ended", Duration::from_secs(5))
         .await
         .expect("chat.session_ended");
 
