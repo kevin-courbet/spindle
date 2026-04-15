@@ -192,7 +192,7 @@ impl CheckpointService {
                 &context.thread_id,
                 session_id,
             )
-            .await;
+            .await?;
         }
 
         Ok(protocol::CheckpointRestoreResult {

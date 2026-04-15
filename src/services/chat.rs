@@ -348,27 +348,22 @@ impl ChatService {
         state: Arc<AppState>,
         thread_id: &str,
         session_id: &str,
-    ) {
+    ) -> Result<(), String> {
         let history_root = {
             let chat = state.chat.lock().await;
             chat.history_root_path().to_path_buf()
         };
         let history_path = history_path_for_session(&history_root, thread_id, session_id);
         let conversation_context = build_conversation_context(&history_path, None);
-        if let Err(error) = persist_session_metadata(&history_root, thread_id, session_id, None) {
-            warn!(
-                thread_id,
-                session_id,
-                error = %error,
-                "failed to persist restored chat session metadata"
-            );
-        }
+        persist_session_metadata(&history_root, thread_id, session_id, None)?;
 
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
             session.acp_session_id = None;
             session.conversation_context = conversation_context;
         }
+
+        Ok(())
     }
 
     pub async fn status(
@@ -2872,7 +2867,7 @@ fn discover_history_sessions(
                             error = %error,
                             "failed to read persisted chat session metadata"
                         );
-                        read_history_acp_session_id(&path)
+                        None
                     }
                 };
 
@@ -3445,7 +3440,8 @@ mod tests {
         register_test_session(&state, 9, session).await;
 
         ChatService::prepare_restored_session_context(Arc::clone(&state), "thread-1", &session_id)
-            .await;
+            .await
+            .expect("prepare restored session context");
 
         let metadata = read_persisted_session_metadata(&history_root, "thread-1", &session_id)
             .expect("read restored session metadata")
@@ -3456,6 +3452,63 @@ mod tests {
         let session = chat.sessions.get(&session_id).expect("registered session");
         assert_eq!(session.acp_session_id, None);
         assert_eq!(session.conversation_context, expected_context);
+    }
+
+    #[tokio::test]
+    async fn prepare_restored_session_context_returns_error_when_metadata_persist_fails() {
+        let state = make_test_state();
+        let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let history_path = history_path_for_session(&history_root, "thread-1", &session_id);
+        fs::create_dir_all(history_path.parent().expect("history parent"))
+            .expect("create history dir");
+        fs::write(
+            &history_path,
+            concat!(
+                r#"{"sessionId":"acp-session-1","update":{"kind":"user_message_chunk","content":"kept prompt"}}"#,
+                "\n",
+                r#"{"sessionId":"acp-session-1","update":{"kind":"agent_message_chunk","content":"kept reply"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write history file");
+        persist_session_metadata(&history_root, "thread-1", &session_id, Some("acp-session-1"))
+            .expect("persist initial metadata");
+        let metadata_path = history_metadata_path_for_session(&history_root, "thread-1", &session_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&metadata_path)
+                .expect("read metadata permissions")
+                .permissions();
+            permissions.set_mode(0o444);
+            fs::set_permissions(&metadata_path, permissions).expect("chmod metadata read only");
+        }
+
+        let mut session = make_test_session();
+        session.summary.session_id = session_id.clone();
+        session.history_path = history_path;
+        session.acp_session_id = Some("stale-acp-session".to_string());
+        session.conversation_context = Some("stale context".to_string());
+        register_test_session(&state, 11, session).await;
+
+        let error = ChatService::prepare_restored_session_context(
+            Arc::clone(&state),
+            "thread-1",
+            &session_id,
+        )
+        .await
+        .expect_err("metadata persistence should fail");
+        assert!(error.contains(&metadata_path.display().to_string()));
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("registered session");
+        assert_eq!(session.acp_session_id.as_deref(), Some("stale-acp-session"));
+        assert_eq!(session.conversation_context.as_deref(), Some("stale context"));
     }
 
     #[tokio::test]
@@ -3555,6 +3608,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_persisted_sessions_does_not_fallback_to_history_when_metadata_is_corrupt() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "spindle-chat-recovery-corrupt-metadata-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state_dir = temp_root.join("threadmill");
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let thread_id = "thread-recovery".to_string();
+        let session_id = "session-recovery".to_string();
+        let history_root = state_dir.join("chat");
+        let history_path = history_path_for_session(&history_root, &thread_id, &session_id);
+        fs::create_dir_all(
+            history_path
+                .parent()
+                .expect("history path should have parent"),
+        )
+        .expect("create history parent dir");
+        fs::write(
+            &history_path,
+            "{\"sessionId\":\"acp-session-1\",\"update\":{\"kind\":\"agent_message_chunk\",\"content\":\"hello\"}}
+",
+        )
+        .expect("write persisted history");
+        let metadata_path =
+            history_metadata_path_for_session(&history_root, &thread_id, &session_id);
+        fs::write(&metadata_path, "{not json").expect("write corrupt session metadata");
+
+        let state = Arc::new(AppState::new(StateStore {
+            path: state_dir.join("threads.json"),
+            data: AppData {
+                projects: vec![Project {
+                    id: "project-1".to_string(),
+                    name: "project".to_string(),
+                    path: "/tmp/project".to_string(),
+                    default_branch: "main".to_string(),
+                }],
+                threads: vec![Thread {
+                    id: thread_id.clone(),
+                    project_id: "project-1".to_string(),
+                    name: "thread".to_string(),
+                    branch: "main".to_string(),
+                    worktree_path: "/tmp/project".to_string(),
+                    status: protocol::ThreadStatus::Closed,
+                    source_type: protocol::SourceType::ExistingBranch,
+                    created_at: Utc::now(),
+                    tmux_session: "tm_test".to_string(),
+                    port_offset: 0,
+                }],
+            },
+        }));
+
+        ChatService::recover_persisted_sessions(Arc::clone(&state))
+            .await
+            .expect("recover persisted sessions");
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id, None);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
     async fn prepare_restored_session_context_skips_missing_runtime_session() {
         let state = make_test_state();
         let session_id = format!("missing-session-{}", uuid::Uuid::new_v4().simple());
@@ -3572,7 +3688,8 @@ mod tests {
         .expect("write history file");
 
         ChatService::prepare_restored_session_context(Arc::clone(&state), "thread-1", &session_id)
-            .await;
+            .await
+            .expect("prepare restored context for missing session");
 
         let chat = state.chat.lock().await;
         assert!(chat.sessions.get(&session_id).is_none());
@@ -3824,6 +3941,11 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, session_id);
         assert_eq!(listed[0].status, protocol::ChatSessionStatus::Ended);
+
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id).expect("recovered session");
+        assert_eq!(session.acp_session_id.as_deref(), Some("acp-session-1"));
+        drop(chat);
 
         let history = ChatService::history(
             Arc::clone(&state),

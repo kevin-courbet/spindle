@@ -363,6 +363,25 @@ async fn checkpoint_refs(repo: &Path, thread_id: &str) -> Vec<String> {
     }
 }
 
+fn session_metadata_path(thread_id: &str, session_id: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("XDG_CONFIG_HOME set"))
+        .join("threadmill")
+        .join("chat")
+        .join(thread_id)
+        .join(format!("{session_id}.metadata.json"))
+}
+
+#[cfg(unix)]
+fn set_read_only(path: &Path, read_only: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .expect("read metadata permissions")
+        .permissions();
+    permissions.set_mode(if read_only { 0o444 } else { 0o644 });
+    fs::set_permissions(path, permissions).expect("update metadata permissions");
+}
+
 #[tokio::test]
 async fn checkpoint_save_list_diff_and_restore_round_trip() {
     if !common::tmux_available().await {
@@ -1062,6 +1081,94 @@ async fn checkpoint_restore_restart_before_load_uses_session_new() {
     assert!(injected_prompt.contains("resume from checkpoint after restart"));
 
     cleanup_thread_project(&mut recovered, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn checkpoint_restore_returns_error_when_restored_metadata_persist_fails() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping checkpoint_restore_returns_error_when_restored_metadata_persist_fails: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_chat_project(&mut harness).await;
+    let created = create_thread(&mut harness, &project_id).await;
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({ "thread_id": &thread_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({ "thread_id": &thread_id, "session_id": &session_id }),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel id") as u16;
+
+    send_test_update(&mut harness, channel_id, "history-before-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-before-checkpoint",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("wait for first history marker");
+
+    harness
+        .rpc(
+            "checkpoint.save",
+            json!({
+                "thread_id": &thread_id,
+                "session_id": &session_id,
+                "message": "checkpoint before metadata write failure"
+            }),
+        )
+        .await
+        .expect("checkpoint.save");
+
+    send_test_update(&mut harness, channel_id, "history-after-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-after-checkpoint",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("wait for second history marker");
+
+    let metadata_path = session_metadata_path(&thread_id, &session_id);
+    #[cfg(unix)]
+    set_read_only(&metadata_path, true);
+
+    let error = harness
+        .rpc_expect_error(
+            "checkpoint.restore",
+            json!({ "thread_id": &thread_id, "seq": 1 }),
+        )
+        .await;
+    assert!(error.contains(&metadata_path.display().to_string()));
+
+    #[cfg(unix)]
+    set_read_only(&metadata_path, false);
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
 
 #[tokio::test]
