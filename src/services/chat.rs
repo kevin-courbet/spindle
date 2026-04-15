@@ -217,6 +217,13 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatLoadParams,
     ) -> Result<protocol::ChatLoadResult, String> {
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let force_new_session =
+            restored_session_marker_exists(&history_root, &params.thread_id, &params.session_id)?;
+
         let (agent_type, load_session_id, stop_tx, history_path) = {
             let mut chat = state.chat.lock().await;
             let session = chat
@@ -236,7 +243,11 @@ impl ChatService {
                 });
             }
 
-            let load_session_id = session.acp_session_id.clone();
+            let load_session_id = if force_new_session {
+                None
+            } else {
+                session.acp_session_id.clone()
+            };
             session.summary.status = protocol::ChatSessionStatus::Starting;
             session.input_tx = None;
             let stop_tx = session.stop_tx.take();
@@ -553,12 +564,15 @@ impl ChatService {
         payload: Vec<u8>,
     ) -> Result<bool, String> {
         let (
+            thread_id,
+            session_id,
             input_tx,
             transitions,
             replacement_payload,
             prompt_updates,
             mut auto_checkpoints,
             history_path,
+            consumed_conversation_context,
         ) = {
             let mut chat = state.chat.lock().await;
             let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
@@ -577,19 +591,32 @@ impl ChatService {
                 .clone();
             let history_path = session.history_path.clone();
             let messages = extract_json_messages(&mut session.input_buffer, &payload, "input");
-            let (transitions, replacement_payload, prompt_updates, auto_checkpoints) =
+            let (
+                transitions,
+                replacement_payload,
+                prompt_updates,
+                auto_checkpoints,
+                consumed_conversation_context,
+            ) =
                 apply_inbound_status_updates(&state, session, messages);
             (
+                session.thread_id.clone(),
+                session_id,
                 input_tx,
                 transitions,
                 replacement_payload,
                 prompt_updates,
                 auto_checkpoints,
                 history_path,
+                consumed_conversation_context,
             )
         };
 
         emit_status_transitions(&state, transitions).await;
+
+        if consumed_conversation_context {
+            clear_pending_conversation_context(&state, &thread_id, &session_id).await?;
+        }
 
         // Capture history cursor BEFORE writing user echoes to the JSONL.
         // Auto-checkpoints need the line count from before the echo so that
@@ -1362,6 +1389,7 @@ fn apply_inbound_status_updates(
     Option<Vec<u8>>,
     Vec<Value>,
     Vec<AutoCheckpointRequest>,
+    bool,
 ) {
     let mut transitions = Vec::new();
     let mut messages = messages;
@@ -1369,6 +1397,7 @@ fn apply_inbound_status_updates(
     let mut payload_rewritten = false;
     let mut history_updates = Vec::new();
     let mut auto_checkpoints = Vec::new();
+    let mut consumed_conversation_context = false;
 
     for message in &mut messages {
         let method = message
@@ -1389,10 +1418,11 @@ fn apply_inbound_status_updates(
                 session.pending_prompt_ids.insert(id);
             }
 
-            if let Some(conversation_context) = session.conversation_context.take() {
+            if let Some(conversation_context) = session.conversation_context.as_deref() {
                 let context_block = format!("{conversation_context}\n\n---\n\n");
                 if prepend_prompt_text_block(message, &context_block) {
                     payload_rewritten = true;
+                    consumed_conversation_context = true;
                 }
             }
 
@@ -1427,6 +1457,7 @@ fn apply_inbound_status_updates(
         replacement_payload,
         history_updates,
         auto_checkpoints,
+        consumed_conversation_context,
     )
 }
 
@@ -1889,17 +1920,7 @@ async fn mark_session_ready(
         session_id,
         Some(handshake.acp_session_id.as_str()),
     ) {
-        Ok(()) => {
-            if let Err(error) = clear_restored_session_marker(&history_root, thread_id, session_id)
-            {
-                warn!(
-                    thread_id,
-                    session_id,
-                    error = %error,
-                    "failed to clear restored chat session marker"
-                );
-            }
-        }
+        Ok(()) => {}
         Err(error) => {
             warn!(
                 thread_id,
@@ -1932,6 +1953,25 @@ async fn mark_session_ready(
         config_options: handshake.config_options.clone(),
     });
     emit_state_delta_updated(&state, thread_id, session_id).await;
+}
+
+async fn clear_pending_conversation_context(
+    state: &Arc<AppState>,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let history_root = {
+        let chat = state.chat.lock().await;
+        chat.history_root_path().to_path_buf()
+    };
+    clear_restored_session_marker(&history_root, thread_id, session_id)?;
+
+    let mut chat = state.chat.lock().await;
+    if let Some(session) = chat.sessions.get_mut(session_id) {
+        session.conversation_context = None;
+    }
+
+    Ok(())
 }
 
 async fn mark_session_failed(
@@ -3260,7 +3300,7 @@ mod tests {
         let state = make_test_state();
         let mut session = make_test_session();
 
-        let (transitions, replacement_payload, _prompt_updates, auto_checkpoints) =
+        let (transitions, replacement_payload, _prompt_updates, auto_checkpoints, consumed) =
             apply_inbound_status_updates(
                 &state,
                 &mut session,
@@ -3278,6 +3318,7 @@ mod tests {
         );
         assert_eq!(auto_checkpoints[0].prompt_preview, None);
         assert_eq!(replacement_payload, None);
+        assert!(!consumed);
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].old_status, protocol::AgentStatus::Idle);
         assert_eq!(transitions[0].new_status, protocol::AgentStatus::Busy);
@@ -3305,7 +3346,7 @@ mod tests {
             }
         });
 
-        let (_transitions, replacement_payload, prompt_updates, _auto_checkpoints) =
+        let (_transitions, replacement_payload, prompt_updates, _auto_checkpoints, consumed) =
             apply_inbound_status_updates(&state, &mut session, vec![message]);
 
         let replacement_payload = replacement_payload.expect("replacement payload");
@@ -3342,7 +3383,8 @@ mod tests {
                 })
             ]
         );
-        assert_eq!(session.conversation_context, None);
+        assert!(consumed);
+        assert_eq!(session.conversation_context.as_deref(), Some("prior context"));
 
         cancel_stall_timer(&mut session);
     }
@@ -3351,6 +3393,12 @@ mod tests {
     async fn handle_binary_frame_prepends_context_block_but_persists_original_history() {
         let state = make_test_state();
         let (temp_root, history_path) = write_history_file(&[]);
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        persist_restored_session_marker(&history_root, "thread-1", "session-1")
+            .expect("persist restore marker");
         let mut session = make_test_session();
         session.history_path = history_path.clone();
         session.conversation_context = Some("prior context".to_string());
@@ -3400,6 +3448,14 @@ mod tests {
             serde_json::from_str(persisted_lines[0]).expect("parse history entry");
         assert_eq!(persisted_entry["sessionId"], "session-1");
         assert_eq!(persisted_entry["update"]["content"]["text"], "new prompt");
+
+        assert!(
+            !restored_session_marker_exists(&history_root, "thread-1", "session-1")
+                .expect("read restore marker state")
+        );
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get("session-1").expect("registered session");
+        assert_eq!(session.conversation_context, None);
 
         cancel_registered_stall_timer(&state, "session-1").await;
         let _ = fs::remove_dir_all(temp_root);
@@ -3626,7 +3682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_session_ready_persists_acp_session_metadata() {
+    async fn mark_session_ready_persists_acp_session_metadata_without_clearing_restore_marker() {
         let state = make_test_state();
         let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
         let history_root = {
@@ -3636,6 +3692,8 @@ mod tests {
         let history_path = history_path_for_session(&history_root, "thread-1", &session_id);
         fs::create_dir_all(history_path.parent().expect("history parent"))
             .expect("create history dir");
+        persist_restored_session_marker(&history_root, "thread-1", &session_id)
+            .expect("persist restore marker");
 
         let mut session = make_test_session();
         session.summary.session_id = session_id.clone();
@@ -3658,6 +3716,10 @@ mod tests {
             .expect("read ready session metadata")
             .expect("ready session metadata");
         assert_eq!(metadata.acp_session_id.as_deref(), Some("acp-session-2"));
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
+        );
     }
 
     #[tokio::test]
