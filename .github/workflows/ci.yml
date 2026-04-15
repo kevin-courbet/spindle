@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   check:
-    name: cargo check + test
+    name: fmt + clippy + check + test
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +36,12 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
       - name: cargo check
         run: cargo check --all-targets --locked
 
@@ -44,3 +50,12 @@ jobs:
         # talk over a local TCP socket; they expect a specific beast/tmux
         # layout and aren't self-contained enough for CI runners.
         run: cargo test --lib --locked
+
+  deny:
+    name: cargo-deny (licenses + advisories + sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
