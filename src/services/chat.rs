@@ -367,29 +367,25 @@ impl ChatService {
         let history_path = history_path_for_session(&history_root, thread_id, session_id);
         let conversation_context = build_conversation_context(&history_path, None);
 
-        {
+        let session_updated = {
             let mut chat = state.chat.lock().await;
             if let Some(session) = chat.sessions.get_mut(session_id) {
                 session.acp_session_id = None;
                 session.conversation_context = conversation_context.clone();
+                true
+            } else {
+                false
             }
+        };
+
+        if !session_updated {
+            return Ok(());
         }
 
+        persist_restored_session_marker(&history_root, thread_id, session_id)?;
         persist_session_metadata(&history_root, thread_id, session_id, None)?;
 
         Ok(())
-    }
-
-    pub(crate) async fn mark_restored_session_for_new_session(
-        state: Arc<AppState>,
-        thread_id: &str,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let history_root = {
-            let chat = state.chat.lock().await;
-            chat.history_root_path().to_path_buf()
-        };
-        persist_restored_session_marker(&history_root, thread_id, session_id)
     }
 
     pub async fn status(
@@ -597,8 +593,7 @@ impl ChatService {
                 prompt_updates,
                 auto_checkpoints,
                 consumed_conversation_context,
-            ) =
-                apply_inbound_status_updates(&state, session, messages);
+            ) = apply_inbound_status_updates(&state, session, messages);
             (
                 session.thread_id.clone(),
                 session_id,
@@ -613,10 +608,6 @@ impl ChatService {
         };
 
         emit_status_transitions(&state, transitions).await;
-
-        if consumed_conversation_context {
-            clear_pending_conversation_context(&state, &thread_id, &session_id).await?;
-        }
 
         // Capture history cursor BEFORE writing user echoes to the JSONL.
         // Auto-checkpoints need the line count from before the echo so that
@@ -679,6 +670,11 @@ impl ChatService {
         input_tx
             .try_send(final_payload)
             .map_err(|err| format!("failed to queue chat input for channel {channel_id}: {err}"))?;
+
+        if consumed_conversation_context {
+            clear_pending_conversation_context(&state, &thread_id, &session_id).await?;
+        }
+
         Ok(true)
     }
     pub async fn cleanup_connection_channels(
@@ -3384,7 +3380,10 @@ mod tests {
             ]
         );
         assert!(consumed);
-        assert_eq!(session.conversation_context.as_deref(), Some("prior context"));
+        assert_eq!(
+            session.conversation_context.as_deref(),
+            Some("prior context")
+        );
 
         cancel_stall_timer(&mut session);
     }
@@ -3453,9 +3452,69 @@ mod tests {
             !restored_session_marker_exists(&history_root, "thread-1", "session-1")
                 .expect("read restore marker state")
         );
-        let chat = state.chat.lock().await;
-        let session = chat.sessions.get("session-1").expect("registered session");
-        assert_eq!(session.conversation_context, None);
+        {
+            let chat = state.chat.lock().await;
+            let session = chat.sessions.get("session-1").expect("registered session");
+            assert_eq!(session.conversation_context, None);
+        }
+
+        cancel_registered_stall_timer(&state, "session-1").await;
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn handle_binary_frame_keeps_restore_state_when_prompt_queue_fails() {
+        let state = make_test_state();
+        let (temp_root, history_path) = write_history_file(&[]);
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        persist_restored_session_marker(&history_root, "thread-1", "session-1")
+            .expect("persist restore marker");
+
+        let mut session = make_test_session();
+        session.history_path = history_path;
+        session.conversation_context = Some("prior context".to_string());
+
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        input_tx
+            .try_send(Vec::from("occupied"))
+            .expect("fill prompt queue");
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 12, session).await;
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 45,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "text", "text": "new prompt"}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let error = ChatService::handle_binary_frame(Arc::clone(&state), 12, payload)
+            .await
+            .expect_err("prompt queue should reject full channel");
+        assert!(error.contains("failed to queue chat input"));
+
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", "session-1")
+                .expect("read restore marker state")
+        );
+        {
+            let chat = state.chat.lock().await;
+            let session = chat.sessions.get("session-1").expect("registered session");
+            assert_eq!(
+                session.conversation_context.as_deref(),
+                Some("prior context")
+            );
+        }
 
         cancel_registered_stall_timer(&state, "session-1").await;
         let _ = fs::remove_dir_all(temp_root);
@@ -3606,6 +3665,10 @@ mod tests {
             .expect("read restored session metadata")
             .expect("restored session metadata");
         assert_eq!(metadata.acp_session_id, None);
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
+        );
 
         let chat = state.chat.lock().await;
         let session = chat.sessions.get(&session_id).expect("registered session");
@@ -3673,6 +3736,10 @@ mod tests {
         let expected_context = build_conversation_context(
             &history_path_for_session(&history_root, "thread-1", &session_id),
             None,
+        );
+        assert!(
+            restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
         );
 
         let chat = state.chat.lock().await;
@@ -3935,6 +4002,16 @@ mod tests {
         ChatService::prepare_restored_session_context(Arc::clone(&state), "thread-1", &session_id)
             .await
             .expect("prepare restored context for missing session");
+
+        assert!(
+            !restored_session_marker_exists(&history_root, "thread-1", &session_id)
+                .expect("read restore marker state")
+        );
+        assert!(
+            read_persisted_session_metadata(&history_root, "thread-1", &session_id)
+                .expect("read restored session metadata")
+                .is_none()
+        );
 
         let chat = state.chat.lock().await;
         assert!(chat.sessions.get(&session_id).is_none());

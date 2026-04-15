@@ -363,12 +363,23 @@ async fn checkpoint_refs(repo: &Path, thread_id: &str) -> Vec<String> {
     }
 }
 
-fn session_metadata_path(thread_id: &str, session_id: &str) -> PathBuf {
+fn chat_state_path(thread_id: &str) -> PathBuf {
     PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("XDG_CONFIG_HOME set"))
         .join("threadmill")
         .join("chat")
         .join(thread_id)
-        .join(format!("{session_id}.metadata.json"))
+}
+
+fn session_metadata_path(thread_id: &str, session_id: &str) -> PathBuf {
+    chat_state_path(thread_id).join(format!("{session_id}.metadata.json"))
+}
+
+fn session_history_path(thread_id: &str, session_id: &str) -> PathBuf {
+    chat_state_path(thread_id).join(format!("{session_id}.jsonl"))
+}
+
+fn restore_marker_path(thread_id: &str, session_id: &str) -> PathBuf {
+    chat_state_path(thread_id).join(format!("{session_id}.restore-session-new"))
 }
 
 #[cfg(unix)]
@@ -1395,6 +1406,142 @@ async fn checkpoint_restore_stop_and_reload_before_prompt_still_uses_session_new
     assert_eq!(
         session_load_count, 0,
         "restored session must not use session/load after stop/load before first post-restore prompt"
+    );
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn checkpoint_restore_does_not_persist_restore_marker_when_history_truncation_fails() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping checkpoint_restore_does_not_persist_restore_marker_when_history_truncation_fails: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_chat_project(&mut harness).await;
+    let created = create_thread(&mut harness, &project_id).await;
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = PathBuf::from(created["worktree_path"].as_str().expect("worktree path"));
+
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({ "thread_id": &thread_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({ "thread_id": &thread_id, "session_id": &session_id }),
+        )
+        .await
+        .expect("chat.attach");
+    let channel_id = attached["channel_id"].as_u64().expect("channel id") as u16;
+
+    send_test_update(&mut harness, channel_id, "history-before-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-before-checkpoint",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("wait for first history marker");
+
+    harness
+        .rpc(
+            "checkpoint.save",
+            json!({
+                "thread_id": &thread_id,
+                "session_id": &session_id,
+                "message": "checkpoint before history truncation failure"
+            }),
+        )
+        .await
+        .expect("checkpoint.save");
+
+    send_test_update(&mut harness, channel_id, "history-after-checkpoint").await;
+    harness
+        .wait_for_channel_output_contains(
+            channel_id,
+            b"history-after-checkpoint",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("wait for second history marker");
+
+    let history_path = session_history_path(&thread_id, &session_id);
+    #[cfg(unix)]
+    set_read_only(&history_path, true);
+
+    let error = harness
+        .rpc_expect_error(
+            "checkpoint.restore",
+            json!({ "thread_id": &thread_id, "seq": 1 }),
+        )
+        .await;
+    assert!(error.contains(&history_path.display().to_string()));
+
+    #[cfg(unix)]
+    set_read_only(&history_path, false);
+
+    let marker_path = restore_marker_path(&thread_id, &session_id);
+    assert!(
+        !marker_path.exists(),
+        "restore marker should not persist when history truncation fails before restore state is prepared"
+    );
+
+    let loaded = harness
+        .rpc(
+            "chat.load",
+            json!({ "thread_id": &thread_id, "session_id": &session_id, "agent_name": "mock" }),
+        )
+        .await
+        .expect("chat.load after failed restore");
+    assert_eq!(loaded["status"], "starting");
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let log_entries = wait_for_mock_chat_agent_log(&worktree_path, |entries| {
+        entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry["method"].as_str(),
+                    Some("session/new") | Some("session/load")
+                )
+            })
+            .count()
+            >= 2
+    })
+    .await;
+
+    let session_new_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/new")
+        .count();
+    let session_load_count = log_entries
+        .iter()
+        .filter(|entry| entry["method"] == "session/load")
+        .count();
+    assert_eq!(
+        session_new_count, 1,
+        "failed restore should not force an extra session/new when history truncation fails"
+    );
+    assert!(
+        session_load_count >= 1,
+        "failed restore should resume with session/load when history truncation fails"
     );
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;

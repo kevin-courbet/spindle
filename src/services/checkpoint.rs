@@ -179,14 +179,6 @@ impl CheckpointService {
             .session_id
             .as_deref()
             .zip(checkpoint.history_cursor());
-        if let Some((session_id, _)) = restored_session {
-            ChatService::mark_restored_session_for_new_session(
-                Arc::clone(&state),
-                &context.thread_id,
-                session_id,
-            )
-            .await?;
-        }
 
         git_output(
             &context.worktree_path,
