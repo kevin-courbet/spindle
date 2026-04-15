@@ -3215,10 +3215,16 @@ mod tests {
     }
 
     fn make_test_state() -> Arc<AppState> {
-        let state_path = std::env::temp_dir().join(format!(
-            "threadmill-chat-tests-{}.json",
+        // Isolate the state parent dir per test. AppState::new derives
+        // history_root from state_path.parent(), so tests sharing the same
+        // parent (e.g. /tmp) clobber each other's marker files when run in
+        // parallel.
+        let state_dir = std::env::temp_dir().join(format!(
+            "threadmill-chat-tests-{}",
             uuid::Uuid::new_v4().simple()
         ));
+        fs::create_dir_all(&state_dir).expect("create test state dir");
+        let state_path = state_dir.join("state.json");
         Arc::new(AppState::new(StateStore {
             path: state_path,
             data: AppData {
