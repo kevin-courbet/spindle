@@ -356,10 +356,10 @@ fn parse_agent_def(path: &std::path::Path) -> Result<AgentDef, CliError> {
         .map_err(|err| CliError::error(format!("failed to read {}: {err}", path.display())))?;
 
     // Parse YAML frontmatter between --- delimiters
-    let (frontmatter, body) = if content.starts_with("---\n") {
-        if let Some(end) = content[4..].find("\n---\n") {
-            let fm = &content[4..4 + end];
-            let body = &content[4 + end + 5..];
+    let (frontmatter, body) = if let Some(after_open) = content.strip_prefix("---\n") {
+        if let Some(end) = after_open.find("\n---\n") {
+            let fm = &after_open[..end];
+            let body = &after_open[end + 5..];
             (fm, body.trim())
         } else {
             ("", content.as_str())

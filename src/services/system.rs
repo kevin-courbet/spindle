@@ -24,7 +24,10 @@ impl SystemService {
 fn get_memory_stats() -> (u32, u32) {
     let mut sys = System::new();
     sys.refresh_memory();
-    (bytes_to_mb(sys.total_memory()), bytes_to_mb(sys.used_memory()))
+    (
+        bytes_to_mb(sys.total_memory()),
+        bytes_to_mb(sys.used_memory()),
+    )
 }
 
 fn get_load_avg() -> f64 {

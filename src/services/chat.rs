@@ -127,7 +127,7 @@ impl ChatService {
         params: protocol::ChatStartParams,
     ) -> Result<protocol::ChatStartResult, String> {
         tracing::info!(thread_id = %params.thread_id, agent = %params.agent_name, "chat_start");
-        let (project_path, command, cwd, preferred_model) =
+        let (_project_path, command, cwd, preferred_model) =
             resolve_agent_launch(&state, &params.thread_id, &params.agent_name).await?;
 
         let session_id = Uuid::new_v4().to_string();
@@ -197,14 +197,14 @@ impl ChatService {
 
         spawn_session_task(
             Arc::clone(&state),
-            params.thread_id,
-            session_id.clone(),
-            params.agent_name,
-            project_path,
-            command,
-            cwd,
-            None,
-            preferred_model.clone(),
+            SessionLaunchContext {
+                thread_id: params.thread_id,
+                session_id: session_id.clone(),
+                command,
+                cwd,
+                load_session_id: None,
+                preferred_model: preferred_model.clone(),
+            },
         );
 
         Ok(protocol::ChatStartResult {
@@ -291,18 +291,18 @@ impl ChatService {
             agent_type.clone()
         };
 
-        let (project_path, command, cwd, preferred_model) =
+        let (_project_path, command, cwd, preferred_model) =
             resolve_agent_launch(&state, &params.thread_id, &effective_agent).await?;
         spawn_session_task(
             Arc::clone(&state),
-            params.thread_id,
-            params.session_id.clone(),
-            agent_type,
-            project_path,
-            command,
-            cwd,
-            load_session_id,
-            preferred_model.clone(),
+            SessionLaunchContext {
+                thread_id: params.thread_id,
+                session_id: params.session_id.clone(),
+                command,
+                cwd,
+                load_session_id,
+                preferred_model: preferred_model.clone(),
+            },
         );
 
         Ok(protocol::ChatLoadResult {
@@ -587,13 +587,13 @@ impl ChatService {
                 .clone();
             let history_path = session.history_path.clone();
             let messages = extract_json_messages(&mut session.input_buffer, &payload, "input");
-            let (
+            let SessionProcessingOutcome {
                 transitions,
                 replacement_payload,
-                prompt_updates,
+                history_updates: prompt_updates,
                 auto_checkpoints,
                 consumed_conversation_context,
-            ) = apply_inbound_status_updates(&state, session, messages);
+            } = apply_inbound_status_updates(&state, session, messages);
             (
                 session.thread_id.clone(),
                 session_id,
@@ -730,48 +730,33 @@ impl ChatService {
     }
 }
 
-fn spawn_session_task(
-    state: Arc<AppState>,
+/// All the session identity + launch parameters needed to spawn and run one chat session.
+/// Grouped into a single type so spawn/run signatures don't balloon.
+struct SessionLaunchContext {
     thread_id: String,
     session_id: String,
-    agent_type: String,
-    project_path: String,
     command: String,
     cwd: String,
     load_session_id: Option<String>,
     preferred_model: Option<String>,
-) {
+}
+
+fn spawn_session_task(state: Arc<AppState>, ctx: SessionLaunchContext) {
     let fail_state = Arc::clone(&state);
-    let fail_thread_id = thread_id.clone();
-    let fail_session_id = session_id.clone();
+    let fail_thread_id = ctx.thread_id.clone();
+    let fail_session_id = ctx.session_id.clone();
 
     // Build env vars for the agent process
     let env_vars = {
         let state_ref = state.clone();
-        let tid = thread_id.clone();
-        let sid = session_id.clone();
+        let tid = ctx.thread_id.clone();
+        let sid = ctx.session_id.clone();
         tokio::spawn(async move { build_agent_env_vars(&state_ref, &tid, &sid).await })
     };
 
     let handle = tokio::spawn(async move {
-        let env_vars = match env_vars.await {
-            Ok(vars) => vars,
-            Err(_) => Vec::new(),
-        };
-        if let Err(error) = run_session_task(
-            Arc::clone(&state),
-            thread_id,
-            session_id,
-            agent_type,
-            project_path,
-            command,
-            cwd,
-            load_session_id,
-            preferred_model,
-            env_vars,
-        )
-        .await
-        {
+        let env_vars = env_vars.await.unwrap_or_default();
+        if let Err(error) = run_session_task(Arc::clone(&state), ctx, env_vars).await {
             warn!(error = %error, "chat session task failed");
         }
     });
@@ -807,16 +792,17 @@ fn spawn_session_task(
 
 async fn run_session_task(
     state: Arc<AppState>,
-    thread_id: String,
-    session_id: String,
-    _agent_type: String,
-    _project_path: String,
-    command: String,
-    cwd: String,
-    load_session_id: Option<String>,
-    preferred_model: Option<String>,
+    ctx: SessionLaunchContext,
     env_vars: Vec<(String, String)>,
 ) -> Result<(), String> {
+    let SessionLaunchContext {
+        thread_id,
+        session_id,
+        command,
+        cwd,
+        load_session_id,
+        preferred_model,
+    } = ctx;
     let mut cmd = Command::new("bash");
     cmd.args(["-lc", &command])
         .current_dir(&cwd)
@@ -928,7 +914,7 @@ async fn run_session_task(
 
         // Read platform system prompt from ~/.config/threadmill/system-prompt.md
         let platform_prompt = {
-            let config_dir = dirs::config_dir().unwrap_or_else(std::path::PathBuf::new);
+            let config_dir = dirs::config_dir().unwrap_or_default();
             let platform_path = config_dir.join("threadmill").join("system-prompt.md");
             match std::fs::read_to_string(&platform_path) {
                 Ok(content) => {
@@ -1039,7 +1025,7 @@ async fn run_session_task(
     let _ = input_task.await;
 
     let reason = match final_status {
-        Ok(status) if explicit_stop => "stopped".to_string(),
+        Ok(_) if explicit_stop => "stopped".to_string(),
         Ok(status) if status.success() => "exited".to_string(),
         Ok(status) => format!(
             "crashed{}",
@@ -1375,17 +1361,23 @@ async fn handle_stall_timeout(state: Arc<AppState>, session_id: String, generati
     emit_status_transitions(&state, transitions).await;
 }
 
+/// Output of `apply_inbound_status_updates`.
+struct SessionProcessingOutcome {
+    transitions: Vec<StatusTransition>,
+    /// If set, the original inbound payload was rewritten and should be
+    /// forwarded to the agent in place of the raw bytes.
+    replacement_payload: Option<Vec<u8>>,
+    history_updates: Vec<Value>,
+    auto_checkpoints: Vec<AutoCheckpointRequest>,
+    /// Whether the per-session conversation context was consumed during this batch.
+    consumed_conversation_context: bool,
+}
+
 fn apply_inbound_status_updates(
     state: &Arc<AppState>,
     session: &mut ChatSessionRuntime,
     messages: Vec<Value>,
-) -> (
-    Vec<StatusTransition>,
-    Option<Vec<u8>>,
-    Vec<Value>,
-    Vec<AutoCheckpointRequest>,
-    bool,
-) {
+) -> SessionProcessingOutcome {
     let mut transitions = Vec::new();
     let mut messages = messages;
     let mut replacement_payload = None;
@@ -1447,13 +1439,13 @@ fn apply_inbound_status_updates(
         replacement_payload = serialize_json_messages(&messages);
     }
 
-    (
+    SessionProcessingOutcome {
         transitions,
         replacement_payload,
         history_updates,
         auto_checkpoints,
         consumed_conversation_context,
-    )
+    }
 }
 
 fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
@@ -3087,7 +3079,7 @@ fn build_injection_prompt(
         .filter(|p| !p.is_empty())
         .collect();
 
-    if context_parts.is_empty() && initial_prompt.map_or(true, str::is_empty) {
+    if context_parts.is_empty() && initial_prompt.is_none_or(str::is_empty) {
         return None;
     }
 
@@ -3301,12 +3293,17 @@ mod tests {
         let state = make_test_state();
         let mut session = make_test_session();
 
-        let (transitions, replacement_payload, _prompt_updates, auto_checkpoints, consumed) =
-            apply_inbound_status_updates(
-                &state,
-                &mut session,
-                vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
-            );
+        let SessionProcessingOutcome {
+            transitions,
+            replacement_payload,
+            auto_checkpoints,
+            consumed_conversation_context: consumed,
+            ..
+        } = apply_inbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({"jsonrpc": "2.0", "id": 42, "method": "session/prompt", "params": {}})],
+        );
 
         assert_eq!(session.summary.agent_status, protocol::AgentStatus::Busy);
         assert!(session.pending_prompt_ids.contains("42"));
@@ -3347,8 +3344,12 @@ mod tests {
             }
         });
 
-        let (_transitions, replacement_payload, prompt_updates, _auto_checkpoints, consumed) =
-            apply_inbound_status_updates(&state, &mut session, vec![message]);
+        let SessionProcessingOutcome {
+            replacement_payload,
+            history_updates: prompt_updates,
+            consumed_conversation_context: consumed,
+            ..
+        } = apply_inbound_status_updates(&state, &mut session, vec![message]);
 
         let replacement_payload = replacement_payload.expect("replacement payload");
         let rewritten: Value =
@@ -4019,7 +4020,7 @@ mod tests {
         );
 
         let chat = state.chat.lock().await;
-        assert!(chat.sessions.get(&session_id).is_none());
+        assert!(!chat.sessions.contains_key(&session_id));
     }
 
     #[tokio::test]

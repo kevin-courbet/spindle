@@ -874,8 +874,7 @@ fn open_authorized_path(authorized: &AuthorizedPath) -> Result<OpenedAuthorizedP
 
 fn canonicalize_open_file(file: &fs::File) -> Result<PathBuf, String> {
     let path = fd_path(file)?;
-    fs::canonicalize(path)
-        .map_err(|err| format!("failed to resolve opened file descriptor: {err}"))
+    fs::canonicalize(path).map_err(|err| format!("failed to resolve opened file descriptor: {err}"))
 }
 
 #[cfg(target_os = "linux")]
