@@ -13,6 +13,293 @@ use crate::{protocol, services::chat::ChatService, AppState};
 
 pub struct WorkflowService;
 
+// ---------- Auto-selection of reviewer personas ----------
+
+/// Parsed `.threadmill/agents/<name>.md` — the deployed persona specs the review
+/// swarm references by name. Mirrors `threadmill-cli`'s parse_agent_def.
+struct AgentPersonaFile {
+    agent: String,
+    model: Option<String>,
+    display_name: Option<String>,
+    system_prompt: String,
+}
+
+fn parse_agent_persona_file(path: &Path) -> Result<AgentPersonaFile, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+
+    let (frontmatter, body) = if let Some(after_open) = content.strip_prefix("---\n") {
+        if let Some(end) = after_open.find("\n---\n") {
+            (&after_open[..end], after_open[end + 5..].trim())
+        } else {
+            ("", content.as_str())
+        }
+    } else {
+        ("", content.as_str())
+    };
+
+    let mut agent = String::new();
+    let mut display_name = None;
+    let mut model: Option<String> = None;
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("agent:") {
+            agent = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("display_name:") {
+            display_name = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("model:") {
+            let t = v.trim();
+            if !t.is_empty() {
+                model = Some(t.to_string());
+            }
+        }
+    }
+
+    if agent.is_empty() {
+        return Err(format!(
+            "agent persona {} missing 'agent' field in frontmatter",
+            path.display()
+        ));
+    }
+
+    Ok(AgentPersonaFile {
+        agent,
+        model,
+        display_name,
+        system_prompt: body.to_string(),
+    })
+}
+
+/// Resolve a persona name (e.g. "reviewer-codex") to its file, preferring the
+/// project-local `.threadmill/agents/` over the global `~/.config/threadmill/agents/`.
+fn resolve_persona_path(worktree: &Path, name: &str) -> Option<PathBuf> {
+    let project = worktree
+        .join(".threadmill/agents")
+        .join(format!("{name}.md"));
+    if project.exists() {
+        return Some(project);
+    }
+    let global = dirs::config_dir()?
+        .join("threadmill/agents")
+        .join(format!("{name}.md"));
+    if global.exists() {
+        return Some(global);
+    }
+    None
+}
+
+fn spec_from_persona(
+    persona: &AgentPersonaFile,
+    display_suffix: &str,
+    initial_prompt: String,
+) -> protocol::WorkflowReviewerSpec {
+    let display_name = persona
+        .display_name
+        .as_ref()
+        .map(|base| format!("{base} — {display_suffix}"))
+        .or_else(|| Some(display_suffix.to_string()));
+    protocol::WorkflowReviewerSpec {
+        agent_name: persona.agent.clone(),
+        parent_session_id: None,
+        system_prompt: Some(persona.system_prompt.clone()),
+        initial_prompt: Some(initial_prompt),
+        display_name,
+        preferred_model: persona.model.clone(),
+    }
+}
+
+/// Read the branch's diff against the nearest default branch. Tries `main`, then
+/// `master`. Empty string if neither exists or git is unavailable.
+async fn branch_diff(worktree: &Path) -> String {
+    for base in ["main", "master"] {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["diff", &format!("{base}...HEAD")])
+            .output()
+            .await;
+        if let Ok(output) = output {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout).to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// True if the given changed-file path looks like a test file. Matches filename
+/// extensions (`*.test.ts`, `*.test.tsx`, `*.spec.ts`, `*.spec.tsx`, `*_test.rs`,
+/// `*_test.py`, `*Test.swift`, `*Tests.swift`, `*Spec.swift`) and common test-directory
+/// segments (`tests/`, `__tests__/`). Avoids the substring trap — "test" on its own
+/// hits `contested.ts`, `attestation.rs`, etc.
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    if lower.contains("/tests/") || lower.contains("/__tests__/") || lower.contains("/test/") {
+        return true;
+    }
+    for suffix in [
+        ".test.ts",
+        ".test.tsx",
+        ".test.js",
+        ".test.jsx",
+        ".spec.ts",
+        ".spec.tsx",
+        ".spec.js",
+        ".spec.jsx",
+        "_test.rs",
+        "_test.py",
+        "_test.go",
+        "test.swift",
+        "tests.swift",
+        "spec.swift",
+    ] {
+        if lower.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn branch_changed_files(worktree: &Path) -> Vec<String> {
+    for base in ["main", "master"] {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["diff", "--name-only", &format!("{base}...HEAD")])
+            .output()
+            .await;
+        if let Ok(output) = output {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .filter(|line| !line.is_empty())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Build the default review-swarm spec list from `git diff main...HEAD`.
+///
+/// Baseline (always when the persona file is present): 3 correctness-focus +
+/// 3 architecture-focus reviewers across `reviewer-codex` / `reviewer-opus` /
+/// `reviewer-gemini`. Plus conditional specialists — effect-reviewer,
+/// logging-review, test-quality-review — added when the diff pattern-matches.
+///
+/// Personas that are not deployed (missing agent file) are silently skipped,
+/// so a repo that only has, say, `reviewer-opus.md` still gets a 2-reviewer
+/// round instead of erroring. The caller can always override by passing
+/// `params.reviewers` explicitly.
+async fn auto_select_reviewer_specs(
+    worktree: &Path,
+) -> Result<Vec<protocol::WorkflowReviewerSpec>, String> {
+    const CORRECTNESS_PROMPT: &str =
+        "Review ALL changes on this branch vs main: `git diff main...HEAD`. \
+Focus on: correctness, edge cases, security, performance. \
+For each issue: file:line, severity (Critical/High/Medium/Low), concrete fix. \
+Conclude with an actionable items list ordered by severity. Only report violations.";
+
+    const ARCHITECTURE_PROMPT: &str =
+        "Review ALL changes on this branch vs main: `git diff main...HEAD`. \
+Focus on: architecture, patterns, error handling, missing tests, silent fallbacks. \
+CRITICAL — silent fallback scan: errors are a feature. Flag every instance of error suppression \
+that masks failures instead of propagating them (|| true, 2>/dev/null, catch blocks returning \
+defaults, _, _ = on operations that should fail loudly, ?? [] hiding malformed responses). \
+For each flagged pattern, state whether it is legitimate cleanup/teardown or an erroneous mask. \
+For each issue: file:line, severity (Critical/High/Medium/Low), concrete fix. \
+Conclude with an actionable items list ordered by severity. Only report violations.";
+
+    const EFFECT_PROMPT: &str = "Review ALL Effect.ts code changes on this branch vs main. \
+Check for: reinvented library functions, non-idiomatic patterns, `_tag` checks that should use \
+library type guards (Cause.isCause, Exit.isExit, Option.isSome), reimplemented transformers \
+(Cause.pretty, Exit.match). Reference llms.txt / vendored Effect docs. \
+For each issue: file:line, severity, concrete fix. Only report violations.";
+
+    const LOGGING_PROMPT: &str = "Review logging changes on this branch vs main. \
+Effect.logError must pass cause as 2nd arg. Services should prefer spans over ad-hoc logInfo/logDebug. \
+Effect.logDebug must not be committed. \
+Report only violations, as a table: | # | Severity | Issue | File:Line |";
+
+    const TEST_QUALITY_PROMPT: &str = "Review test changes on this branch vs main. \
+Check for: source-reading tests, tautological assertions, mock-as-subject, mock-server echo, \
+over-mocked wiring, no-op assertions. \
+Report only violations, as a table: | # | Severity | Pattern | Issue | File:Line |";
+
+    let mut specs = Vec::new();
+
+    for persona_name in ["reviewer-codex", "reviewer-opus", "reviewer-gemini"] {
+        let Some(path) = resolve_persona_path(worktree, persona_name) else {
+            continue;
+        };
+        let persona = parse_agent_persona_file(&path)?;
+        specs.push(spec_from_persona(
+            &persona,
+            "Correctness",
+            CORRECTNESS_PROMPT.to_string(),
+        ));
+        specs.push(spec_from_persona(
+            &persona,
+            "Architecture",
+            ARCHITECTURE_PROMPT.to_string(),
+        ));
+    }
+
+    let diff = branch_diff(worktree).await;
+    let changed = branch_changed_files(worktree).await;
+
+    let has_ts_effect = changed
+        .iter()
+        .any(|f| f.ends_with(".ts") || f.ends_with(".tsx"))
+        && (diff.contains("from \"effect\"")
+            || diff.contains("from 'effect'")
+            || diff.contains("from '@effect/")
+            || diff.contains("from \"@effect/"));
+
+    // `Effect.log` already subsumes `Effect.logError` / `.logInfo` / `.logDebug`; keep it
+    // as the single signal to avoid misleading redundancy in the condition list.
+    let has_logging = diff.contains("Effect.log");
+
+    // Match test-file paths by filename extension / directory segment, not bare substring —
+    // `contains("test")` false-positives on `contested.ts`, `attestation.rs`, etc.;
+    // `contains("spec")` trips on `inspector.ts`, `respect.ts`, `specify.ts`.
+    let has_test_changes = changed.iter().any(|f| is_test_path(f));
+
+    if has_ts_effect {
+        if let Some(path) = resolve_persona_path(worktree, "effect-reviewer") {
+            let persona = parse_agent_persona_file(&path)?;
+            specs.push(spec_from_persona(
+                &persona,
+                "Effect.ts",
+                EFFECT_PROMPT.to_string(),
+            ));
+        }
+    }
+    if has_logging {
+        if let Some(path) = resolve_persona_path(worktree, "logging-review") {
+            let persona = parse_agent_persona_file(&path)?;
+            specs.push(spec_from_persona(
+                &persona,
+                "Logging",
+                LOGGING_PROMPT.to_string(),
+            ));
+        }
+    }
+    if has_test_changes {
+        if let Some(path) = resolve_persona_path(worktree, "test-quality-review") {
+            let persona = parse_agent_persona_file(&path)?;
+            specs.push(spec_from_persona(
+                &persona,
+                "Tests",
+                TEST_QUALITY_PROMPT.to_string(),
+            ));
+        }
+    }
+
+    Ok(specs)
+}
+
 /// Inject a `<system-context>` message into the orchestrator session, if one is set.
 ///
 /// Fire-and-forget. Used to keep the orchestrator informed when non-orchestrator actors
@@ -56,6 +343,13 @@ struct PersistedWorkflow {
     next_reviewer_index: u32,
     #[serde(default = "default_next_index")]
     next_finding_index: u32,
+    /// How many reviewer rows `start_review` intends to spawn for the current round.
+    /// Used to gate `workflow.review_completed` — we must not emit until every spec
+    /// has actually been inserted into `reviewers`, otherwise a fast first reviewer
+    /// finishing before the second is spawned would trip `all_terminal` with `count=1`.
+    /// Reset to 0 on review_completed.
+    #[serde(default)]
+    expected_reviewer_count: u32,
 }
 
 fn default_next_index() -> u32 {
@@ -304,12 +598,14 @@ impl WorkflowService {
                 reviewers: Vec::new(),
                 findings: Vec::new(),
                 review_started_at: None,
+                current_review_round: 0,
             };
             workflows.data.workflows.push(PersistedWorkflow {
                 state: workflow.clone(),
                 next_worker_index: 1,
                 next_reviewer_index: 1,
                 next_finding_index: 1,
+                expected_reviewer_count: 0,
             });
             workflows.save()?;
             workflow
@@ -454,6 +750,7 @@ impl WorkflowService {
                 initial_prompt: params.initial_prompt,
                 display_name: params.display_name,
                 parent_session_id: params.parent_session_id,
+                preferred_model: params.preferred_model,
             },
         )
         .await;
@@ -637,8 +934,55 @@ impl WorkflowService {
         )
         .await?;
 
-        let mut reviewers = Vec::with_capacity(params.reviewers.len());
-        for reviewer in params.reviewers {
+        // Bump the round counter so findings recorded during this round can be
+        // distinguished from future post-fix re-review findings.
+        {
+            let mut store = state.workflows.lock().await;
+            if let Some(workflow) = find_workflow_locked_mut(&mut store, &params.workflow_id) {
+                workflow.state.current_review_round =
+                    workflow.state.current_review_round.saturating_add(1);
+                touch_workflow(&mut workflow.state);
+                store.save()?;
+            }
+        }
+
+        // thread's worktree. Empty specs = "Spindle, pick the review swarm".
+        let reviewer_specs = if params.reviewers.is_empty() {
+            let thread_id = {
+                let store = state.workflows.lock().await;
+                find_workflow_locked(&store, &params.workflow_id)
+                    .ok_or_else(|| format!("workflow not found: {}", params.workflow_id))?
+                    .thread_id
+                    .clone()
+            };
+            let worktree = {
+                let store = state.store.lock().await;
+                store
+                    .thread_by_id(&thread_id)
+                    .ok_or_else(|| format!("thread not found: {thread_id}"))?
+                    .worktree_path
+                    .clone()
+            };
+            auto_select_reviewer_specs(std::path::Path::new(&worktree)).await?
+        } else {
+            params.reviewers
+        };
+
+        // Record how many reviewer rows this round will produce. `set_session_failed`
+        // gates `workflow.review_completed` on `reviewers.len() >= expected_reviewer_count`
+        // so a fast-finishing first reviewer can't fire the end-of-round event before
+        // the remaining specs are even inserted.
+        {
+            let mut store = state.workflows.lock().await;
+            if let Some(workflow) = find_workflow_locked_mut(&mut store, &params.workflow_id) {
+                workflow.expected_reviewer_count =
+                    u32::try_from(reviewer_specs.len()).unwrap_or(u32::MAX);
+                store.save()?;
+            }
+        }
+
+        let mut reviewers = Vec::with_capacity(reviewer_specs.len());
+        for reviewer in reviewer_specs {
             let spawned = Self::spawn_reviewer(
                 Arc::clone(&state),
                 protocol::WorkflowSpawnReviewerParams {
@@ -648,6 +992,7 @@ impl WorkflowService {
                     system_prompt: reviewer.system_prompt,
                     initial_prompt: reviewer.initial_prompt,
                     display_name: reviewer.display_name,
+                    preferred_model: reviewer.preferred_model,
                 },
             )
             .await;
@@ -741,6 +1086,7 @@ impl WorkflowService {
                 initial_prompt: params.initial_prompt,
                 display_name: params.display_name,
                 parent_session_id: params.parent_session_id,
+                preferred_model: params.preferred_model,
             },
         )
         .await;
@@ -861,6 +1207,7 @@ impl WorkflowService {
             }
 
             let now = Utc::now().to_rfc3339();
+            let round = workflow.state.current_review_round.max(1);
             let mut findings = Vec::with_capacity(params.findings.len());
             for finding in params.findings {
                 let finding = protocol::WorkflowFinding {
@@ -872,6 +1219,8 @@ impl WorkflowService {
                     file_path: finding.file_path,
                     line: finding.line,
                     created_at: now.clone(),
+                    resolved: false,
+                    review_round: round,
                 };
                 workflow.next_finding_index += 1;
                 workflow.state.findings.push(finding.clone());
@@ -893,6 +1242,35 @@ impl WorkflowService {
         );
         emit_workflow_upsert(&state, workflow);
         Ok(findings)
+    }
+
+    pub async fn resolve_finding(
+        state: Arc<AppState>,
+        params: protocol::WorkflowResolveFindingParams,
+    ) -> Result<protocol::WorkflowResolveFindingResult, String> {
+        let (workflow, finding) = {
+            let mut store = state.workflows.lock().await;
+            let workflow = find_workflow_locked_mut(&mut store, &params.workflow_id)
+                .ok_or_else(|| format!("workflow not found: {}", params.workflow_id))?;
+            let index = workflow
+                .state
+                .findings
+                .iter()
+                .position(|finding| finding.finding_id == params.finding_id)
+                .ok_or_else(|| format!("finding not found: {}", params.finding_id))?;
+            workflow.state.findings[index].resolved = params.resolved;
+            touch_workflow(&mut workflow.state);
+            let finding = workflow.state.findings[index].clone();
+            let workflow_state = workflow.state.clone();
+            store.save()?;
+            (workflow_state, finding)
+        };
+
+        emit_workflow_upsert(&state, workflow.clone());
+        Ok(protocol::WorkflowResolveFindingResult {
+            workflow_id: workflow.workflow_id,
+            finding,
+        })
     }
 
     pub async fn complete(
@@ -1445,7 +1823,50 @@ async fn set_session_failed(
                         reviewer,
                     },
                 );
-                emit_workflow_upsert(&state, workflow);
+                emit_workflow_upsert(&state, workflow.clone());
+
+                // If every reviewer for this round is now in a terminal state AND
+                // `start_review` has finished appending the full spec list, the round
+                // is over — emit `review_completed` so the UI can surface
+                // "awaiting findings" and the orchestrator can call Momus.
+                //
+                // The `expected_reviewer_count` gate matters: reviewers are spawned
+                // sequentially, so a fast-finishing first reviewer could otherwise trip
+                // `all_terminal` with count=1 before the others are even inserted.
+                let expected = {
+                    let store = state.workflows.lock().await;
+                    store
+                        .data
+                        .workflows
+                        .iter()
+                        .find(|w| w.state.workflow_id == workflow.workflow_id)
+                        .map(|w| w.expected_reviewer_count)
+                        .unwrap_or(0)
+                };
+                let all_terminal = !workflow.reviewers.is_empty()
+                    && workflow
+                        .reviewers
+                        .iter()
+                        .all(|r| worker_is_terminal(&r.status))
+                    && u32::try_from(workflow.reviewers.len()).unwrap_or(u32::MAX) >= expected;
+                if all_terminal {
+                    state.emit_event(
+                        "workflow.review_completed",
+                        protocol::WorkflowReviewCompletedEvent {
+                            workflow_id: workflow.workflow_id.clone(),
+                            thread_id: workflow.thread_id.clone(),
+                            review_round: workflow.current_review_round,
+                            reviewer_count: workflow.reviewers.len(),
+                        },
+                    );
+                    // Reset so a mid-round manual `spawn_reviewer` added later can't
+                    // re-fire the end-of-round event on its own terminal transition.
+                    let mut store = state.workflows.lock().await;
+                    if let Some(wf) = find_workflow_locked_mut(&mut store, &workflow.workflow_id) {
+                        wf.expected_reviewer_count = 0;
+                        let _ = store.save();
+                    }
+                }
             }
         }
     }
@@ -1563,10 +1984,12 @@ mod tests {
                 reviewers: Vec::new(),
                 findings: Vec::new(),
                 review_started_at: None,
+                current_review_round: 0,
             },
             next_worker_index: 2,
             next_reviewer_index: 1,
             next_finding_index: 1,
+            expected_reviewer_count: 0,
         });
         store.save().expect("save workflow store");
     }
@@ -1605,10 +2028,12 @@ mod tests {
                 }],
                 findings: Vec::new(),
                 review_started_at: Some(Utc::now().to_rfc3339()),
+                current_review_round: 1,
             },
             next_worker_index: 1,
             next_reviewer_index: 2,
             next_finding_index: 1,
+            expected_reviewer_count: 0,
         });
         store.save().expect("save workflow store");
     }

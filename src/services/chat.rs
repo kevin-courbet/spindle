@@ -130,8 +130,11 @@ impl ChatService {
         params: protocol::ChatStartParams,
     ) -> Result<protocol::ChatStartResult, String> {
         tracing::info!(thread_id = %params.thread_id, agent = %params.agent_name, "chat_start");
-        let (_project_path, command, cwd, preferred_model) =
+        let (_project_path, command, cwd, project_preferred_model) =
             resolve_agent_launch(&state, &params.thread_id, &params.agent_name).await?;
+        // Per-session override (from agent def's `model:` frontmatter) wins over the
+        // project-level default.
+        let preferred_model = params.preferred_model.clone().or(project_preferred_model);
 
         let session_id = Uuid::new_v4().to_string();
         let created_at = Utc::now().to_rfc3339();

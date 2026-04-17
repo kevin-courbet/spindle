@@ -503,6 +503,12 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("workflow.complete", message))?;
             to_value("workflow.complete", result)
         }
+        RequestDispatch::WorkflowResolveFinding(params) => {
+            let result = WorkflowService::resolve_finding(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.resolve_finding", message))?;
+            to_value("workflow.resolve_finding", result)
+        }
         RequestDispatch::AgentRegistryList(_) => {
             let entries = crate::services::agent_registry::discover_agents();
             to_value("agent.registry.list", entries)
