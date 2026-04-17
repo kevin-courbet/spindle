@@ -22,7 +22,7 @@ async fn ping_returns_pong() {
 
     socket
         .send(Message::Text(
-            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string().into(),
         ))
         .await
         .expect("send ping");
@@ -84,7 +84,7 @@ async fn session_hello_negotiates_protocol_capabilities() {
     });
 
     socket
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .expect("send session.hello");
 
@@ -149,7 +149,7 @@ async fn request_before_session_hello_returns_structured_error() {
     });
 
     socket
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .expect("send project.list");
 
@@ -205,7 +205,7 @@ async fn system_cleanup_is_not_exposed_over_rpc() {
     });
 
     socket
-        .send(Message::Text(hello.to_string()))
+        .send(Message::Text(hello.to_string().into()))
         .await
         .expect("send session.hello");
 
@@ -231,7 +231,7 @@ async fn system_cleanup_is_not_exposed_over_rpc() {
     });
 
     socket
-        .send(Message::Text(cleanup.to_string()))
+        .send(Message::Text(cleanup.to_string().into()))
         .await
         .expect("send system.cleanup");
 
@@ -288,7 +288,7 @@ async fn session_hello_rejects_incompatible_protocol_version() {
     });
 
     socket
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .expect("send session.hello");
 
@@ -338,7 +338,7 @@ async fn session_hello_rejects_missing_required_capabilities() {
     });
 
     socket
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .expect("send session.hello");
 
@@ -399,7 +399,7 @@ async fn session_hello_rejects_unsupported_required_capabilities() {
     });
 
     socket
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .expect("send session.hello");
 
@@ -459,7 +459,7 @@ async fn concurrent_session_hello_allows_only_one_initialization() {
         });
 
         socket
-            .send(Message::Text(payload.to_string()))
+            .send(Message::Text(payload.to_string().into()))
             .await
             .expect("send concurrent session.hello");
     }
@@ -541,7 +541,7 @@ async fn session_hello_rejects_repeat_initialization() {
     });
 
     socket
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .expect("send first session.hello");
 
@@ -576,7 +576,7 @@ async fn session_hello_rejects_repeat_initialization() {
     });
 
     socket
-        .send(Message::Text(second_payload.to_string()))
+        .send(Message::Text(second_payload.to_string().into()))
         .await
         .expect("send second session.hello");
 
@@ -643,7 +643,7 @@ async fn uninitialized_connection_does_not_receive_events() {
     });
 
     initialized_socket
-        .send(Message::Text(hello_payload.to_string()))
+        .send(Message::Text(hello_payload.to_string().into()))
         .await
         .expect("send session.hello");
 
@@ -728,7 +728,7 @@ async fn uninitialized_connection_does_not_receive_events() {
     });
 
     initialized_socket
-        .send(Message::Text(add_payload.to_string()))
+        .send(Message::Text(add_payload.to_string().into()))
         .await
         .expect("send project.add");
 
@@ -777,7 +777,7 @@ async fn uninitialized_connection_does_not_receive_events() {
         }
     });
     initialized_socket
-        .send(Message::Text(remove_payload.to_string()))
+        .send(Message::Text(remove_payload.to_string().into()))
         .await
         .expect("send project.remove");
     let _project_remove_response = loop {

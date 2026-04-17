@@ -72,7 +72,7 @@ impl TestHarness {
         });
 
         self.socket
-            .send(Message::Text(payload.to_string()))
+            .send(Message::Text(payload.to_string().into()))
             .await
             .map_err(|err| format!("failed to send {method}: {err}"))?;
 
@@ -153,7 +153,7 @@ impl TestHarness {
         frame.extend_from_slice(&channel_id.to_be_bytes());
         frame.extend_from_slice(payload);
         self.socket
-            .send(Message::Binary(frame))
+            .send(Message::Binary(frame.into()))
             .await
             .map_err(|err| format!("failed to send binary frame for channel {channel_id}: {err}"))
     }

@@ -1933,7 +1933,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         let mut frame = Vec::with_capacity(out_payload.len() + 2);
         frame.extend_from_slice(&channel_id.to_be_bytes());
         frame.extend_from_slice(out_payload);
-        if outbound.send(Message::Binary(frame)).is_err() {
+        if outbound.send(Message::Binary(frame.into())).is_err() {
             dead_channels.push(channel_id);
         }
     }
