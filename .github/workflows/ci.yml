@@ -5,57 +5,154 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly re-run catches freshly-published advisories without a code change.
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUSTFLAGS: '-D warnings'
+  RUSTDOCFLAGS: '-D warnings'
+
 jobs:
-  check:
-    name: fmt + clippy + check + test
-    runs-on: macos-14
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-        # submodule `threadmill` is only needed by codegen/generate.sh; the
-        # generated src/protocol.rs is committed, so cargo builds don't need it.
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Cache cargo registry + build
-        uses: actions/cache@v4
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ci-
+          shared-key: linux-stable
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: Rust toolchain
-        run: |
-          rustup show
-          rustc --version
-          cargo --version
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-stable
+      - run: cargo check --all-targets --locked
 
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+  test-linux:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # Integration tests spawn a real daemon + tmux — lib/unit only in CI.
+      - run: cargo nextest run --lib --locked
 
-      - name: cargo clippy (deny warnings)
-        run: cargo clippy --all-targets --locked -- -D warnings
+  test-macos:
+    name: test (macos)
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --lib --locked
 
-      - name: cargo check
-        run: cargo check --all-targets --locked
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-stable
+      - run: cargo doc --no-deps --locked --workspace
 
-      - name: cargo test (library + unit)
-        # Skip integration tests — they spawn a real daemon with tmux and
-        # talk over a local TCP socket; they expect a specific beast/tmux
-        # layout and aren't self-contained enough for CI runners.
-        run: cargo test --lib --locked
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
 
   deny:
-    name: cargo-deny (licenses + advisories + sources)
+    name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  codegen-drift:
+    name: codegen drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Private submodule: only run where the deploy key is available.
+    # Fork PRs and envs without the secret fall through cleanly.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    steps:
+      - name: Check for submodule deploy key
+        id: gate
+        env:
+          KEY: ${{ secrets.SUBMODULE_DEPLOY_KEY }}
+        run: |
+          if [ -n "${KEY:-}" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SUBMODULE_DEPLOY_KEY not set; skipping codegen drift check."
+          fi
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        if: steps.gate.outputs.has_key == 'true'
+        with:
+          ssh-private-key: ${{ secrets.SUBMODULE_DEPLOY_KEY }}
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.has_key == 'true'
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.SUBMODULE_DEPLOY_KEY }}
+
+      - name: Regenerate protocol bindings
+        if: steps.gate.outputs.has_key == 'true'
+        run: ./codegen/generate.sh
+
+      - name: Fail if checked-in bindings are stale
+        if: steps.gate.outputs.has_key == 'true'
+        run: |
+          if ! git diff --exit-code -- src/protocol.rs; then
+            echo "::error::src/protocol.rs is out of date. Run ./codegen/generate.sh and commit."
+            exit 1
+          fi
