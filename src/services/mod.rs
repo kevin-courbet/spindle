@@ -3,12 +3,12 @@ pub mod chat;
 pub mod checkpoint;
 pub mod file;
 pub mod git;
+pub mod issues;
 pub mod opencode;
 pub mod preset;
 pub mod project;
 pub mod terminal;
 pub mod thread;
-pub mod todo;
 pub mod workflow;
 
 pub fn sanitize_name(value: &str) -> String {

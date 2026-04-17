@@ -36,10 +36,6 @@ enum Command {
         #[command(subcommand)]
         command: ChatCommand,
     },
-    Todo {
-        #[command(subcommand)]
-        command: TodoCommand,
-    },
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -138,72 +134,6 @@ enum ChatCommand {
         #[arg(long)]
         pretty: bool,
     },
-}
-
-#[derive(Subcommand, Debug)]
-enum TodoCommand {
-    List {
-        #[arg(long, value_enum, default_value_t = TodoFilterArg::Active)]
-        filter: TodoFilterArg,
-    },
-    Add {
-        content: String,
-        #[arg(long, value_enum)]
-        priority: Option<TodoPriorityArg>,
-    },
-    Update {
-        id: String,
-        #[arg(long)]
-        content: Option<String>,
-        #[arg(long, value_enum)]
-        priority: Option<TodoPriorityArg>,
-    },
-    Done {
-        id: String,
-    },
-    Reopen {
-        id: String,
-    },
-    Remove {
-        id: String,
-    },
-    Reorder {
-        ids: Vec<String>,
-    },
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum TodoFilterArg {
-    All,
-    Active,
-    Completed,
-}
-
-impl TodoFilterArg {
-    fn as_rpc_value(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Active => "active",
-            Self::Completed => "completed",
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum TodoPriorityArg {
-    Low,
-    Medium,
-    High,
-}
-
-impl TodoPriorityArg {
-    fn as_rpc_value(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -553,7 +483,6 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             }
         },
         Command::Chat { command } => handle_chat(command, &ws_url, auth_token.as_deref()).await,
-        Command::Todo { command } => handle_todo(command, &ws_url, auth_token.as_deref()).await,
         Command::Workflow { command } => {
             handle_workflow(command, &ws_url, auth_token.as_deref()).await
         }
@@ -905,111 +834,6 @@ async fn handle_chat(
             )
             .await?;
             print_json(&result, pretty)
-        }
-    }
-}
-
-async fn handle_todo(
-    command: TodoCommand,
-    ws_url: &str,
-    auth_token: Option<&str>,
-) -> Result<(), CliError> {
-    let thread_id = resolve_current_thread_id(ws_url, auth_token).await?;
-
-    match command {
-        TodoCommand::List { filter } => {
-            let result = rpc_request(
-                ws_url,
-                auth_token,
-                "todo.list",
-                json!({ "thread_id": thread_id, "filter": filter.as_rpc_value() }),
-            )
-            .await?;
-            print_json(&result, false)
-        }
-        TodoCommand::Add { content, priority } => {
-            if content.trim().is_empty() {
-                return Err(CliError::error("todo content must not be empty"));
-            }
-
-            let mut params = json!({ "thread_id": thread_id, "content": content });
-            if let Some(priority) = priority {
-                params["priority"] = json!(priority.as_rpc_value());
-            }
-
-            let result = rpc_request(ws_url, auth_token, "todo.add", params).await?;
-            print_json(&result, false)
-        }
-        TodoCommand::Update {
-            id,
-            content,
-            priority,
-        } => {
-            let mut params = json!({ "thread_id": thread_id, "todo_id": id });
-            let mut changed = false;
-            if let Some(content) = content {
-                if content.trim().is_empty() {
-                    return Err(CliError::error("todo content must not be empty"));
-                }
-                params["content"] = json!(content);
-                changed = true;
-            }
-            if let Some(priority) = priority {
-                params["priority"] = json!(priority.as_rpc_value());
-                changed = true;
-            }
-            if !changed {
-                return Err(CliError::error(
-                    "todo update requires --content and/or --priority",
-                ));
-            }
-
-            let result = rpc_request(ws_url, auth_token, "todo.update", params).await?;
-            print_json(&result, false)
-        }
-        TodoCommand::Done { id } => {
-            let result = rpc_request(
-                ws_url,
-                auth_token,
-                "todo.update",
-                json!({ "thread_id": thread_id, "todo_id": id, "completed": true }),
-            )
-            .await?;
-            print_json(&result, false)
-        }
-        TodoCommand::Reopen { id } => {
-            let result = rpc_request(
-                ws_url,
-                auth_token,
-                "todo.update",
-                json!({ "thread_id": thread_id, "todo_id": id, "completed": false }),
-            )
-            .await?;
-            print_json(&result, false)
-        }
-        TodoCommand::Remove { id } => {
-            let result = rpc_request(
-                ws_url,
-                auth_token,
-                "todo.remove",
-                json!({ "thread_id": thread_id, "todo_id": id }),
-            )
-            .await?;
-            print_json(&result, false)
-        }
-        TodoCommand::Reorder { ids } => {
-            if ids.is_empty() {
-                return Err(CliError::error("todo reorder requires at least one id"));
-            }
-
-            let result = rpc_request(
-                ws_url,
-                auth_token,
-                "todo.reorder",
-                json!({ "thread_id": thread_id, "todo_ids": ids }),
-            )
-            .await?;
-            print_json(&result, false)
         }
     }
 }

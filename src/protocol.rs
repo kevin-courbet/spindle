@@ -1268,119 +1268,6 @@ pub struct CheckpointDiffResult {
     pub diff_text: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum TodoPriority {
-    #[serde(rename = "low")]
-    Low,
-    #[serde(rename = "medium")]
-    Medium,
-    #[serde(rename = "high")]
-    High,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-pub enum TodoFilter {
-    #[default]
-    #[serde(rename = "all")]
-    All,
-    #[serde(rename = "active")]
-    Active,
-    #[serde(rename = "completed")]
-    Completed,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoItem {
-    pub id: String,
-    pub thread_id: String,
-    pub content: String,
-    pub completed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<TodoPriority>,
-    pub created_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoListParams {
-    pub thread_id: String,
-    #[serde(default)]
-    pub filter: TodoFilter,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoAddParams {
-    pub thread_id: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<TodoPriority>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoUpdateParams {
-    pub thread_id: String,
-    pub todo_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<TodoPriority>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoToggleParams {
-    pub thread_id: String,
-    pub todo_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoRemoveParams {
-    pub thread_id: String,
-    pub todo_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoReorderParams {
-    pub thread_id: String,
-    pub todo_ids: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoRemoveResult {
-    pub success: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoReorderResult {
-    pub success: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoAddedEvent {
-    pub thread_id: String,
-    pub todo: TodoItem,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoUpdatedEvent {
-    pub thread_id: String,
-    pub todo: TodoItem,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoRemovedEvent {
-    pub thread_id: String,
-    pub todo_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TodoReorderedEvent {
-    pub thread_id: String,
-    pub todo_ids: Vec<String>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GitStatusSummaryFile {
     pub path: String,
@@ -1452,10 +1339,6 @@ pub struct GitCreatePrResult {
     pub pr_url: String,
     pub pr_number: u64,
 }
-
-pub type TodoListResult = Vec<TodoItem>;
-pub type TodoAddResult = TodoItem;
-pub type TodoUpdateResult = TodoItem;
 
 pub type PingResult = String;
 pub type StateSnapshotResult = StateSnapshot;
@@ -1644,12 +1527,6 @@ pub const METHOD_GIT_STATUS_SUMMARY: &str = "git.status_summary";
 pub const METHOD_GIT_COMMIT: &str = "git.commit";
 pub const METHOD_GIT_PUSH: &str = "git.push";
 pub const METHOD_GIT_CREATE_PR: &str = "git.create_pr";
-pub const METHOD_TODO_LIST: &str = "todo.list";
-pub const METHOD_TODO_ADD: &str = "todo.add";
-pub const METHOD_TODO_UPDATE: &str = "todo.update";
-pub const METHOD_TODO_TOGGLE: &str = "todo.toggle";
-pub const METHOD_TODO_REMOVE: &str = "todo.remove";
-pub const METHOD_TODO_REORDER: &str = "todo.reorder";
 pub const METHOD_THREAD_CREATE: &str = "thread.create";
 pub const METHOD_THREAD_CLOSE: &str = "thread.close";
 pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
@@ -1772,18 +1649,6 @@ pub enum RequestDispatch {
     GitPush(GitPushParams),
     #[serde(rename = "git.create_pr")]
     GitCreatePr(GitCreatePrParams),
-    #[serde(rename = "todo.list")]
-    TodoList(TodoListParams),
-    #[serde(rename = "todo.add")]
-    TodoAdd(TodoAddParams),
-    #[serde(rename = "todo.update")]
-    TodoUpdate(TodoUpdateParams),
-    #[serde(rename = "todo.toggle")]
-    TodoToggle(TodoToggleParams),
-    #[serde(rename = "todo.remove")]
-    TodoRemove(TodoRemoveParams),
-    #[serde(rename = "todo.reorder")]
-    TodoReorder(TodoReorderParams),
     #[serde(rename = "thread.create")]
     ThreadCreate(ThreadCreateParams),
     #[serde(rename = "thread.close")]
@@ -1940,24 +1805,6 @@ pub fn parse_request_dispatch(
         METHOD_GIT_CREATE_PR => serde_json::from_value::<GitCreatePrParams>(params)
             .map(RequestDispatch::GitCreatePr)
             .map_err(|err| format!("invalid git.create_pr params: {err}")),
-        METHOD_TODO_LIST => serde_json::from_value::<TodoListParams>(params)
-            .map(RequestDispatch::TodoList)
-            .map_err(|err| format!("invalid todo.list params: {err}")),
-        METHOD_TODO_ADD => serde_json::from_value::<TodoAddParams>(params)
-            .map(RequestDispatch::TodoAdd)
-            .map_err(|err| format!("invalid todo.add params: {err}")),
-        METHOD_TODO_UPDATE => serde_json::from_value::<TodoUpdateParams>(params)
-            .map(RequestDispatch::TodoUpdate)
-            .map_err(|err| format!("invalid todo.update params: {err}")),
-        METHOD_TODO_TOGGLE => serde_json::from_value::<TodoToggleParams>(params)
-            .map(RequestDispatch::TodoToggle)
-            .map_err(|err| format!("invalid todo.toggle params: {err}")),
-        METHOD_TODO_REMOVE => serde_json::from_value::<TodoRemoveParams>(params)
-            .map(RequestDispatch::TodoRemove)
-            .map_err(|err| format!("invalid todo.remove params: {err}")),
-        METHOD_TODO_REORDER => serde_json::from_value::<TodoReorderParams>(params)
-            .map(RequestDispatch::TodoReorder)
-            .map_err(|err| format!("invalid todo.reorder params: {err}")),
         METHOD_THREAD_CREATE => serde_json::from_value::<ThreadCreateParams>(params)
             .map(RequestDispatch::ThreadCreate)
             .map_err(|err| format!("invalid thread.create params: {err}")),
