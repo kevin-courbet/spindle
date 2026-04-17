@@ -5,13 +5,19 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Default to read-only; individual jobs opt into additional perms.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: build ${{ matrix.triple }}
     runs-on: macos-14
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write      # SLSA provenance signing via Sigstore
+      attestations: write  # actions/attest-build-provenance
     strategy:
       fail-fast: false
       matrix:
@@ -33,16 +39,9 @@ jobs:
         # submodule `threadmill` is only needed by codegen/generate.sh; the
         # generated src/protocol.rs is committed, so cargo builds don't need it.
 
-      - name: Cache cargo + target
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ matrix.triple }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-${{ matrix.triple }}-
+          shared-key: release-${{ matrix.triple }}
 
       - name: Install zig + cargo-zigbuild (Linux targets only)
         if: matrix.use_zigbuild
@@ -76,6 +75,13 @@ jobs:
           tar -czf "$ARCHIVE" -C "$STAGE_ROOT" "spindle-${VERSION}-${{ matrix.triple }}"
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "archive_path=$GITHUB_WORKSPACE/$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance (SLSA)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.archive_path }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -90,6 +96,9 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # scoped to the release job only
     # Only publish on tag pushes, not on workflow_dispatch dry runs.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     steps:
