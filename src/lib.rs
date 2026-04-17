@@ -619,7 +619,8 @@ async fn activate_session_events(
                             "method": event.method,
                             "params": event.params,
                         })
-                        .to_string(),
+                        .to_string()
+                        .into(),
                     );
                     if outbound_tx.send(message).is_err() {
                         break;
@@ -711,7 +712,8 @@ fn success_response(id: Value, result: Value) -> Message {
             "id": id,
             "result": result,
         })
-        .to_string(),
+        .to_string()
+        .into(),
     )
 }
 
@@ -736,6 +738,7 @@ fn error_response(id: Option<Value>, error: RpcError) -> Message {
             "id": id.unwrap_or(Value::Null),
             "error": error_payload,
         })
-        .to_string(),
+        .to_string()
+        .into(),
     )
 }

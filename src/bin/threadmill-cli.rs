@@ -735,7 +735,7 @@ async fn handle_chat(
                 },
             });
             socket
-                .send(Message::Text(hello.to_string()))
+                .send(Message::Text(hello.to_string().into()))
                 .await
                 .map_err(|err| CliError::connection(format!("failed to send hello: {err}")))?;
             let _ = read_response_by_id(&mut socket, HELLO_REQUEST_ID, "session.hello").await?;
@@ -1473,7 +1473,7 @@ async fn rpc_request(
     });
 
     socket
-        .send(Message::Text(hello_request.to_string()))
+        .send(Message::Text(hello_request.to_string().into()))
         .await
         .map_err(|err| CliError::connection(format!("failed to send session.hello: {err}")))?;
 
@@ -1490,7 +1490,7 @@ async fn rpc_request(
     }
 
     socket
-        .send(Message::Text(request.to_string()))
+        .send(Message::Text(request.to_string().into()))
         .await
         .map_err(|err| CliError::connection(format!("failed to send {method}: {err}")))?;
 
