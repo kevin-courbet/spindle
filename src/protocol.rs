@@ -343,6 +343,11 @@ pub struct WorkflowState {
     pub prd_issue_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implementation_issue_urls: Vec<String>,
+    /// Chat session driving the workflow (e.g. the session that ran /sisyphus).
+    /// Target for `inject_system_context` when non-orchestrator actors (UI, CLI, other
+    /// agents) mutate workflow state and the orchestrator must be notified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workers: Vec<WorkflowWorker>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -888,6 +893,8 @@ pub struct WorkflowCreateParams {
     pub prd_issue_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implementation_issue_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1947,6 +1954,7 @@ mod tests {
             completed_at: None,
             prd_issue_url: None,
             implementation_issue_urls: Vec::new(),
+            orchestrator_session_id: None,
             workers: Vec::new(),
             reviewers: Vec::new(),
             findings: Vec::new(),

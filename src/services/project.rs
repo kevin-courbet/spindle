@@ -77,9 +77,6 @@ impl ProjectService {
         let protocol_project = project.to_protocol()?;
 
         if is_new {
-            state.emit_project_added(protocol::ProjectAddedEvent {
-                project: protocol_project.clone(),
-            });
             state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ProjectAdded {
                 project: protocol_project.clone(),
             }]);
@@ -190,9 +187,6 @@ impl ProjectService {
         };
 
         if removed {
-            state.emit_project_removed(protocol::ProjectRemovedEvent {
-                project_id: params.project_id.clone(),
-            });
             state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ProjectRemoved {
                 project_id: params.project_id,
             }]);

@@ -163,9 +163,6 @@ impl ThreadService {
             (thread, protocol_thread)
         };
 
-        state.emit_thread_created(protocol::ThreadCreatedEvent {
-            thread: protocol_thread.clone(),
-        });
         state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ThreadCreated {
             thread: protocol_thread.clone(),
         }]);
@@ -683,11 +680,6 @@ impl ThreadService {
         let previous = thread.status.clone();
         thread.status = next.clone();
 
-        state.emit_thread_status_changed(protocol::ThreadStatusChanged {
-            thread_id: thread_id.to_string(),
-            old: previous.clone(),
-            new: next.clone(),
-        });
         state.emit_state_delta(vec![
             protocol::StateDeltaOperationPayload::ThreadStatusChanged {
                 thread_id: thread_id.to_string(),

@@ -13,6 +13,34 @@ use crate::{protocol, services::chat::ChatService, AppState};
 
 pub struct WorkflowService;
 
+/// Inject a `<system-context>` message into the orchestrator session, if one is set.
+///
+/// Fire-and-forget. Used to keep the orchestrator informed when non-orchestrator actors
+/// (UI override, CLI, another agent) mutate workflow state. No-op when the workflow has
+/// no `orchestrator_session_id` or the session is unreachable.
+async fn notify_orchestrator(
+    state: &Arc<AppState>,
+    workflow: &protocol::WorkflowState,
+    body: &str,
+) {
+    let Some(session_id) = workflow.orchestrator_session_id.as_deref() else {
+        return;
+    };
+    let context = format!(
+        "[Workflow {} — phase: {:?}]\n{body}",
+        workflow.workflow_id, workflow.phase
+    );
+    if let Err(err) = ChatService::inject_system_context(state.clone(), session_id, &context).await
+    {
+        warn!(
+            workflow_id = %workflow.workflow_id,
+            session_id = %session_id,
+            error = %err,
+            "failed to inject orchestrator context"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowStoreData {
     #[serde(default)]
@@ -271,6 +299,7 @@ impl WorkflowService {
                 completed_at: None,
                 prd_issue_url: params.prd_issue_url,
                 implementation_issue_urls: params.implementation_issue_urls,
+                orchestrator_session_id: params.orchestrator_session_id,
                 workers: Vec::new(),
                 reviewers: Vec::new(),
                 findings: Vec::new(),
@@ -355,8 +384,8 @@ impl WorkflowService {
             protocol::WorkflowPhaseChangedEvent {
                 workflow_id: workflow.workflow_id.clone(),
                 thread_id: workflow.thread_id.clone(),
-                old_phase,
-                new_phase,
+                old_phase: old_phase.clone(),
+                new_phase: new_phase.clone(),
                 forced,
             },
         );
@@ -369,6 +398,12 @@ impl WorkflowService {
             );
         }
         emit_workflow_upsert(&state, workflow.clone());
+
+        if forced {
+            let body =
+                format!("User force-transitioned workflow from {old_phase:?} to {new_phase:?}.");
+            notify_orchestrator(&state, &workflow, &body).await;
+        }
         Ok(workflow)
     }
 
@@ -480,6 +515,21 @@ impl WorkflowService {
                     },
                 );
                 emit_workflow_state_delta(&state, &workflow_id).await;
+
+                let snapshot = {
+                    let store = state.workflows.lock().await;
+                    find_workflow_locked(&store, &workflow_id).cloned()
+                };
+                if let Some(snapshot) = snapshot {
+                    let body = format!(
+                        "Worker {} ({}) spawned with session {}.",
+                        worker.worker_id,
+                        worker.agent_name,
+                        worker.session_id.clone().unwrap_or_else(|| "?".to_string())
+                    );
+                    notify_orchestrator(&state, &snapshot, &body).await;
+                }
+
                 Ok(protocol::WorkflowSpawnWorkerResult {
                     workflow_id,
                     worker,
@@ -730,18 +780,31 @@ impl WorkflowService {
                 )
                 .await?;
 
-                let reviewer = {
+                let (reviewer, workflow_snapshot) = {
                     let store = state.workflows.lock().await;
                     let workflow = find_workflow_locked(&store, &workflow_id)
                         .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
-                    workflow
+                    let reviewer = workflow
                         .reviewers
                         .iter()
                         .find(|reviewer| reviewer.reviewer_id == reviewer_id)
                         .cloned()
-                        .ok_or_else(|| format!("reviewer not found: {reviewer_id}"))?
+                        .ok_or_else(|| format!("reviewer not found: {reviewer_id}"))?;
+                    (reviewer, workflow.clone())
                 };
                 emit_workflow_state_delta(&state, &workflow_id).await;
+
+                let body = format!(
+                    "Reviewer {} ({}) spawned with session {}.",
+                    reviewer.reviewer_id,
+                    reviewer.agent_name,
+                    reviewer
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| "?".to_string())
+                );
+                notify_orchestrator(&state, &workflow_snapshot, &body).await;
+
                 Ok(protocol::WorkflowSpawnReviewerResult {
                     workflow_id,
                     reviewer,
@@ -1481,6 +1544,7 @@ mod tests {
                 completed_at: None,
                 prd_issue_url: None,
                 implementation_issue_urls: Vec::new(),
+                orchestrator_session_id: None,
                 workers: vec![protocol::WorkflowWorker {
                     worker_id: worker_id.to_string(),
                     agent_name: "mock".to_string(),
@@ -1524,6 +1588,7 @@ mod tests {
                 completed_at: None,
                 prd_issue_url: None,
                 implementation_issue_urls: Vec::new(),
+                orchestrator_session_id: None,
                 workers: Vec::new(),
                 reviewers: vec![protocol::WorkflowReviewer {
                     reviewer_id: reviewer_id.to_string(),
