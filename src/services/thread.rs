@@ -10,7 +10,7 @@ use crate::{
     protocol,
     services::{
         chat::ChatService, checkpoint::CheckpointService, preset::PresetService, sanitize_name,
-        short_id, todo::TodoService,
+        short_id,
     },
     state_store::{port_base_with_offset, thread_env, Thread},
     tmux, AppState,
@@ -335,8 +335,8 @@ impl ThreadService {
             let _ = tmux::kill_session(&thread.tmux_session).await;
         }
 
-        // Worktree-dependent cleanup: checkpoint refs, todos, config hooks,
-        // and worktree removal all need the directory to exist. If it's already
+        // Worktree-dependent cleanup: checkpoint refs, config hooks, and
+        // worktree removal all need the directory to exist. If it's already
         // gone (e.g. manually deleted or stale from a prior failed run), skip
         // gracefully instead of failing the close.
         let worktree_exists = Path::new(&thread.worktree_path).is_dir();
@@ -354,13 +354,6 @@ impl ThreadService {
                 thread_id = %thread.id,
                 error = %err,
                 "checkpoint cleanup failed during close, continuing"
-            );
-        }
-        if let Err(err) = TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await {
-            warn!(
-                thread_id = %thread.id,
-                error = %err,
-                "todo cleanup failed during close, continuing"
             );
         }
 
@@ -395,7 +388,6 @@ impl ThreadService {
         }
         if Path::new(&thread.worktree_path).is_dir() {
             CheckpointService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
-            TodoService::cleanup_thread(Arc::clone(&state), &thread.id).await?;
         }
 
         {

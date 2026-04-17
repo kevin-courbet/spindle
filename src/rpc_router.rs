@@ -11,7 +11,7 @@ use crate::{
         chat::ChatService, checkpoint::CheckpointService, file::FileService, git::GitService,
         opencode::OpencodeService, preset::PresetService, project::ProjectService,
         system::SystemService, terminal, terminal::TerminalConnectionState, thread::ThreadService,
-        todo::TodoService, workflow::WorkflowService,
+        workflow::WorkflowService,
     },
     AppState, ConnectionSessionState, RpcError,
 };
@@ -287,42 +287,6 @@ pub async fn dispatch_request(
                 .await
                 .map_err(|message| map_service_error("git.create_pr", message))?;
             to_value("git.create_pr", result)
-        }
-        RequestDispatch::TodoList(params) => {
-            let result = TodoService::list(state, params)
-                .await
-                .map_err(|message| map_service_error("todo.list", message))?;
-            to_value("todo.list", result)
-        }
-        RequestDispatch::TodoAdd(params) => {
-            let result = TodoService::add(state, params)
-                .await
-                .map_err(|message| map_service_error("todo.add", message))?;
-            to_value("todo.add", result)
-        }
-        RequestDispatch::TodoUpdate(params) => {
-            let result = TodoService::update(state, params)
-                .await
-                .map_err(|message| map_service_error("todo.update", message))?;
-            to_value("todo.update", result)
-        }
-        RequestDispatch::TodoToggle(params) => {
-            let result = TodoService::toggle(state, params)
-                .await
-                .map_err(|message| map_service_error("todo.toggle", message))?;
-            to_value("todo.toggle", result)
-        }
-        RequestDispatch::TodoRemove(params) => {
-            let result = TodoService::remove(state, params)
-                .await
-                .map_err(|message| map_service_error("todo.remove", message))?;
-            to_value("todo.remove", result)
-        }
-        RequestDispatch::TodoReorder(params) => {
-            let result = TodoService::reorder(state, params)
-                .await
-                .map_err(|message| map_service_error("todo.reorder", message))?;
-            to_value("todo.reorder", result)
         }
         RequestDispatch::ThreadCreate(params) => {
             let thread = ThreadService::create(state, params)

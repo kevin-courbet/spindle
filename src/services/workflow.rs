@@ -1325,23 +1325,9 @@ impl WorkflowService {
             }
         }
 
-        let platform = detect_remote_platform(&project_path).await;
-        let issues = match &platform {
-            protocol::WorkflowIssuePlatform::Github => {
-                list_github_issues(&project_path, &label, limit).await?
-            }
-            protocol::WorkflowIssuePlatform::Gitlab => {
-                list_gitlab_issues(&project_path, &label, limit).await?
-            }
-            protocol::WorkflowIssuePlatform::Unknown => {
-                return Err(format!(
-                    "could not detect github.com or gitlab in {}'s git remote — \
-                     configure an origin or pass issues manually via workflow.create",
-                    project_path
-                ));
-            }
-        };
-
+        let transport = crate::services::issues::for_project(&project_path, None).await;
+        let platform = transport.kind();
+        let issues = transport.list(&label, limit).await?;
         issue_cache_put(cache_key, platform.clone(), issues.clone()).await;
         Ok(protocol::WorkflowListIssuesResult {
             platform,
@@ -1376,14 +1362,17 @@ impl WorkflowService {
 
         // The orchestrator prompt says "read the issue thoroughly" — a 200-char
         // preview is not enough. If the caller didn't send a full body, try to
-        // fetch it via gh/glab. Failures fall back gracefully to whatever the
-        // caller did send.
+        // fetch it via the transport. Failures fall back gracefully to whatever
+        // the caller did send.
         let issue_body = match params.issue_body.clone() {
             Some(body) if body.len() > 300 => Some(body),
-            supplied => match fetch_full_issue_body(&worktree, &params.issue_url).await {
-                Some(full) => Some(full),
-                None => supplied,
-            },
+            supplied => {
+                let transport = crate::services::issues::for_project(&worktree, None).await;
+                match transport.resolve(&params.issue_url).await.ok().flatten() {
+                    Some(enriched) => enriched.body.or(supplied),
+                    None => supplied,
+                }
+            }
         };
 
         let initial_prompt = format!(
@@ -1442,234 +1431,6 @@ impl WorkflowService {
             orchestrator_session_id: chat_result.session_id,
         })
     }
-}
-
-// ---------- Issue listing helpers ----------
-
-async fn detect_remote_platform(project_path: &str) -> protocol::WorkflowIssuePlatform {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(project_path)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .await;
-    let Ok(output) = output else {
-        return protocol::WorkflowIssuePlatform::Unknown;
-    };
-    if !output.status.success() {
-        return protocol::WorkflowIssuePlatform::Unknown;
-    }
-    let url = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_lowercase();
-    // Tighter matches — bare `contains("gitlab")` false-positives on a URL like
-    // `legitlab.com`. Require a host-boundary token so substrings don't win.
-    if url.contains("github.com") {
-        protocol::WorkflowIssuePlatform::Github
-    } else if url.contains("gitlab.com") || url.contains("//gitlab.") || url.contains("@gitlab.") {
-        protocol::WorkflowIssuePlatform::Gitlab
-    } else {
-        protocol::WorkflowIssuePlatform::Unknown
-    }
-}
-
-/// Best-effort: try `gh issue view <url> --json body` first, then `glab issue view`.
-/// Returns None on any failure (auth, network, CLI missing, …) so the caller can
-/// fall back to whatever body text it already has without failing the workflow.
-async fn fetch_full_issue_body(worktree_path: &str, issue_url: &str) -> Option<String> {
-    let gh = tokio::process::Command::new("gh")
-        .current_dir(worktree_path)
-        .args(["issue", "view", issue_url, "--json", "body"])
-        .output()
-        .await;
-    if let Ok(output) = gh {
-        if output.status.success() {
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let Some(body) = parsed.get("body").and_then(serde_json::Value::as_str) {
-                    if !body.is_empty() {
-                        return Some(body.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    let glab = tokio::process::Command::new("glab")
-        .current_dir(worktree_path)
-        .args(["issue", "view", issue_url, "--output", "json"])
-        .output()
-        .await;
-    if let Ok(output) = glab {
-        if output.status.success() {
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let Some(body) = parsed
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    if !body.is_empty() {
-                        return Some(body.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-async fn list_github_issues(
-    project_path: &str,
-    label: &str,
-    limit: u32,
-) -> Result<Vec<protocol::WorkflowIssueRef>, String> {
-    let limit_str = limit.to_string();
-    // `gh -R` takes `[HOST/]OWNER/REPO`, not a filesystem path. Invoke `gh` from
-    // inside the project directory instead — it auto-detects the repo from git.
-    let output = tokio::process::Command::new("gh")
-        .current_dir(project_path)
-        .args([
-            "issue",
-            "list",
-            "--label",
-            label,
-            "--state",
-            "open",
-            "--limit",
-            &limit_str,
-            "--json",
-            "number,title,url,createdAt,author,body",
-        ])
-        .output()
-        .await
-        .map_err(|err| {
-            format!(
-                "failed to run `gh issue list`: {err}. \
-                 Is the GitHub CLI installed and authenticated (`gh auth status`)?"
-            )
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh issue list failed: {}", stderr.trim()));
-    }
-
-    let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse `gh issue list` output: {err}"))?;
-
-    Ok(raw
-        .into_iter()
-        .map(|row| protocol::WorkflowIssueRef {
-            number: row
-                .get("number")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            title: row
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            url: row
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            author: row
-                .get("author")
-                .and_then(|a| a.get("login"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            created_at: row
-                .get("createdAt")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            body_preview: row
-                .get("body")
-                .and_then(serde_json::Value::as_str)
-                .map(truncate_preview),
-        })
-        .collect())
-}
-
-async fn list_gitlab_issues(
-    project_path: &str,
-    label: &str,
-    limit: u32,
-) -> Result<Vec<protocol::WorkflowIssueRef>, String> {
-    let limit_str = limit.to_string();
-    let output = tokio::process::Command::new("glab")
-        .current_dir(project_path)
-        .args([
-            "issue",
-            "list",
-            "--label",
-            label,
-            "--opened",
-            "--per-page",
-            &limit_str,
-            "--output",
-            "json",
-        ])
-        .output()
-        .await
-        .map_err(|err| {
-            format!(
-                "failed to run `glab issue list`: {err}. \
-                 Is the GitLab CLI installed and authenticated (`glab auth status`)?"
-            )
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("glab issue list failed: {}", stderr.trim()));
-    }
-
-    let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse `glab issue list` output: {err}"))?;
-
-    Ok(raw
-        .into_iter()
-        .map(|row| protocol::WorkflowIssueRef {
-            number: row
-                .get("iid")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            title: row
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            url: row
-                .get("web_url")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            author: row
-                .get("author")
-                .and_then(|a| a.get("username"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            created_at: row
-                .get("created_at")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            body_preview: row
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-                .map(truncate_preview),
-        })
-        .collect())
-}
-
-fn truncate_preview(body: &str) -> String {
-    const LIMIT: usize = 200;
-    if body.len() <= LIMIT {
-        return body.to_string();
-    }
-    let mut end = LIMIT;
-    while !body.is_char_boundary(end) && end > 0 {
-        end -= 1;
-    }
-    format!("{}…", &body[..end])
 }
 
 // ---------- Issue cache (30s TTL, in-memory) ----------
