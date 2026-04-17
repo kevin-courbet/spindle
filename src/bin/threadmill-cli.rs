@@ -48,6 +48,12 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    /// Run as a stdio MCP server. Exposes the workflow.* surface (plus read-only
+    /// thread / chat helpers) as MCP tools that any MCP-capable agent harness
+    /// — Claude Code, Codex, OpenCode, Gemini CLI, … — can consume. Reads
+    /// newline-delimited JSON-RPC from stdin, writes responses to stdout. Logs
+    /// go to stderr.
+    Mcp,
 }
 
 #[derive(Subcommand, Debug)]
@@ -561,6 +567,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             });
             print_json(&output, pretty)
         }
+        Command::Mcp => run_mcp_server(&ws_url, auth_token).await,
     }
 }
 
@@ -1565,4 +1572,568 @@ fn read_auth_token() -> Option<String> {
     } else {
         Some(token.to_string())
     }
+}
+
+// ===================================================================
+//   MCP stdio server
+// ===================================================================
+//
+// Implements the Model Context Protocol (2024-11-05 wire version) over stdio.
+// Newline-delimited JSON-RPC 2.0. The server exposes the workflow.* CLI
+// surface (plus read-only thread / chat helpers) as MCP tools that any
+// MCP-capable agent harness — Claude Code, Codex, OpenCode, Gemini CLI —
+// can dial by spawning `threadmill-cli mcp` as a subprocess.
+//
+// All tool calls are routed through the existing `rpc_request` helper, so
+// the MCP server is a thin translation layer in front of Spindle's
+// WebSocket JSON-RPC API. Logs intentionally go to stderr; stdout is
+// reserved exclusively for MCP protocol frames.
+
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Protocol versions we're willing to negotiate. If the client asks for one of
+/// these we echo it back; otherwise we fall back to `MCP_PROTOCOL_VERSION` and
+/// let the client decide whether to continue or disconnect.
+const SUPPORTED_MCP_VERSIONS: &[&str] = &["2024-11-05"];
+
+struct McpTool {
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+    dispatch: McpDispatch,
+}
+
+/// How to turn a `tools/call.arguments` object into a Spindle JSON-RPC call.
+enum McpDispatch {
+    /// Direct call: forward the given method name with the raw arguments object as params.
+    Direct(&'static str),
+    /// Needs thread context: reads `thread_id` from `THREADMILL_THREAD` env var, injects
+    /// it into the params under the given key, then forwards to `method`.
+    WithCurrentThread {
+        method: &'static str,
+        inject_key: &'static str,
+    },
+}
+
+fn mcp_tool_catalog() -> Vec<McpTool> {
+    vec![
+        // --- workflow.* (mirror the CLI surface) ---
+        McpTool {
+            name: "workflow_create",
+            description: "Create a new Sisyphus workflow for the current thread. Optionally link a PRD issue URL \
+                          and implementation-issue URLs. Returns the new workflow_id.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prd_issue_url": {"type": "string", "description": "PRD issue URL (optional)."},
+                    "implementation_issue_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Implementation issue URLs (optional)."
+                    },
+                    "orchestrator_session_id": {"type": "string", "description": "Chat session that drives the workflow. Defaults to the caller's session if omitted."}
+                }
+            }),
+            dispatch: McpDispatch::WithCurrentThread {
+                method: "workflow.create",
+                inject_key: "thread_id",
+            },
+        },
+        McpTool {
+            name: "workflow_status",
+            description: "Fetch the current state of a workflow (phase, workers, reviewers, findings, linked issues).",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id"],
+                "properties": {"workflow_id": {"type": "string"}}
+            }),
+            dispatch: McpDispatch::Direct("workflow.status"),
+        },
+        McpTool {
+            name: "workflow_list",
+            description: "List workflows. With no arguments, lists workflows for the current thread.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread_id": {"type": "string", "description": "Filter by thread. Defaults to current thread if omitted."}
+                }
+            }),
+            dispatch: McpDispatch::WithCurrentThread {
+                method: "workflow.list",
+                inject_key: "thread_id",
+            },
+        },
+        McpTool {
+            name: "workflow_transition",
+            description: "Transition a workflow to a new phase. Pass force=true to bypass state-machine validation \
+                          (user override). Valid phases: PLANNING, IMPLEMENTING, TESTING, REVIEWING, FIXING, COMPLETE, BLOCKED, FAILED.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id", "phase"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "phase": {"type": "string", "enum": ["PLANNING","IMPLEMENTING","TESTING","REVIEWING","FIXING","COMPLETE","BLOCKED","FAILED"]},
+                    "force": {"type": "boolean", "default": false}
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.transition"),
+        },
+        McpTool {
+            name: "workflow_spawn_worker",
+            description: "Spawn a Hephaestus worker chat session tracked by the workflow. agent_name is the harness id \
+                          (claude, codex, opencode, gemini, …). system_prompt and initial_prompt are optional.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id", "agent_name"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "agent_name": {"type": "string"},
+                    "system_prompt": {"type": "string"},
+                    "initial_prompt": {"type": "string"},
+                    "display_name": {"type": "string"},
+                    "parent_session_id": {"type": "string"},
+                    "preferred_model": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.spawn_worker"),
+        },
+        McpTool {
+            name: "workflow_record_handoff",
+            description: "Record a worker's handoff. stop_reason is one of DONE / CONTEXT_EXHAUSTED / BLOCKED_NEED_INFO / \
+                          BLOCKED_TECHNICAL / QUALITY_CONCERN / SCOPE_CREEP. context is required (multi-line summary).",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id", "worker_id", "stop_reason", "context"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "worker_id": {"type": "string"},
+                    "stop_reason": {"type": "string", "enum": ["DONE","CONTEXT_EXHAUSTED","BLOCKED_NEED_INFO","BLOCKED_TECHNICAL","QUALITY_CONCERN","SCOPE_CREEP"]},
+                    "context": {"type": "string"},
+                    "progress": {"type": "array", "items": {"type": "string"}},
+                    "next_steps": {"type": "array", "items": {"type": "string"}},
+                    "blockers": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.record_handoff"),
+        },
+        McpTool {
+            name: "workflow_start_review",
+            description: "Transition the workflow to REVIEWING and kick off the review swarm. With an empty reviewers[] \
+                          (or omitted), Spindle auto-selects reviewers from git diff main...HEAD. Pass force=true to \
+                          allow transitioning from phases that would otherwise be invalid.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "force": {"type": "boolean", "default": false},
+                    "reviewers": {
+                        "type": "array",
+                        "description": "Optional explicit reviewer specs. Omit for auto-selection from git diff.",
+                        "items": {
+                            "type": "object",
+                            "required": ["agent_name"],
+                            "properties": {
+                                "agent_name": {"type": "string", "description": "Harness id (claude, codex, opencode, gemini, …)."},
+                                "system_prompt": {"type": "string"},
+                                "initial_prompt": {"type": "string"},
+                                "display_name": {"type": "string"},
+                                "parent_session_id": {"type": "string"},
+                                "preferred_model": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.start_review"),
+        },
+        McpTool {
+            name: "workflow_spawn_reviewer",
+            description: "Spawn an individual reviewer session during a review round. Use for ad-hoc specialist reviewers \
+                          beyond the auto-selected swarm.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id", "agent_name"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "agent_name": {"type": "string"},
+                    "system_prompt": {"type": "string"},
+                    "initial_prompt": {"type": "string"},
+                    "display_name": {"type": "string"},
+                    "parent_session_id": {"type": "string"},
+                    "preferred_model": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.spawn_reviewer"),
+        },
+        McpTool {
+            name: "workflow_list_reviewers",
+            description: "List reviewer sessions attached to a workflow. Includes status and session_id for each.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id"],
+                "properties": {"workflow_id": {"type": "string"}}
+            }),
+            dispatch: McpDispatch::Direct("workflow.list_reviewers"),
+        },
+        McpTool {
+            name: "workflow_record_findings",
+            description: "Record synthesized findings for the current review round. Each finding needs severity \
+                          (LOW/MEDIUM/HIGH), summary, details, and optionally source_reviewers / file_path / line.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id", "findings"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "findings": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["severity", "summary", "details"],
+                            "properties": {
+                                "severity": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+                                "summary": {"type": "string"},
+                                "details": {"type": "string"},
+                                "source_reviewers": {"type": "array", "items": {"type": "string"}},
+                                "file_path": {"type": "string"},
+                                "line": {"type": "integer"}
+                            }
+                        }
+                    }
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.record_findings"),
+        },
+        McpTool {
+            name: "workflow_resolve_finding",
+            description: "Mark a finding resolved (or unresolved). Default resolved=true.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id", "finding_id"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "finding_id": {"type": "string"},
+                    "resolved": {"type": "boolean", "default": true}
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.resolve_finding"),
+        },
+        McpTool {
+            name: "workflow_complete",
+            description: "Mark the workflow COMPLETE. force=true skips validation.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "force": {"type": "boolean", "default": false}
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.complete"),
+        },
+        // --- read-only helpers ---
+        McpTool {
+            name: "thread_list",
+            description: "List active threads. Useful for agents that need to reference other threads by name or id.",
+            input_schema: json!({"type": "object"}),
+            dispatch: McpDispatch::Direct("thread.list"),
+        },
+        McpTool {
+            name: "chat_list",
+            description: "List chat sessions in the current thread (workers, reviewers, orchestrator).",
+            input_schema: json!({"type": "object"}),
+            dispatch: McpDispatch::WithCurrentThread {
+                method: "chat.list",
+                inject_key: "thread_id",
+            },
+        },
+        McpTool {
+            name: "chat_status",
+            description: "Fetch a single chat session's current status (agent type, worker count, display name, …).",
+            input_schema: json!({
+                "type": "object",
+                "required": ["session_id"],
+                "properties": {"session_id": {"type": "string"}}
+            }),
+            dispatch: McpDispatch::Direct("chat.status"),
+        },
+    ]
+}
+
+async fn run_mcp_server(ws_url: &str, auth_token: Option<String>) -> Result<(), CliError> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let tools = mcp_tool_catalog();
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    let mut initialized = false;
+
+    eprintln!(
+        "threadmill-cli mcp — {} tools, talking to {}",
+        tools.len(),
+        ws_url
+    );
+
+    loop {
+        let line = match stdin.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                eprintln!("mcp: stdin closed, exiting");
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("mcp: stdin read error: {err}");
+                return Err(CliError::connection(format!("stdin: {err}")));
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(err) => {
+                // Per JSON-RPC 2.0 the server MUST respond with a parse error
+                // when a request is unparseable. Silent drop would hang a client
+                // that's waiting on a specific id.
+                eprintln!("mcp: parse error on stdin: {err} (raw: {line})");
+                let resp = err_response(&Some(Value::Null), -32700, "parse error");
+                write_mcp_frame(&mut stdout, &resp).await?;
+                continue;
+            }
+        };
+
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = msg.get("id").cloned();
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // JSON-RPC 2.0: notifications have no `id` and MUST NOT receive a
+        // response. Handle them before the request dispatcher so no path can
+        // accidentally emit a reply with `id: null`.
+        if id.is_none() {
+            match method {
+                "notifications/initialized" => {
+                    // Per MCP 2024-11-05 the server transitions to "ready" on
+                    // this notification, NOT on the initialize request — the
+                    // client must complete the handshake before tool calls.
+                    initialized = true;
+                }
+                "notifications/cancelled" | "notifications/progress" => {
+                    // Client-side lifecycle notifications we don't act on yet.
+                }
+                other => {
+                    eprintln!("mcp: ignoring unknown notification: {other}");
+                }
+            }
+            continue;
+        }
+
+        let response: Value = match method {
+            "initialize" => {
+                // Protocol version negotiation: if the client's requested
+                // version is one we support, echo it; otherwise fall back to
+                // our default and let the client decide whether to continue.
+                let client_version = params.get("protocolVersion").and_then(Value::as_str);
+                let response_version = match client_version {
+                    Some(v) if SUPPORTED_MCP_VERSIONS.contains(&v) => v,
+                    _ => MCP_PROTOCOL_VERSION,
+                };
+                ok_response(
+                    &id,
+                    json!({
+                        "protocolVersion": response_version,
+                        "capabilities": {"tools": {"listChanged": false}},
+                        "serverInfo": {
+                            "name": "threadmill-cli",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        }
+                    }),
+                )
+            }
+            "tools/list" => {
+                if !initialized {
+                    err_response(&id, -32002, "server not initialized")
+                } else {
+                    let tool_list: Vec<Value> = tools
+                        .iter()
+                        .map(|t| {
+                            json!({
+                                "name": t.name,
+                                "description": t.description,
+                                "inputSchema": t.input_schema,
+                            })
+                        })
+                        .collect();
+                    ok_response(&id, json!({"tools": tool_list}))
+                }
+            }
+            "tools/call" => {
+                if !initialized {
+                    err_response(&id, -32002, "server not initialized")
+                } else {
+                    handle_tool_call(ws_url, auth_token.as_deref(), &tools, params, &id).await
+                }
+            }
+            "ping" => ok_response(&id, json!({})),
+            other => err_response(&id, -32601, &format!("unknown method: {other}")),
+        };
+
+        write_mcp_frame(&mut stdout, &response).await?;
+    }
+}
+
+async fn handle_tool_call(
+    ws_url: &str,
+    auth_token: Option<&str>,
+    tools: &[McpTool],
+    params: Value,
+    id: &Option<Value>,
+) -> Value {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let tool = match tools.iter().find(|t| t.name == name) {
+        Some(t) => t,
+        None => {
+            return tool_error(id, &format!("unknown tool: {name}"));
+        }
+    };
+
+    let rpc_params = match &tool.dispatch {
+        McpDispatch::Direct(_) => args,
+        McpDispatch::WithCurrentThread { inject_key, .. } => {
+            // Resolve thread context: explicit arg > env var > error. A wrong-type
+            // argument (e.g. `thread_id: 42` or `thread_id: {}`) is a caller bug —
+            // surface it loudly instead of silently overwriting with the env var.
+            let mut args = args;
+            match args.get(*inject_key) {
+                Some(Value::String(s)) if !s.is_empty() => { /* caller-supplied, keep as-is */ }
+                Some(Value::Null) | None => {
+                    let thread_id = match env::var("THREADMILL_THREAD") {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return tool_error(
+                                id,
+                                &format!(
+                                    "this tool needs `{inject_key}` set in arguments, or THREADMILL_THREAD env var present"
+                                ),
+                            );
+                        }
+                    };
+                    match args.as_object_mut() {
+                        Some(obj) => {
+                            obj.insert(inject_key.to_string(), Value::String(thread_id));
+                        }
+                        None => {
+                            return tool_error(id, "tool arguments must be an object");
+                        }
+                    }
+                }
+                Some(Value::String(_)) => {
+                    // Empty-string case — treat like missing so env fallback applies.
+                    let thread_id = match env::var("THREADMILL_THREAD") {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return tool_error(
+                                id,
+                                &format!(
+                                    "this tool needs `{inject_key}` set in arguments, or THREADMILL_THREAD env var present"
+                                ),
+                            );
+                        }
+                    };
+                    if let Some(obj) = args.as_object_mut() {
+                        obj.insert(inject_key.to_string(), Value::String(thread_id));
+                    }
+                }
+                Some(other) => {
+                    return tool_error(
+                        id,
+                        &format!("`{inject_key}` must be a string, got {}", type_label(other)),
+                    );
+                }
+            }
+            args
+        }
+    };
+
+    let method = match &tool.dispatch {
+        McpDispatch::Direct(method) | McpDispatch::WithCurrentThread { method, .. } => *method,
+    };
+
+    match rpc_request(ws_url, auth_token, method, rpc_params).await {
+        Ok(result) => {
+            let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false,
+                }
+            })
+        }
+        Err(err) => tool_error(id, &err.message),
+    }
+}
+
+fn type_label(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn ok_response(id: &Option<Value>, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn err_response(id: &Option<Value>, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message},
+    })
+}
+
+/// Convention in MCP 2024-11-05: tool-execution failures return a `result` with
+/// `isError: true` and the message in `content`, NOT a JSON-RPC `error` — that's
+/// reserved for protocol-level failures (unknown method, bad params, etc.).
+fn tool_error(id: &Option<Value>, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": message}],
+            "isError": true,
+        }
+    })
+}
+
+async fn write_mcp_frame(stdout: &mut tokio::io::Stdout, frame: &Value) -> Result<(), CliError> {
+    use tokio::io::AsyncWriteExt;
+    let mut payload = serde_json::to_vec(frame)
+        .map_err(|err| CliError::error(format!("failed to encode MCP frame: {err}")))?;
+    payload.push(b'\n');
+    stdout
+        .write_all(&payload)
+        .await
+        .map_err(|err| CliError::connection(format!("mcp stdout write: {err}")))?;
+    stdout
+        .flush()
+        .await
+        .map_err(|err| CliError::connection(format!("mcp stdout flush: {err}")))?;
+    Ok(())
 }
