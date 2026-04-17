@@ -1055,6 +1055,74 @@ pub struct WorkflowCompleteParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowListIssuesParams {
+    pub project_id: String,
+    /// Override the issue label that identifies PRDs. Defaults to "prd".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Maximum number of issues to return. Capped server-side at 100; defaults to 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// When true, skip the in-memory 30s cache and always re-shell out. The fresh
+    /// result is still written back to the cache. UI refresh buttons should set this.
+    #[serde(default)]
+    pub bypass_cache: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowIssuePlatform {
+    #[serde(rename = "github")]
+    Github,
+    #[serde(rename = "gitlab")]
+    Gitlab,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowIssueRef {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// Short preview of the issue body — first ~200 chars — so the Mac can show
+    /// it in the list without a second round-trip. Full body is fetched on demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_preview: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowListIssuesResult {
+    pub platform: WorkflowIssuePlatform,
+    pub issues: Vec<WorkflowIssueRef>,
+    /// True when this response came from the 30s TTL cache rather than a fresh
+    /// gh/glab shell-out. UI can use this to skip flashing spinners.
+    #[serde(default)]
+    pub cached: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowStartFromIssueParams {
+    pub thread_id: String,
+    pub issue_url: String,
+    pub issue_title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_body: Option<String>,
+    /// Persona name under `.threadmill/agents/` — defaults to "sisyphus".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowStartFromIssueResult {
+    pub workflow_id: String,
+    pub orchestrator_session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorkflowResolveFindingParams {
     pub workflow_id: String,
     pub finding_id: String,
@@ -1614,6 +1682,8 @@ pub const METHOD_WORKFLOW_LIST_REVIEWERS: &str = "workflow.list_reviewers";
 pub const METHOD_WORKFLOW_RECORD_FINDINGS: &str = "workflow.record_findings";
 pub const METHOD_WORKFLOW_COMPLETE: &str = "workflow.complete";
 pub const METHOD_WORKFLOW_RESOLVE_FINDING: &str = "workflow.resolve_finding";
+pub const METHOD_WORKFLOW_LIST_ISSUES: &str = "workflow.list_issues";
+pub const METHOD_WORKFLOW_START_FROM_ISSUE: &str = "workflow.start_from_issue";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -1778,6 +1848,10 @@ pub enum RequestDispatch {
     WorkflowComplete(WorkflowCompleteParams),
     #[serde(rename = "workflow.resolve_finding")]
     WorkflowResolveFinding(WorkflowResolveFindingParams),
+    #[serde(rename = "workflow.list_issues")]
+    WorkflowListIssues(WorkflowListIssuesParams),
+    #[serde(rename = "workflow.start_from_issue")]
+    WorkflowStartFromIssue(WorkflowStartFromIssueParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
     #[serde(rename = "agent.registry.list")]
@@ -1989,6 +2063,14 @@ pub fn parse_request_dispatch(
             serde_json::from_value::<WorkflowResolveFindingParams>(params)
                 .map(RequestDispatch::WorkflowResolveFinding)
                 .map_err(|err| format!("invalid workflow.resolve_finding params: {err}"))
+        }
+        METHOD_WORKFLOW_LIST_ISSUES => serde_json::from_value::<WorkflowListIssuesParams>(params)
+            .map(RequestDispatch::WorkflowListIssues)
+            .map_err(|err| format!("invalid workflow.list_issues params: {err}")),
+        METHOD_WORKFLOW_START_FROM_ISSUE => {
+            serde_json::from_value::<WorkflowStartFromIssueParams>(params)
+                .map(RequestDispatch::WorkflowStartFromIssue)
+                .map_err(|err| format!("invalid workflow.start_from_issue params: {err}"))
         }
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
