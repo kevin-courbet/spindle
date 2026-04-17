@@ -40,6 +40,10 @@ enum Command {
         #[command(subcommand)]
         command: TodoCommand,
     },
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
     Status {
         #[arg(long)]
         pretty: bool,
@@ -196,6 +200,206 @@ impl TodoPriorityArg {
     }
 }
 
+#[derive(Subcommand, Debug)]
+enum WorkflowCommand {
+    /// Create a new workflow for a thread (PLANNING phase)
+    Create {
+        /// Thread ID or name (defaults to THREADMILL_THREAD)
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// PRD issue URL
+        #[arg(long)]
+        prd_issue: Option<String>,
+        /// Implementation issue URL (repeatable)
+        #[arg(long = "implementation-issue")]
+        implementation_issues: Vec<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Show current workflow state (phase, workers, reviewers, findings)
+    Status {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// List workflows, optionally filtered by thread
+    List {
+        /// Thread ID or name (defaults to THREADMILL_THREAD if set)
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// List all workflows across threads
+        #[arg(long, conflicts_with = "thread_id")]
+        all: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Transition workflow to a new phase
+    Transition {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long, value_enum)]
+        phase: WorkflowPhaseArg,
+        /// Force transition bypassing state-machine validation
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Spawn a worker chat session tracked by the workflow
+    SpawnWorker {
+        #[arg(long)]
+        workflow_id: String,
+        /// Agent binary name (e.g. "claude", "gemini", "opencode")
+        #[arg(long)]
+        agent: Option<String>,
+        /// Agent definition name (reads from .threadmill/agents/<name>.md)
+        #[arg(long)]
+        agent_def: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system_prompt_file: Option<String>,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        parent_session: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Record a worker handoff (completion, blocker, context-exhaustion, ...)
+    RecordHandoff {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long, value_enum)]
+        stop_reason: StopReasonArg,
+        /// Context/summary. Literal text, or "@path" to read from file
+        #[arg(long)]
+        context: String,
+        /// Progress bullet (repeatable)
+        #[arg(long = "progress")]
+        progress: Vec<String>,
+        /// Next-step bullet (repeatable)
+        #[arg(long = "next-step")]
+        next_steps: Vec<String>,
+        #[arg(long)]
+        blockers: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Transition workflow to REVIEWING and spawn reviewers
+    StartReview {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        force: bool,
+        /// Reviewer specs as JSON array, or "@path" to read from file.
+        /// Each entry: {"agent_name": "...", "system_prompt": "...", "initial_prompt": "...", "display_name": "...", "parent_session_id": "..."}
+        #[arg(long)]
+        reviewers: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Spawn a single reviewer session
+    SpawnReviewer {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        agent_def: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system_prompt_file: Option<String>,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        parent_session: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// List reviewer sessions attached to a workflow
+    ListReviewers {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Record findings synthesized from the review swarm
+    RecordFindings {
+        #[arg(long)]
+        workflow_id: String,
+        /// Findings as JSON array, or "@path" to read from file.
+        /// Each entry: {"severity": "LOW|MEDIUM|HIGH", "summary": "...", "details": "...", "source_reviewers": [...], "file_path": "...", "line": 42}
+        #[arg(long)]
+        findings: String,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Mark workflow COMPLETE
+    Complete {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum WorkflowPhaseArg {
+    Planning,
+    Implementing,
+    Testing,
+    Reviewing,
+    Fixing,
+    Complete,
+    Blocked,
+    Failed,
+}
+
+impl WorkflowPhaseArg {
+    fn as_rpc_value(self) -> &'static str {
+        match self {
+            Self::Planning => "PLANNING",
+            Self::Implementing => "IMPLEMENTING",
+            Self::Testing => "TESTING",
+            Self::Reviewing => "REVIEWING",
+            Self::Fixing => "FIXING",
+            Self::Complete => "COMPLETE",
+            Self::Blocked => "BLOCKED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum StopReasonArg {
+    Done,
+    ContextExhausted,
+    BlockedNeedInfo,
+    BlockedTechnical,
+    QualityConcern,
+    ScopeCreep,
+}
+
+impl StopReasonArg {
+    fn as_rpc_value(self) -> &'static str {
+        match self {
+            Self::Done => "DONE",
+            Self::ContextExhausted => "CONTEXT_EXHAUSTED",
+            Self::BlockedNeedInfo => "BLOCKED_NEED_INFO",
+            Self::BlockedTechnical => "BLOCKED_TECHNICAL",
+            Self::QualityConcern => "QUALITY_CONCERN",
+            Self::ScopeCreep => "SCOPE_CREEP",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CliError {
     message: String,
@@ -332,6 +536,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         },
         Command::Chat { command } => handle_chat(command, &ws_url, auth_token.as_deref()).await,
         Command::Todo { command } => handle_todo(command, &ws_url, auth_token.as_deref()).await,
+        Command::Workflow { command } => {
+            handle_workflow(command, &ws_url, auth_token.as_deref()).await
+        }
         Command::Status { pretty } => {
             let ping = rpc_request(&ws_url, auth_token.as_deref(), "ping", json!({})).await?;
             let output = json!({
@@ -770,6 +977,336 @@ async fn handle_todo(
             )
             .await?;
             print_json(&result, false)
+        }
+    }
+}
+
+/// Read a value that is either literal text or `@<path>` pointing at a file.
+fn resolve_text_or_file(input: &str) -> Result<String, CliError> {
+    if let Some(path) = input.strip_prefix('@') {
+        fs::read_to_string(path)
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .map_err(|err| CliError::error(format!("failed to read {path}: {err}")))
+    } else {
+        Ok(input.to_string())
+    }
+}
+
+struct AgentPayload {
+    agent_name: String,
+    system_prompt: Option<String>,
+    initial_prompt: Option<String>,
+    display_name: Option<String>,
+}
+
+/// Resolve an optional agent / agent_def pair into the worker spawn payload fields.
+fn resolve_agent_payload(
+    agent: Option<String>,
+    agent_def: Option<String>,
+    prompt: Option<String>,
+    system_prompt_file: Option<String>,
+    display_name: Option<String>,
+) -> Result<AgentPayload, CliError> {
+    if let Some(def_name) = agent_def {
+        if system_prompt_file.is_some() {
+            return Err(CliError::error(
+                "--system-prompt-file cannot be combined with --agent-def \
+                 (agent definitions already embed the system prompt)",
+            ));
+        }
+        let def_path = resolve_agent_def_path(&def_name)?;
+        let def = parse_agent_def(&def_path)?;
+        Ok(AgentPayload {
+            agent_name: def.agent,
+            system_prompt: Some(def.system_prompt),
+            initial_prompt: prompt,
+            display_name: display_name.or(def.display_name),
+        })
+    } else if let Some(agent_name) = agent {
+        let system_prompt = system_prompt_file
+            .map(|path| {
+                fs::read_to_string(&path)
+                    .map(|s| s.trim_end_matches('\n').to_string())
+                    .map_err(|err| CliError::error(format!("failed to read {path}: {err}")))
+            })
+            .transpose()?;
+        Ok(AgentPayload {
+            agent_name,
+            system_prompt,
+            initial_prompt: prompt,
+            display_name,
+        })
+    } else {
+        Err(CliError::error("either --agent or --agent-def is required"))
+    }
+}
+
+fn build_spawn_params(
+    workflow_id: String,
+    payload: AgentPayload,
+    parent_session: Option<String>,
+) -> Value {
+    let mut params = json!({
+        "workflow_id": workflow_id,
+        "agent_name": payload.agent_name,
+    });
+    if let Some(sp) = payload.system_prompt {
+        params["system_prompt"] = json!(sp);
+    }
+    if let Some(p) = payload.initial_prompt {
+        params["initial_prompt"] = json!(p);
+    }
+    if let Some(d) = payload.display_name {
+        params["display_name"] = json!(d);
+    }
+    if let Some(ps) = parent_session {
+        params["parent_session_id"] = json!(ps);
+    }
+    params
+}
+
+async fn resolve_thread_arg(
+    ws_url: &str,
+    auth_token: Option<&str>,
+    input: &str,
+) -> Result<String, CliError> {
+    let list = rpc_request(ws_url, auth_token, "thread.list", json!({})).await?;
+    let threads = list
+        .as_array()
+        .ok_or_else(|| CliError::error("thread.list returned non-array"))?;
+
+    if let Some(t) = threads
+        .iter()
+        .find(|t| t.get("id").and_then(Value::as_str) == Some(input))
+    {
+        return t
+            .get("id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| CliError::error("thread missing id"));
+    }
+    if let Some(t) = threads
+        .iter()
+        .find(|t| t.get("name").and_then(Value::as_str) == Some(input))
+    {
+        return t
+            .get("id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| CliError::error("thread missing id"));
+    }
+    Err(CliError::error(format!("no thread found for {input}")))
+}
+
+async fn handle_workflow(
+    command: WorkflowCommand,
+    ws_url: &str,
+    auth_token: Option<&str>,
+) -> Result<(), CliError> {
+    match command {
+        WorkflowCommand::Create {
+            thread_id,
+            prd_issue,
+            implementation_issues,
+            pretty,
+        } => {
+            let resolved_thread_id = match thread_id {
+                Some(ref t) => resolve_thread_arg(ws_url, auth_token, t).await?,
+                None => resolve_current_thread_id(ws_url, auth_token).await?,
+            };
+            let mut params = json!({ "thread_id": resolved_thread_id });
+            if let Some(url) = prd_issue {
+                params["prd_issue_url"] = json!(url);
+            }
+            if !implementation_issues.is_empty() {
+                params["implementation_issue_urls"] = json!(implementation_issues);
+            }
+            let result = rpc_request(ws_url, auth_token, "workflow.create", params).await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::Status {
+            workflow_id,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.status",
+                json!({ "workflow_id": workflow_id }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::List {
+            thread_id,
+            all,
+            pretty,
+        } => {
+            let params = if all {
+                json!({})
+            } else if let Some(t) = thread_id {
+                let resolved = resolve_thread_arg(ws_url, auth_token, &t).await?;
+                json!({ "thread_id": resolved })
+            } else if let Ok(current) = env::var("THREADMILL_THREAD") {
+                let resolved = resolve_thread_arg(ws_url, auth_token, &current).await?;
+                json!({ "thread_id": resolved })
+            } else {
+                json!({})
+            };
+            let result = rpc_request(ws_url, auth_token, "workflow.list", params).await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::Transition {
+            workflow_id,
+            phase,
+            force,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.transition",
+                json!({
+                    "workflow_id": workflow_id,
+                    "phase": phase.as_rpc_value(),
+                    "force": force,
+                }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::SpawnWorker {
+            workflow_id,
+            agent,
+            agent_def,
+            prompt,
+            system_prompt_file,
+            display_name,
+            parent_session,
+            pretty,
+        } => {
+            let payload =
+                resolve_agent_payload(agent, agent_def, prompt, system_prompt_file, display_name)?;
+            let params = build_spawn_params(workflow_id, payload, parent_session);
+            let result = rpc_request(ws_url, auth_token, "workflow.spawn_worker", params).await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::RecordHandoff {
+            workflow_id,
+            worker_id,
+            stop_reason,
+            context,
+            progress,
+            next_steps,
+            blockers,
+            pretty,
+        } => {
+            let context_text = resolve_text_or_file(&context)?;
+            let mut params = json!({
+                "workflow_id": workflow_id,
+                "worker_id": worker_id,
+                "stop_reason": stop_reason.as_rpc_value(),
+                "context": context_text,
+            });
+            if !progress.is_empty() {
+                params["progress"] = json!(progress);
+            }
+            if !next_steps.is_empty() {
+                params["next_steps"] = json!(next_steps);
+            }
+            if let Some(b) = blockers {
+                params["blockers"] = json!(b);
+            }
+            let result = rpc_request(ws_url, auth_token, "workflow.record_handoff", params).await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::StartReview {
+            workflow_id,
+            force,
+            reviewers,
+            pretty,
+        } => {
+            let mut params = json!({
+                "workflow_id": workflow_id,
+                "force": force,
+            });
+            if let Some(raw) = reviewers {
+                let json_text = resolve_text_or_file(&raw)?;
+                let parsed: Value = serde_json::from_str(&json_text)
+                    .map_err(|err| CliError::error(format!("invalid --reviewers JSON: {err}")))?;
+                if !parsed.is_array() {
+                    return Err(CliError::error("--reviewers must be a JSON array"));
+                }
+                params["reviewers"] = parsed;
+            }
+            let result = rpc_request(ws_url, auth_token, "workflow.start_review", params).await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::SpawnReviewer {
+            workflow_id,
+            agent,
+            agent_def,
+            prompt,
+            system_prompt_file,
+            display_name,
+            parent_session,
+            pretty,
+        } => {
+            let payload =
+                resolve_agent_payload(agent, agent_def, prompt, system_prompt_file, display_name)?;
+            let params = build_spawn_params(workflow_id, payload, parent_session);
+            let result = rpc_request(ws_url, auth_token, "workflow.spawn_reviewer", params).await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::ListReviewers {
+            workflow_id,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.list_reviewers",
+                json!({ "workflow_id": workflow_id }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::RecordFindings {
+            workflow_id,
+            findings,
+            pretty,
+        } => {
+            let json_text = resolve_text_or_file(&findings)?;
+            let parsed: Value = serde_json::from_str(&json_text)
+                .map_err(|err| CliError::error(format!("invalid --findings JSON: {err}")))?;
+            if !parsed.is_array() {
+                return Err(CliError::error("--findings must be a JSON array"));
+            }
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.record_findings",
+                json!({
+                    "workflow_id": workflow_id,
+                    "findings": parsed,
+                }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::Complete {
+            workflow_id,
+            force,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.complete",
+                json!({ "workflow_id": workflow_id, "force": force }),
+            )
+            .await?;
+            print_json(&result, pretty)
         }
     }
 }
