@@ -1287,6 +1287,438 @@ impl WorkflowService {
         )
         .await
     }
+
+    pub async fn list_issues(
+        state: Arc<AppState>,
+        params: protocol::WorkflowListIssuesParams,
+    ) -> Result<protocol::WorkflowListIssuesResult, String> {
+        let label = params.label.unwrap_or_else(|| "prd".to_string());
+        // argv is passed via execve so there's no shell-injection path, but a
+        // label beginning with `-` can still be interpreted as a flag by gh/glab
+        // themselves. Reject up-front with a clear error.
+        if label.starts_with('-') || label.is_empty() {
+            return Err(format!(
+                "invalid label `{label}` — must be non-empty and not start with `-`"
+            ));
+        }
+        let limit = params.limit.unwrap_or(50).min(100);
+
+        // Resolve project path.
+        let project_path = {
+            let store = state.store.lock().await;
+            let project = store
+                .project_by_id(&params.project_id)
+                .ok_or_else(|| format!("project not found: {}", params.project_id))?;
+            project.path.clone()
+        };
+
+        // Cache hit? Respect bypass_cache — a UI refresh button should set that
+        // so the user isn't staring at 30s-stale results.
+        let cache_key = format!("{}|{}|{}", params.project_id, label, limit);
+        if !params.bypass_cache {
+            if let Some(cached) = issue_cache_get(&cache_key).await {
+                return Ok(protocol::WorkflowListIssuesResult {
+                    platform: cached.platform,
+                    issues: cached.issues,
+                    cached: true,
+                });
+            }
+        }
+
+        let platform = detect_remote_platform(&project_path).await;
+        let issues = match &platform {
+            protocol::WorkflowIssuePlatform::Github => {
+                list_github_issues(&project_path, &label, limit).await?
+            }
+            protocol::WorkflowIssuePlatform::Gitlab => {
+                list_gitlab_issues(&project_path, &label, limit).await?
+            }
+            protocol::WorkflowIssuePlatform::Unknown => {
+                return Err(format!(
+                    "could not detect github.com or gitlab in {}'s git remote — \
+                     configure an origin or pass issues manually via workflow.create",
+                    project_path
+                ));
+            }
+        };
+
+        issue_cache_put(cache_key, platform.clone(), issues.clone()).await;
+        Ok(protocol::WorkflowListIssuesResult {
+            platform,
+            issues,
+            cached: false,
+        })
+    }
+
+    pub async fn start_from_issue(
+        state: Arc<AppState>,
+        params: protocol::WorkflowStartFromIssueParams,
+    ) -> Result<protocol::WorkflowStartFromIssueResult, String> {
+        // Resolve worktree so we can look up the persona file.
+        let worktree = {
+            let store = state.store.lock().await;
+            store
+                .thread_by_id(&params.thread_id)
+                .ok_or_else(|| format!("thread not found: {}", params.thread_id))?
+                .worktree_path
+                .clone()
+        };
+
+        let persona_name = params.persona.unwrap_or_else(|| "sisyphus".to_string());
+        let persona_path =
+            resolve_persona_path(Path::new(&worktree), &persona_name).ok_or_else(|| {
+                format!(
+                    "persona not found: {persona_name} (looked in .threadmill/agents/ \
+                     and ~/.config/threadmill/agents/)"
+                )
+            })?;
+        let persona = parse_agent_persona_file(&persona_path)?;
+
+        // The orchestrator prompt says "read the issue thoroughly" — a 200-char
+        // preview is not enough. If the caller didn't send a full body, try to
+        // fetch it via gh/glab. Failures fall back gracefully to whatever the
+        // caller did send.
+        let issue_body = match params.issue_body.clone() {
+            Some(body) if body.len() > 300 => Some(body),
+            supplied => match fetch_full_issue_body(&worktree, &params.issue_url).await {
+                Some(full) => Some(full),
+                None => supplied,
+            },
+        };
+
+        let initial_prompt = format!(
+            "Start a Sisyphus workflow for this PRD issue.\n\n\
+             Issue: {}\nTitle: {}\n\n{}\n\n\
+             Read the issue thoroughly, define the goal, then transition to IMPLEMENTING \
+             and spawn Hephaestus workers for each chunk of work.",
+            params.issue_url,
+            params.issue_title,
+            issue_body.as_deref().unwrap_or("(no body provided)"),
+        );
+
+        let chat_result = ChatService::start(
+            Arc::clone(&state),
+            protocol::ChatStartParams {
+                thread_id: params.thread_id.clone(),
+                agent_name: persona.agent.clone(),
+                system_prompt: Some(persona.system_prompt.clone()),
+                initial_prompt: Some(initial_prompt),
+                display_name: persona.display_name.clone(),
+                parent_session_id: None,
+                preferred_model: persona.model.clone(),
+            },
+        )
+        .await?;
+
+        // If workflow.create fails after chat.start succeeded, stop the orphaned
+        // session so the user doesn't end up with an ACP process nobody owns.
+        let workflow = match Self::create(
+            Arc::clone(&state),
+            protocol::WorkflowCreateParams {
+                thread_id: params.thread_id.clone(),
+                prd_issue_url: Some(params.issue_url),
+                implementation_issue_urls: Vec::new(),
+                orchestrator_session_id: Some(chat_result.session_id.clone()),
+            },
+        )
+        .await
+        {
+            Ok(w) => w,
+            Err(err) => {
+                let _ = ChatService::stop(
+                    Arc::clone(&state),
+                    protocol::ChatStopParams {
+                        thread_id: params.thread_id,
+                        session_id: chat_result.session_id,
+                    },
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        Ok(protocol::WorkflowStartFromIssueResult {
+            workflow_id: workflow.workflow_id,
+            orchestrator_session_id: chat_result.session_id,
+        })
+    }
+}
+
+// ---------- Issue listing helpers ----------
+
+async fn detect_remote_platform(project_path: &str) -> protocol::WorkflowIssuePlatform {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return protocol::WorkflowIssuePlatform::Unknown;
+    };
+    if !output.status.success() {
+        return protocol::WorkflowIssuePlatform::Unknown;
+    }
+    let url = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_lowercase();
+    // Tighter matches — bare `contains("gitlab")` false-positives on a URL like
+    // `legitlab.com`. Require a host-boundary token so substrings don't win.
+    if url.contains("github.com") {
+        protocol::WorkflowIssuePlatform::Github
+    } else if url.contains("gitlab.com") || url.contains("//gitlab.") || url.contains("@gitlab.") {
+        protocol::WorkflowIssuePlatform::Gitlab
+    } else {
+        protocol::WorkflowIssuePlatform::Unknown
+    }
+}
+
+/// Best-effort: try `gh issue view <url> --json body` first, then `glab issue view`.
+/// Returns None on any failure (auth, network, CLI missing, …) so the caller can
+/// fall back to whatever body text it already has without failing the workflow.
+async fn fetch_full_issue_body(worktree_path: &str, issue_url: &str) -> Option<String> {
+    let gh = tokio::process::Command::new("gh")
+        .current_dir(worktree_path)
+        .args(["issue", "view", issue_url, "--json", "body"])
+        .output()
+        .await;
+    if let Ok(output) = gh {
+        if output.status.success() {
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(body) = parsed.get("body").and_then(serde_json::Value::as_str) {
+                    if !body.is_empty() {
+                        return Some(body.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let glab = tokio::process::Command::new("glab")
+        .current_dir(worktree_path)
+        .args(["issue", "view", issue_url, "--output", "json"])
+        .output()
+        .await;
+    if let Ok(output) = glab {
+        if output.status.success() {
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(body) = parsed
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if !body.is_empty() {
+                        return Some(body.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn list_github_issues(
+    project_path: &str,
+    label: &str,
+    limit: u32,
+) -> Result<Vec<protocol::WorkflowIssueRef>, String> {
+    let limit_str = limit.to_string();
+    // `gh -R` takes `[HOST/]OWNER/REPO`, not a filesystem path. Invoke `gh` from
+    // inside the project directory instead — it auto-detects the repo from git.
+    let output = tokio::process::Command::new("gh")
+        .current_dir(project_path)
+        .args([
+            "issue",
+            "list",
+            "--label",
+            label,
+            "--state",
+            "open",
+            "--limit",
+            &limit_str,
+            "--json",
+            "number,title,url,createdAt,author,body",
+        ])
+        .output()
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to run `gh issue list`: {err}. \
+                 Is the GitHub CLI installed and authenticated (`gh auth status`)?"
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh issue list failed: {}", stderr.trim()));
+    }
+
+    let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse `gh issue list` output: {err}"))?;
+
+    Ok(raw
+        .into_iter()
+        .map(|row| protocol::WorkflowIssueRef {
+            number: row
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            title: row
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            url: row
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            author: row
+                .get("author")
+                .and_then(|a| a.get("login"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            created_at: row
+                .get("createdAt")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            body_preview: row
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .map(truncate_preview),
+        })
+        .collect())
+}
+
+async fn list_gitlab_issues(
+    project_path: &str,
+    label: &str,
+    limit: u32,
+) -> Result<Vec<protocol::WorkflowIssueRef>, String> {
+    let limit_str = limit.to_string();
+    let output = tokio::process::Command::new("glab")
+        .current_dir(project_path)
+        .args([
+            "issue",
+            "list",
+            "--label",
+            label,
+            "--opened",
+            "--per-page",
+            &limit_str,
+            "--output",
+            "json",
+        ])
+        .output()
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to run `glab issue list`: {err}. \
+                 Is the GitLab CLI installed and authenticated (`glab auth status`)?"
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("glab issue list failed: {}", stderr.trim()));
+    }
+
+    let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse `glab issue list` output: {err}"))?;
+
+    Ok(raw
+        .into_iter()
+        .map(|row| protocol::WorkflowIssueRef {
+            number: row
+                .get("iid")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            title: row
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            url: row
+                .get("web_url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            author: row
+                .get("author")
+                .and_then(|a| a.get("username"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            created_at: row
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            body_preview: row
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(truncate_preview),
+        })
+        .collect())
+}
+
+fn truncate_preview(body: &str) -> String {
+    const LIMIT: usize = 200;
+    if body.len() <= LIMIT {
+        return body.to_string();
+    }
+    let mut end = LIMIT;
+    while !body.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!("{}…", &body[..end])
+}
+
+// ---------- Issue cache (30s TTL, in-memory) ----------
+
+struct CachedIssues {
+    at: std::time::Instant,
+    platform: protocol::WorkflowIssuePlatform,
+    issues: Vec<protocol::WorkflowIssueRef>,
+}
+
+const ISSUE_CACHE_TTL_SECS: u64 = 30;
+
+static ISSUE_CACHE: std::sync::OnceLock<
+    tokio::sync::Mutex<std::collections::HashMap<String, CachedIssues>>,
+> = std::sync::OnceLock::new();
+
+fn issue_cache() -> &'static tokio::sync::Mutex<std::collections::HashMap<String, CachedIssues>> {
+    ISSUE_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+async fn issue_cache_get(key: &str) -> Option<CachedIssues> {
+    let cache = issue_cache().lock().await;
+    cache.get(key).and_then(|entry| {
+        if entry.at.elapsed().as_secs() < ISSUE_CACHE_TTL_SECS {
+            Some(CachedIssues {
+                at: entry.at,
+                platform: entry.platform.clone(),
+                issues: entry.issues.clone(),
+            })
+        } else {
+            None
+        }
+    })
+}
+
+async fn issue_cache_put(
+    key: String,
+    platform: protocol::WorkflowIssuePlatform,
+    issues: Vec<protocol::WorkflowIssueRef>,
+) {
+    let mut cache = issue_cache().lock().await;
+    cache.insert(
+        key,
+        CachedIssues {
+            at: std::time::Instant::now(),
+            platform,
+            issues,
+        },
+    );
 }
 
 async fn handle_server_event(
