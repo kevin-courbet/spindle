@@ -348,6 +348,18 @@ enum WorkflowCommand {
         #[arg(long)]
         pretty: bool,
     },
+    /// Toggle a finding's resolved flag (default: mark resolved)
+    ResolveFinding {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        finding_id: String,
+        /// Pass `--unresolve` to flip an accidentally-resolved finding back
+        #[arg(long)]
+        unresolve: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -556,6 +568,9 @@ struct AgentDef {
     agent: String,
     display_name: Option<String>,
     system_prompt: String,
+    /// Optional ACP model override (e.g. `claude-opus-4-7`). Wired through to
+    /// `ChatStartParams.preferred_model` so the persona pins its LLM.
+    model: Option<String>,
 }
 
 fn parse_agent_def(path: &std::path::Path) -> Result<AgentDef, CliError> {
@@ -577,6 +592,7 @@ fn parse_agent_def(path: &std::path::Path) -> Result<AgentDef, CliError> {
 
     let mut agent = String::new();
     let mut display_name = None;
+    let mut model: Option<String> = None;
 
     for line in frontmatter.lines() {
         let line = line.trim();
@@ -584,6 +600,11 @@ fn parse_agent_def(path: &std::path::Path) -> Result<AgentDef, CliError> {
             agent = value.trim().to_string();
         } else if let Some(value) = line.strip_prefix("display_name:") {
             display_name = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("model:") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                model = Some(trimmed.to_string());
+            }
         }
     }
 
@@ -598,6 +619,7 @@ fn parse_agent_def(path: &std::path::Path) -> Result<AgentDef, CliError> {
         agent,
         display_name,
         system_prompt: body.to_string(),
+        model,
     })
 }
 
@@ -642,11 +664,12 @@ async fn handle_chat(
             let thread_id = resolve_current_thread_id(ws_url, auth_token).await?;
 
             // Resolve agent definition if provided
-            let (agent_name, sys_prompt, disp_name) = if let Some(def_name) = agent_def {
+            let (agent_name, sys_prompt, disp_name, pref_model) = if let Some(def_name) = agent_def
+            {
                 let def_path = resolve_agent_def_path(&def_name)?;
                 let def = parse_agent_def(&def_path)?;
                 let dn = display_name.or(def.display_name);
-                (def.agent, Some(def.system_prompt), dn)
+                (def.agent, Some(def.system_prompt), dn, def.model)
             } else if let Some(agent_name) = agent {
                 let sys = system_prompt_file
                     .map(|path| {
@@ -654,7 +677,7 @@ async fn handle_chat(
                             .map_err(|err| CliError::error(format!("failed to read {path}: {err}")))
                     })
                     .transpose()?;
-                (agent_name, sys, display_name)
+                (agent_name, sys, display_name, None)
             } else {
                 return Err(CliError::error("either --agent or --agent-def is required"));
             };
@@ -674,6 +697,9 @@ async fn handle_chat(
             }
             if let Some(ps) = parent_session {
                 params["parent_session_id"] = json!(ps);
+            }
+            if let Some(model) = pref_model {
+                params["preferred_model"] = json!(model);
             }
 
             let result = rpc_request(ws_url, auth_token, "chat.start", params).await?;
@@ -997,6 +1023,7 @@ struct AgentPayload {
     system_prompt: Option<String>,
     initial_prompt: Option<String>,
     display_name: Option<String>,
+    preferred_model: Option<String>,
 }
 
 /// Resolve an optional agent / agent_def pair into the worker spawn payload fields.
@@ -1021,6 +1048,7 @@ fn resolve_agent_payload(
             system_prompt: Some(def.system_prompt),
             initial_prompt: prompt,
             display_name: display_name.or(def.display_name),
+            preferred_model: def.model,
         })
     } else if let Some(agent_name) = agent {
         let system_prompt = system_prompt_file
@@ -1035,6 +1063,7 @@ fn resolve_agent_payload(
             system_prompt,
             initial_prompt: prompt,
             display_name,
+            preferred_model: None,
         })
     } else {
         Err(CliError::error("either --agent or --agent-def is required"))
@@ -1061,6 +1090,9 @@ fn build_spawn_params(
     }
     if let Some(ps) = parent_session {
         params["parent_session_id"] = json!(ps);
+    }
+    if let Some(model) = payload.preferred_model {
+        params["preferred_model"] = json!(model);
     }
     params
 }
@@ -1304,6 +1336,25 @@ async fn handle_workflow(
                 auth_token,
                 "workflow.complete",
                 json!({ "workflow_id": workflow_id, "force": force }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::ResolveFinding {
+            workflow_id,
+            finding_id,
+            unresolve,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.resolve_finding",
+                json!({
+                    "workflow_id": workflow_id,
+                    "finding_id": finding_id,
+                    "resolved": !unresolve,
+                }),
             )
             .await?;
             print_json(&result, pretty)

@@ -328,6 +328,19 @@ pub struct WorkflowFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
     pub created_at: String,
+    /// Resolution flag toggled by `workflow.resolve_finding`. UI uses this to
+    /// drive the "all findings resolved → back to TESTING" transition.
+    #[serde(default)]
+    pub resolved: bool,
+    /// Review round in which this finding was surfaced — 1 for the initial
+    /// review, 2 for post-fix re-review, etc. Populated from the workflow's
+    /// `current_review_round` at the time `workflow.record_findings` ran.
+    #[serde(default = "default_review_round")]
+    pub review_round: u32,
+}
+
+fn default_review_round() -> u32 {
+    1
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -356,6 +369,10 @@ pub struct WorkflowState {
     pub findings: Vec<WorkflowFinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_started_at: Option<String>,
+    /// Monotonic counter incremented on each `workflow.start_review`. Used to
+    /// distinguish initial-round findings from post-fix re-review findings.
+    #[serde(default)]
+    pub current_review_round: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -413,6 +430,21 @@ pub struct WorkflowFindingsRecordedEvent {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorkflowCompletedEvent {
     pub workflow: WorkflowState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowReviewCompletedEvent {
+    pub workflow_id: String,
+    pub thread_id: String,
+    /// Review round that just finished (1-indexed).
+    pub review_round: u32,
+    /// How many reviewers participated in this round (all terminal by emit time).
+    /// Reviewer sessions always route through `set_session_failed` on session end —
+    /// whether the agent errored or finished cleanly — so a separate
+    /// "completed vs failed" split would be structurally meaningless at this layer.
+    /// Callers that want to distinguish can inspect individual
+    /// `WorkflowReviewer.failure_message` fields.
+    pub reviewer_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -846,6 +878,10 @@ pub struct ChatStartParams {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Explicit ACP model ID override (e.g. `claude-opus-4-7`). Takes precedence over
+    /// the project's `default_chat_model`. Sourced from agent-def `model:` frontmatter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -928,6 +964,8 @@ pub struct WorkflowSpawnWorkerParams {
     pub initial_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -955,6 +993,8 @@ pub struct WorkflowReviewerSpec {
     pub initial_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -978,6 +1018,8 @@ pub struct WorkflowSpawnReviewerParams {
     pub initial_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1010,6 +1052,22 @@ pub struct WorkflowCompleteParams {
     pub workflow_id: String,
     #[serde(default)]
     pub force: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowResolveFindingParams {
+    pub workflow_id: String,
+    pub finding_id: String,
+    /// Target resolution state. Default is `true` (mark resolved); pass `false` to
+    /// unresolve.
+    #[serde(default = "default_true")]
+    pub resolved: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowResolveFindingResult {
+    pub workflow_id: String,
+    pub finding: WorkflowFinding,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1555,6 +1613,7 @@ pub const METHOD_WORKFLOW_SPAWN_REVIEWER: &str = "workflow.spawn_reviewer";
 pub const METHOD_WORKFLOW_LIST_REVIEWERS: &str = "workflow.list_reviewers";
 pub const METHOD_WORKFLOW_RECORD_FINDINGS: &str = "workflow.record_findings";
 pub const METHOD_WORKFLOW_COMPLETE: &str = "workflow.complete";
+pub const METHOD_WORKFLOW_RESOLVE_FINDING: &str = "workflow.resolve_finding";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -1717,6 +1776,8 @@ pub enum RequestDispatch {
     WorkflowRecordFindings(WorkflowRecordFindingsParams),
     #[serde(rename = "workflow.complete")]
     WorkflowComplete(WorkflowCompleteParams),
+    #[serde(rename = "workflow.resolve_finding")]
+    WorkflowResolveFinding(WorkflowResolveFindingParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
     #[serde(rename = "agent.registry.list")]
@@ -1924,6 +1985,11 @@ pub fn parse_request_dispatch(
         METHOD_WORKFLOW_COMPLETE => serde_json::from_value::<WorkflowCompleteParams>(params)
             .map(RequestDispatch::WorkflowComplete)
             .map_err(|err| format!("invalid workflow.complete params: {err}")),
+        METHOD_WORKFLOW_RESOLVE_FINDING => {
+            serde_json::from_value::<WorkflowResolveFindingParams>(params)
+                .map(RequestDispatch::WorkflowResolveFinding)
+                .map_err(|err| format!("invalid workflow.resolve_finding params: {err}"))
+        }
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),
@@ -1948,6 +2014,7 @@ mod tests {
         WorkflowState {
             workflow_id: "workflow-1".into(),
             thread_id: "thread-1".into(),
+            current_review_round: 0,
             phase: WorkflowPhase::Reviewing,
             created_at: "2026-04-12T00:00:00Z".into(),
             updated_at: "2026-04-12T00:00:00Z".into(),
