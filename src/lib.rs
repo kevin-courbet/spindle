@@ -115,30 +115,6 @@ impl AppState {
         self.emit_event("thread.progress", event);
     }
 
-    pub fn emit_thread_status_changed(&self, event: protocol::ThreadStatusChanged) {
-        self.emit_event("thread.status_changed", event);
-    }
-
-    pub fn emit_project_added(&self, event: protocol::ProjectAddedEvent) {
-        self.emit_event("project.added", event);
-    }
-
-    pub fn emit_project_removed(&self, event: protocol::ProjectRemovedEvent) {
-        self.emit_event("project.removed", event);
-    }
-
-    pub fn emit_thread_created(&self, event: protocol::ThreadCreatedEvent) {
-        self.emit_event("thread.created", event);
-    }
-
-    pub fn emit_thread_removed(&self, event: protocol::ThreadRemovedEvent) {
-        self.emit_event("thread.removed", event);
-    }
-
-    pub fn emit_preset_process_event(&self, event: protocol::PresetProcessEvent) {
-        self.emit_event("preset.process_event", event);
-    }
-
     pub fn emit_preset_output(&self, event: protocol::PresetOutputEvent) {
         self.emit_event("preset.output", event);
     }

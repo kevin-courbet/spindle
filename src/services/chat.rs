@@ -3,7 +3,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use chrono::Utc;
@@ -398,6 +401,84 @@ impl ChatService {
             .get(&params.session_id)
             .ok_or_else(|| format!("session not found: {}", params.session_id))?;
         Ok(runtime.summary.clone())
+    }
+
+    /// Inject a `<system-context>` ACP prompt into a live session.
+    ///
+    /// The injected prompt is tracked in `pending_prompt_ids` so the session's status
+    /// machine flips Busy → Idle when the agent responds, matching the behaviour of
+    /// user-originated prompts. The injection is NOT tagged via `injection_prompt_id`
+    /// (that singleton is reserved for the handshake-time injection that fires
+    /// `chat.injection_complete`); mid-session injections complete silently.
+    ///
+    /// If the agent is mid-turn, ACP queues the prompt for delivery after the current
+    /// turn. The underlying mpsc + single stdin writer task guarantees frame-level
+    /// atomicity — no concurrent-write mutex is required.
+    ///
+    /// Returns an error if the session is unknown, has no active ACP channel yet
+    /// (pre-handshake), or the stdin channel is closed.
+    pub async fn inject_system_context(
+        state: Arc<AppState>,
+        session_id: &str,
+        context: &str,
+    ) -> Result<(), String> {
+        if context.trim().is_empty() {
+            return Err("inject_system_context: context must not be empty".to_string());
+        }
+
+        let (input_tx, acp_session_id) = {
+            let chat = state.chat.lock().await;
+            let session = chat
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| format!("session not found: {session_id}"))?;
+            let input_tx = session
+                .input_tx
+                .clone()
+                .ok_or_else(|| format!("session {session_id} has no active stdin channel"))?;
+            let acp_session_id = session
+                .acp_session_id
+                .clone()
+                .ok_or_else(|| format!("session {session_id} has not completed ACP handshake"))?;
+            (input_tx, acp_session_id)
+        };
+
+        let wrapped = format!("<system-context>\n{}\n</system-context>", context.trim());
+        let request_id = injection_request_id();
+        let request_id_str = request_id.to_string();
+
+        send_acp_request(
+            &input_tx,
+            request_id,
+            "session/prompt",
+            json!({
+                "sessionId": acp_session_id,
+                "prompt": [{"type": "text", "text": wrapped}],
+            }),
+        )
+        .await?;
+
+        // Register in the session's pending-prompt set so the Busy/Idle status machine
+        // accounts for this in-flight ACP turn. Cleared by `apply_outbound_status_updates`
+        // when the response arrives.
+        let transitions = {
+            let mut chat = state.chat.lock().await;
+            let mut transitions = Vec::new();
+            if let Some(session) = chat.sessions.get_mut(session_id) {
+                session.pending_prompt_ids.insert(request_id_str);
+                apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
+            }
+            transitions
+        };
+        emit_status_transitions(&state, transitions).await;
+
+        tracing::info!(
+            session_id = %session_id,
+            request_id,
+            len = wrapped.len(),
+            "injected system context"
+        );
+        Ok(())
     }
 
     pub async fn recover_persisted_sessions(state: Arc<AppState>) -> Result<(), String> {
@@ -1149,6 +1230,15 @@ async fn perform_handshake(
         model_id,
         replay_notifications: collected,
     })
+}
+
+/// Monotonic ID generator for Spindle-originated ACP requests (injections, etc.).
+///
+/// Starts at 1_000_000_000 to stay far above IDs the Mac uses for user-originated
+/// prompts, avoiding collisions in `pending_prompt_ids` tracking.
+fn injection_request_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1_000_000_000);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 async fn send_acp_request(

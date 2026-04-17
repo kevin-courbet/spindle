@@ -283,13 +283,6 @@ fn emit_preset_event(
     exit_code: Option<i64>,
     crash_context: Option<protocol::PresetCrashContext>,
 ) {
-    state.emit_preset_process_event(protocol::PresetProcessEvent {
-        thread_id: thread_id.to_string(),
-        preset: preset.to_string(),
-        event: event.clone(),
-        exit_code,
-        crash_context: crash_context.clone(),
-    });
     state.emit_state_delta(vec![
         protocol::StateDeltaOperationPayload::PresetProcessEvent {
             thread_id: thread_id.to_string(),
