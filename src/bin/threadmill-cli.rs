@@ -98,7 +98,7 @@ enum ChatCommand {
         /// Agent binary name (e.g. "claude", "gemini", "opencode")
         #[arg(long)]
         agent: Option<String>,
-        /// Agent definition name (reads from .threadmill/agents/<name>.md)
+        /// Agent definition name (reads from `.threadmill/agents/<name>.md`)
         #[arg(long)]
         agent_def: Option<String>,
         /// Initial prompt to send after handshake
@@ -259,7 +259,7 @@ enum WorkflowCommand {
         /// Agent binary name (e.g. "claude", "gemini", "opencode")
         #[arg(long)]
         agent: Option<String>,
-        /// Agent definition name (reads from .threadmill/agents/<name>.md)
+        /// Agent definition name (reads from `.threadmill/agents/<name>.md`)
         #[arg(long)]
         agent_def: Option<String>,
         #[arg(long)]
@@ -1895,7 +1895,7 @@ async fn run_mcp_server(ws_url: &str, auth_token: Option<String>) -> Result<(), 
             Ok(v) => v,
             Err(err) => {
                 // Per JSON-RPC 2.0 the server MUST respond with a parse error
-                // when a request is unparseable. Silent drop would hang a client
+                // when a request is unparsable. Silent drop would hang a client
                 // that's waiting on a specific id.
                 eprintln!("mcp: parse error on stdin: {err} (raw: {line})");
                 let resp = err_response(&Some(Value::Null), -32700, "parse error");
