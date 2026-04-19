@@ -2237,7 +2237,7 @@ fn enriched_to_wire(issue: crate::services::issues::EnrichedIssue) -> protocol::
 /// implementation list contains `url`. Used to attribute ambient issue events
 /// (close, comment) to a workflow when the caller didn't supply one explicitly.
 /// Returns `None` if zero or more than one active workflow matches — better to
-/// not attribute than mis-attribute a comment to the wrong workflow.
+/// not attribute than misattribute a comment to the wrong workflow.
 async fn find_workflow_id_for_issue_url(state: &AppState, url: &str) -> Option<String> {
     let store = state.workflows.lock().await;
     workflow_id_for_issue_url_locked(&store, url)
@@ -2280,7 +2280,7 @@ fn workflow_id_for_issue_url_locked(store: &WorkflowStore, url: &str) -> Option<
         _ => {
             warn!(
                 "find_workflow_id_for_issue_url: ambiguous match for {url} across active \
-                 workflows {matches:?} — returning None to avoid mis-attribution"
+                 workflows {matches:?} — returning None to avoid misattribution"
             );
             None
         }
