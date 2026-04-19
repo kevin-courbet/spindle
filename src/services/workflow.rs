@@ -2146,28 +2146,58 @@ fn enriched_to_wire(issue: crate::services::issues::EnrichedIssue) -> protocol::
     }
 }
 
-/// Scan active workflows for the first one whose PRD or implementation list
-/// contains `url`. Used to attribute ambient issue events (close, comment) to
-/// a workflow when the caller didn't supply one explicitly.
+/// Scan active (not Complete / not Failed) workflows for the one whose PRD or
+/// implementation list contains `url`. Used to attribute ambient issue events
+/// (close, comment) to a workflow when the caller didn't supply one explicitly.
+/// Returns `None` if zero or more than one active workflow matches — better to
+/// not attribute than mis-attribute a comment to the wrong workflow.
 async fn find_workflow_id_for_issue_url(state: &AppState, url: &str) -> Option<String> {
     let store = state.workflows.lock().await;
     workflow_id_for_issue_url_locked(&store, url)
 }
 
+/// Trim trailing slash + surrounding whitespace before URL comparison. Host
+/// case-folding is intentionally not applied — github.com/gitlab paths are
+/// case-sensitive for org/repo segments.
+fn normalize_url(s: &str) -> &str {
+    s.trim().trim_end_matches('/')
+}
+
 fn workflow_id_for_issue_url_locked(store: &WorkflowStore, url: &str) -> Option<String> {
-    store
+    let needle = normalize_url(url);
+    let matches: Vec<&str> = store
         .data
         .workflows
         .iter()
-        .find(|workflow| {
-            workflow.state.prd_issue_url.as_deref() == Some(url)
-                || workflow
-                    .state
-                    .implementation_issue_urls
-                    .iter()
-                    .any(|candidate| candidate == url)
+        .filter(|workflow| workflow_is_active_phase(&workflow.state.phase))
+        .filter(|workflow| {
+            let prd_match = workflow
+                .state
+                .prd_issue_url
+                .as_deref()
+                .map(|candidate| normalize_url(candidate) == needle)
+                .unwrap_or(false);
+            let impl_match = workflow
+                .state
+                .implementation_issue_urls
+                .iter()
+                .any(|candidate| normalize_url(candidate) == needle);
+            prd_match || impl_match
         })
-        .map(|workflow| workflow.state.workflow_id.clone())
+        .map(|workflow| workflow.state.workflow_id.as_str())
+        .collect();
+
+    match matches.len() {
+        0 => None,
+        1 => Some(matches[0].to_string()),
+        _ => {
+            warn!(
+                "find_workflow_id_for_issue_url: ambiguous match for {url} across active \
+                 workflows {matches:?} — returning None to avoid mis-attribution"
+            );
+            None
+        }
+    }
 }
 
 async fn emit_workflow_state_delta(state: &AppState, workflow_id: &str) {
