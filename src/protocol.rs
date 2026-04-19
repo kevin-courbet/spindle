@@ -1072,9 +1072,10 @@ pub struct IssueListParams {
     /// Optional label filter. `None` means no label filter (all issues).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Desired state filter. Defaults to `Open`. State filtering for `scope=All`
-    /// / `scope=Prds` is currently a no-op — transports list open issues only —
-    /// and is honored only when `scope=LinkedTo` (post-filtered via `resolve`).
+    /// Desired state filter. Defaults to `Open`. `Closed` / `All` are only
+    /// honored when `scope=LinkedTo` (post-filtered via `resolve`); requesting
+    /// `Closed` or `All` together with `scope=All` / `scope=Prds` returns an
+    /// explicit error rather than silently surfacing open-only results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<IssueListState>,
     /// Scope the listing: all repo issues, PRDs only, or the issues linked to a

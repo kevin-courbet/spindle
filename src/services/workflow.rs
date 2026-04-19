@@ -2963,4 +2963,182 @@ mod tests {
         assert!(result.contains("(no body)"));
         assert!(result.ends_with("Prompt"));
     }
+
+    #[test]
+    fn prepend_issue_context_truncates_long_body() {
+        let body = "x".repeat(ISSUE_BODY_INJECT_CAP + 500);
+        let issue = make_issue("Big", Some(&body));
+        let result = prepend_issue_context(Some("Go.".into()), "url-big", &issue).unwrap();
+        assert!(
+            result.contains("[truncated, 500 chars elided]"),
+            "expected truncation marker, got: {result}"
+        );
+        // First N chars of body must still be present.
+        let prefix = "x".repeat(64);
+        assert!(result.contains(&prefix), "body prefix missing");
+        // Output must remain valid UTF-8 (trivially true for &str, but assert
+        // by round-tripping through bytes → str).
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(result.ends_with("Go."));
+    }
+
+    #[test]
+    fn cap_issue_body_no_op_at_cap() {
+        let body = "y".repeat(ISSUE_BODY_INJECT_CAP);
+        let out = cap_issue_body(&body, ISSUE_BODY_INJECT_CAP);
+        assert_eq!(out.chars().count(), ISSUE_BODY_INJECT_CAP);
+        assert!(!out.contains("[truncated"));
+    }
+
+    #[test]
+    fn cap_issue_body_handles_multibyte_at_boundary() {
+        // 3-byte char repeated; pushing past the cap forces a split that
+        // would be invalid UTF-8 if we used byte-based slicing.
+        let body = "🚀".repeat(50); // 50 chars / 200 bytes
+        let out = cap_issue_body(&body, 10);
+        // First 10 chars of output (before the marker) should be 10 rockets.
+        let head: String = out.chars().take(10).collect();
+        assert_eq!(head, "🚀".repeat(10));
+        assert!(out.contains("[truncated, 40 chars elided]"));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    fn make_persisted_workflow_for_url(
+        workflow_id: &str,
+        phase: protocol::WorkflowPhase,
+        prd_url: Option<&str>,
+        impl_urls: &[&str],
+    ) -> PersistedWorkflow {
+        PersistedWorkflow {
+            state: protocol::WorkflowState {
+                workflow_id: workflow_id.to_string(),
+                thread_id: "thread-x".to_string(),
+                phase,
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                completed_at: None,
+                prd_issue_url: prd_url.map(str::to_string),
+                implementation_issue_urls: impl_urls.iter().map(|s| s.to_string()).collect(),
+                orchestrator_session_id: None,
+                workers: Vec::new(),
+                reviewers: Vec::new(),
+                findings: Vec::new(),
+                review_started_at: None,
+                current_review_round: 0,
+            },
+            next_worker_index: 1,
+            next_reviewer_index: 1,
+            next_finding_index: 1,
+            expected_reviewer_count: 0,
+        }
+    }
+
+    fn make_workflow_store(workflows: Vec<PersistedWorkflow>) -> WorkflowStore {
+        let dir = std::env::temp_dir().join(format!(
+            "threadmill-workflow-attribution-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        WorkflowStore {
+            path: dir.join("workflows.json"),
+            data: WorkflowStoreData { workflows },
+        }
+    }
+
+    #[test]
+    fn find_workflow_id_for_issue_url_skips_completed_workflows() {
+        let url = "https://github.com/o/r/issues/1";
+        let store = make_workflow_store(vec![
+            make_persisted_workflow_for_url(
+                "wf-old",
+                protocol::WorkflowPhase::Complete,
+                Some(url),
+                &[],
+            ),
+            make_persisted_workflow_for_url(
+                "wf-active",
+                protocol::WorkflowPhase::Implementing,
+                Some(url),
+                &[],
+            ),
+        ]);
+        let result = workflow_id_for_issue_url_locked(&store, url);
+        assert_eq!(result.as_deref(), Some("wf-active"));
+    }
+
+    #[test]
+    fn find_workflow_id_for_issue_url_returns_none_when_ambiguous() {
+        let url = "https://github.com/o/r/issues/2";
+        let store = make_workflow_store(vec![
+            make_persisted_workflow_for_url(
+                "wf-a",
+                protocol::WorkflowPhase::Implementing,
+                Some(url),
+                &[],
+            ),
+            make_persisted_workflow_for_url(
+                "wf-b",
+                protocol::WorkflowPhase::Testing,
+                None,
+                &[url],
+            ),
+        ]);
+        let result = workflow_id_for_issue_url_locked(&store, url);
+        assert!(result.is_none(), "ambiguous match must not attribute");
+    }
+
+    #[test]
+    fn find_workflow_id_for_issue_url_normalizes_trailing_slash() {
+        let stored = "https://github.com/o/r/issues/3/";
+        let queried = "https://github.com/o/r/issues/3";
+        let store = make_workflow_store(vec![make_persisted_workflow_for_url(
+            "wf-norm",
+            protocol::WorkflowPhase::Implementing,
+            Some(stored),
+            &[],
+        )]);
+        let result = workflow_id_for_issue_url_locked(&store, queried);
+        assert_eq!(result.as_deref(), Some("wf-norm"));
+    }
+
+    #[tokio::test]
+    async fn issue_list_rejects_closed_state_with_scope_all() {
+        let state = make_test_state();
+        let err = WorkflowService::issue_list(
+            Arc::clone(&state),
+            protocol::IssueListParams {
+                project_id: "no-such-project".to_string(),
+                state: Some(protocol::IssueListState::Closed),
+                scope: Some(protocol::IssueListScope::All),
+                limit: None,
+                bypass_cache: false,
+                label: None,
+            },
+        )
+        .await
+        .expect_err("should reject closed+all");
+        assert!(
+            err.contains("not supported"),
+            "error should explain unsupported combo, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_list_rejects_all_state_with_scope_prds() {
+        let state = make_test_state();
+        let err = WorkflowService::issue_list(
+            Arc::clone(&state),
+            protocol::IssueListParams {
+                project_id: "no-such-project".to_string(),
+                state: Some(protocol::IssueListState::All),
+                scope: Some(protocol::IssueListScope::Prds),
+                limit: None,
+                bypass_cache: false,
+                label: None,
+            },
+        )
+        .await
+        .expect_err("should reject all+prds");
+        assert!(err.contains("not supported"), "got: {err}");
+    }
 }
