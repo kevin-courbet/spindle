@@ -794,7 +794,9 @@ async fn workflow_review_records_findings_and_reconciles_after_restart() {
 #[tokio::test]
 async fn workflow_add_linked_issue_appends_url_and_emits_delta() {
     if !common::tmux_available().await {
-        eprintln!("skipping workflow_add_linked_issue_appends_url_and_emits_delta: tmux unavailable");
+        eprintln!(
+            "skipping workflow_add_linked_issue_appends_url_and_emits_delta: tmux unavailable"
+        );
         return;
     }
 

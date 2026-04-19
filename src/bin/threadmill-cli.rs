@@ -607,9 +607,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Workflow { command } => {
             handle_workflow(command, &ws_url, auth_token.as_deref()).await
         }
-        Command::Issue { command } => {
-            handle_issue(command, &ws_url, auth_token.as_deref()).await
-        }
+        Command::Issue { command } => handle_issue(command, &ws_url, auth_token.as_deref()).await,
         Command::Status { pretty } => {
             let ping = rpc_request(&ws_url, auth_token.as_deref(), "ping", json!({})).await?;
             let output = json!({

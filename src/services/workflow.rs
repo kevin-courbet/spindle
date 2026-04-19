@@ -756,14 +756,11 @@ impl WorkflowService {
                 };
                 match worktree {
                     Some(worktree) => {
-                        let transport =
-                            crate::services::issues::for_project(&worktree, None).await;
+                        let transport = crate::services::issues::for_project(&worktree, None).await;
                         match transport.resolve(url).await {
-                            Ok(Some(issue)) => prepend_issue_context(
-                                params.initial_prompt.clone(),
-                                url,
-                                &issue,
-                            ),
+                            Ok(Some(issue)) => {
+                                prepend_issue_context(params.initial_prompt.clone(), url, &issue)
+                            }
                             Ok(None) => {
                                 warn!("spawn_worker: issue not found for injection: {url}");
                                 params.initial_prompt.clone()
@@ -1422,9 +1419,7 @@ impl WorkflowService {
                 // but a label beginning with `-` can still be interpreted as a
                 // flag by gh/glab. Reject up-front with a clear error.
                 if label.starts_with('-') {
-                    return Err(format!(
-                        "invalid label `{label}` — must not start with `-`"
-                    ));
+                    return Err(format!("invalid label `{label}` — must not start with `-`"));
                 }
 
                 let cache_key = format!("{}|{}|{}", params.project_id, label, limit);
@@ -1685,7 +1680,8 @@ impl WorkflowService {
             }
         }
 
-        let mut resolved = std::collections::HashMap::<String, Option<protocol::EnrichedIssueWire>>::new();
+        let mut resolved =
+            std::collections::HashMap::<String, Option<protocol::EnrichedIssueWire>>::new();
         for url in &unique_urls {
             let wire = transport
                 .resolve(url)
