@@ -1330,19 +1330,18 @@ impl WorkflowService {
         .await
     }
 
-    pub async fn list_issues(
+    /// `issue.list` — unified issue listing across scopes (All / Prds / LinkedTo)
+    /// and an optional label filter. For `scope=All` / `scope=Prds`, cached for
+    /// 30s keyed on `project_id|label|limit`; `scope=LinkedTo` is never cached
+    /// because the linked-URL set can change at any time. The `state` filter is
+    /// only honored for `scope=LinkedTo` today (transport `list` returns open
+    /// issues only; post-filtering unscoped lists would require a resolve per
+    /// row which is too expensive).
+    pub async fn issue_list(
         state: Arc<AppState>,
-        params: protocol::WorkflowListIssuesParams,
-    ) -> Result<protocol::WorkflowListIssuesResult, String> {
-        let label = params.label.unwrap_or_else(|| "prd".to_string());
-        // argv is passed via execve so there's no shell-injection path, but a
-        // label beginning with `-` can still be interpreted as a flag by gh/glab
-        // themselves. Reject up-front with a clear error.
-        if label.starts_with('-') || label.is_empty() {
-            return Err(format!(
-                "invalid label `{label}` — must be non-empty and not start with `-`"
-            ));
-        }
+        params: protocol::IssueListParams,
+    ) -> Result<protocol::IssueListResult, String> {
+        let scope = params.scope.unwrap_or_default();
         let limit = params.limit.unwrap_or(50).min(100);
 
         // Resolve project path.
@@ -1354,27 +1353,360 @@ impl WorkflowService {
             project.path.clone()
         };
 
-        // Cache hit? Respect bypass_cache — a UI refresh button should set that
-        // so the user isn't staring at 30s-stale results.
-        let cache_key = format!("{}|{}|{}", params.project_id, label, limit);
-        if !params.bypass_cache {
-            if let Some(cached) = issue_cache_get(&cache_key).await {
-                return Ok(protocol::WorkflowListIssuesResult {
-                    platform: cached.platform,
-                    issues: cached.issues,
-                    cached: true,
-                });
+        match scope {
+            protocol::IssueListScope::LinkedTo { workflow_id } => {
+                let (prd_url, impl_urls) = {
+                    let store = state.workflows.lock().await;
+                    let workflow = find_workflow_locked(&store, &workflow_id)
+                        .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
+                    (
+                        workflow.prd_issue_url.clone(),
+                        workflow.implementation_issue_urls.clone(),
+                    )
+                };
+
+                let mut seen = std::collections::HashSet::<String>::new();
+                let mut ordered: Vec<String> = Vec::new();
+                if let Some(url) = prd_url {
+                    if seen.insert(url.clone()) {
+                        ordered.push(url);
+                    }
+                }
+                for url in impl_urls {
+                    if seen.insert(url.clone()) {
+                        ordered.push(url);
+                    }
+                }
+
+                let transport = crate::services::issues::for_project(&project_path, None).await;
+                let platform = transport.kind();
+                let state_filter = params.state.unwrap_or_default();
+                let mut issues = Vec::new();
+                for url in ordered {
+                    match transport.resolve(&url).await {
+                        Ok(Some(enriched)) => {
+                            let keep = match state_filter {
+                                protocol::IssueListState::All => true,
+                                protocol::IssueListState::Open => {
+                                    enriched.state == protocol::IssueState::Open
+                                }
+                                protocol::IssueListState::Closed => {
+                                    enriched.state == protocol::IssueState::Closed
+                                }
+                            };
+                            if keep {
+                                issues.push(enriched.r#ref);
+                            }
+                        }
+                        Ok(None) | Err(_) => {
+                            // Transport failed or issue vanished. Skip — linked-to
+                            // lists favor showing what we have over failing wholesale.
+                        }
+                    }
+                    if issues.len() as u32 >= limit {
+                        break;
+                    }
+                }
+                Ok(protocol::IssueListResult {
+                    platform,
+                    issues,
+                    cached: false,
+                })
+            }
+            protocol::IssueListScope::All | protocol::IssueListScope::Prds => {
+                let label = match scope {
+                    protocol::IssueListScope::Prds => "prd".to_string(),
+                    _ => params.label.unwrap_or_default(),
+                };
+                // argv is passed via execve so there's no shell-injection path,
+                // but a label beginning with `-` can still be interpreted as a
+                // flag by gh/glab. Reject up-front with a clear error.
+                if label.starts_with('-') {
+                    return Err(format!(
+                        "invalid label `{label}` — must not start with `-`"
+                    ));
+                }
+
+                let cache_key = format!("{}|{}|{}", params.project_id, label, limit);
+                if !params.bypass_cache {
+                    if let Some(cached) = issue_cache_get(&cache_key).await {
+                        return Ok(protocol::IssueListResult {
+                            platform: cached.platform,
+                            issues: cached.issues,
+                            cached: true,
+                        });
+                    }
+                }
+
+                let transport = crate::services::issues::for_project(&project_path, None).await;
+                let platform = transport.kind();
+                let issues = transport.list(&label, limit).await?;
+                issue_cache_put(cache_key, platform.clone(), issues.clone()).await;
+                Ok(protocol::IssueListResult {
+                    platform,
+                    issues,
+                    cached: false,
+                })
+            }
+        }
+    }
+
+    /// `issue.resolve` — fetch the live enriched view of a single issue. Returns
+    /// `None` when the transport can't locate it (404, invalid URL, …).
+    pub async fn issue_resolve(
+        state: Arc<AppState>,
+        params: protocol::IssueResolveParams,
+    ) -> Result<protocol::IssueResolveResult, String> {
+        let project_path = {
+            let store = state.store.lock().await;
+            let project = store
+                .project_by_id(&params.project_id)
+                .ok_or_else(|| format!("project not found: {}", params.project_id))?;
+            project.path.clone()
+        };
+        let transport = crate::services::issues::for_project(&project_path, None).await;
+        let enriched = transport.resolve(&params.url).await?;
+        Ok(protocol::IssueResolveResult {
+            issue: enriched.map(enriched_to_wire),
+        })
+    }
+
+    /// `issue.close` — close an issue via the transport. Emits a
+    /// `workflow.issue_closed` direct event on success; attributes the action to
+    /// any active workflow whose PRD or implementation list contains the URL.
+    pub async fn issue_close(
+        state: Arc<AppState>,
+        params: protocol::IssueCloseParams,
+    ) -> Result<protocol::IssueCloseResult, String> {
+        let project_path = {
+            let store = state.store.lock().await;
+            let project = store
+                .project_by_id(&params.project_id)
+                .ok_or_else(|| format!("project not found: {}", params.project_id))?;
+            project.path.clone()
+        };
+        let transport = crate::services::issues::for_project(&project_path, None).await;
+        transport
+            .close(&params.url, params.reason.as_deref())
+            .await?;
+
+        let workflow_id = find_workflow_id_for_issue_url(&state, &params.url).await;
+        state.emit_event(
+            "workflow.issue_closed",
+            protocol::WorkflowIssueClosedEvent {
+                project_id: params.project_id.clone(),
+                url: params.url.clone(),
+                reason: params.reason.clone(),
+                by_worker_id: params.by_worker_id.clone(),
+                workflow_id,
+            },
+        );
+        Ok(protocol::IssueCloseResult { success: true })
+    }
+
+    /// `issue.comment` — post a comment on an issue. Emits a
+    /// `workflow.issue_commented` direct event on success. The event payload
+    /// intentionally omits `body` to keep the broadcast small — consumers who
+    /// need the comment text should resolve the issue.
+    pub async fn issue_comment(
+        state: Arc<AppState>,
+        params: protocol::IssueCommentParams,
+    ) -> Result<protocol::IssueCommentResult, String> {
+        let project_path = {
+            let store = state.store.lock().await;
+            let project = store
+                .project_by_id(&params.project_id)
+                .ok_or_else(|| format!("project not found: {}", params.project_id))?;
+            project.path.clone()
+        };
+        let transport = crate::services::issues::for_project(&project_path, None).await;
+        transport.comment(&params.url, &params.body).await?;
+
+        let workflow_id = find_workflow_id_for_issue_url(&state, &params.url).await;
+        state.emit_event(
+            "workflow.issue_commented",
+            protocol::WorkflowIssueCommentedEvent {
+                project_id: params.project_id.clone(),
+                url: params.url.clone(),
+                by_worker_id: params.by_worker_id.clone(),
+                workflow_id,
+            },
+        );
+        Ok(protocol::IssueCommentResult { success: true })
+    }
+
+    /// `issue.create` — create a new issue via the transport. If
+    /// `link_to_workflow_id` is set and the workflow exists, the new URL is
+    /// appended to its `implementation_issue_urls` (with persistence + a
+    /// `WorkflowUpsert` state delta). Also emits a `workflow.issue_created`
+    /// direct event with the new ref.
+    pub async fn issue_create(
+        state: Arc<AppState>,
+        params: protocol::IssueCreateParams,
+    ) -> Result<protocol::IssueCreateResult, String> {
+        let project_path = {
+            let store = state.store.lock().await;
+            let project = store
+                .project_by_id(&params.project_id)
+                .ok_or_else(|| format!("project not found: {}", params.project_id))?;
+            project.path.clone()
+        };
+        let transport = crate::services::issues::for_project(&project_path, None).await;
+        let draft = crate::services::issues::IssueDraft {
+            title: params.draft.title,
+            body: params.draft.body,
+            labels: params.draft.labels,
+            assignees: params.draft.assignees,
+        };
+        let issue_ref = transport.create(draft).await?;
+
+        // Best-effort link. If the workflow has vanished we still return the
+        // created ref — the issue exists, silently dropping the link would be
+        // worse than returning the ref with `linked_workflow_id=None`.
+        let mut linked_workflow_id = None;
+        if let Some(workflow_id) = params.link_to_workflow_id.clone() {
+            let updated = {
+                let mut store = state.workflows.lock().await;
+                if let Some(workflow) = find_workflow_locked_mut(&mut store, &workflow_id) {
+                    if !workflow
+                        .state
+                        .implementation_issue_urls
+                        .contains(&issue_ref.url)
+                    {
+                        workflow
+                            .state
+                            .implementation_issue_urls
+                            .push(issue_ref.url.clone());
+                        touch_workflow(&mut workflow.state);
+                    }
+                    let cloned = workflow.state.clone();
+                    store.save()?;
+                    Some(cloned)
+                } else {
+                    None
+                }
+            };
+            if let Some(workflow_state) = updated {
+                linked_workflow_id = Some(workflow_id);
+                emit_workflow_upsert(&state, workflow_state);
             }
         }
 
+        state.emit_event(
+            "workflow.issue_created",
+            protocol::WorkflowIssueCreatedEvent {
+                project_id: params.project_id.clone(),
+                issue_ref: issue_ref.clone(),
+                linked_workflow_id: linked_workflow_id.clone(),
+            },
+        );
+        Ok(protocol::IssueCreateResult {
+            issue_ref,
+            linked_workflow_id,
+        })
+    }
+
+    /// `workflow.add_linked_issue` — append an implementation-issue URL to a
+    /// workflow. Idempotent (no-op if already linked). State change is
+    /// broadcast via the standard `WorkflowUpsert` delta; no side-event.
+    pub async fn workflow_add_linked_issue(
+        state: Arc<AppState>,
+        params: protocol::WorkflowAddLinkedIssueParams,
+    ) -> Result<protocol::WorkflowAddLinkedIssueResult, String> {
+        if params.url.trim().is_empty() {
+            return Err("invalid issue url: must be non-empty".to_string());
+        }
+        let workflow_state = {
+            let mut store = state.workflows.lock().await;
+            let workflow = find_workflow_locked_mut(&mut store, &params.workflow_id)
+                .ok_or_else(|| format!("workflow not found: {}", params.workflow_id))?;
+            if !workflow
+                .state
+                .implementation_issue_urls
+                .contains(&params.url)
+            {
+                workflow
+                    .state
+                    .implementation_issue_urls
+                    .push(params.url.clone());
+                touch_workflow(&mut workflow.state);
+            }
+            let cloned = workflow.state.clone();
+            store.save()?;
+            cloned
+        };
+
+        emit_workflow_upsert(&state, workflow_state.clone());
+        Ok(protocol::WorkflowAddLinkedIssueResult {
+            workflow: workflow_state,
+        })
+    }
+
+    /// `workflow.resolve_linked_issues` — batch-resolve a workflow's PRD + all
+    /// implementation issues. Deduplicates transport calls when the same URL
+    /// appears in multiple slots. Individual resolve failures return `None`
+    /// for that entry rather than failing the whole RPC.
+    pub async fn workflow_resolve_linked_issues(
+        state: Arc<AppState>,
+        params: protocol::WorkflowResolveLinkedIssuesParams,
+    ) -> Result<protocol::WorkflowResolveLinkedIssuesResult, String> {
+        let (thread_id, prd_url, impl_urls) = {
+            let store = state.workflows.lock().await;
+            let workflow = find_workflow_locked(&store, &params.workflow_id)
+                .ok_or_else(|| format!("workflow not found: {}", params.workflow_id))?;
+            (
+                workflow.thread_id.clone(),
+                workflow.prd_issue_url.clone(),
+                workflow.implementation_issue_urls.clone(),
+            )
+        };
+
+        let project_path = {
+            let store = state.store.lock().await;
+            let thread = store
+                .thread_by_id(&thread_id)
+                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+            thread.worktree_path.clone()
+        };
         let transport = crate::services::issues::for_project(&project_path, None).await;
-        let platform = transport.kind();
-        let issues = transport.list(&label, limit).await?;
-        issue_cache_put(cache_key, platform.clone(), issues.clone()).await;
-        Ok(protocol::WorkflowListIssuesResult {
-            platform,
-            issues,
-            cached: false,
+
+        // Intra-call dedupe — build a HashMap<url, resolved> so a URL that
+        // appears as both PRD and implementation only hits the transport once.
+        let mut unique_urls: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::<String>::new();
+        if let Some(ref url) = prd_url {
+            if seen.insert(url.clone()) {
+                unique_urls.push(url.clone());
+            }
+        }
+        for url in &impl_urls {
+            if seen.insert(url.clone()) {
+                unique_urls.push(url.clone());
+            }
+        }
+
+        let mut resolved = std::collections::HashMap::<String, Option<protocol::EnrichedIssueWire>>::new();
+        for url in &unique_urls {
+            let wire = transport
+                .resolve(url)
+                .await
+                .ok()
+                .flatten()
+                .map(enriched_to_wire);
+            resolved.insert(url.clone(), wire);
+        }
+
+        let prd = prd_url
+            .as_ref()
+            .and_then(|url| resolved.get(url).cloned().flatten());
+        let implementations = impl_urls
+            .iter()
+            .filter_map(|url| resolved.get(url).cloned().flatten())
+            .collect::<Vec<_>>();
+
+        Ok(protocol::WorkflowResolveLinkedIssuesResult {
+            prd,
+            implementations,
         })
     }
 
@@ -1637,7 +1969,7 @@ fn prepend_issue_context(
         "# Linked issue\n\nURL: {}\nTitle: {}\nState: {}\n\n{}\n\n---\n\n",
         url,
         issue.r#ref.title,
-        issue.state.as_str(),
+        crate::services::issues::issue_state_as_str(&issue.state),
         issue.body.as_deref().unwrap_or("(no body)"),
     );
     Some(match base {
@@ -1755,6 +2087,43 @@ fn emit_workflow_upsert(state: &AppState, workflow: protocol::WorkflowState) {
     state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::WorkflowUpsert {
         workflow,
     }]);
+}
+
+/// Convert internal `EnrichedIssue` to the wire-safe `EnrichedIssueWire` for
+/// RPC responses. The split keeps `services::issues::EnrichedIssue` free of
+/// serde requirements — only the wire type needs them.
+fn enriched_to_wire(issue: crate::services::issues::EnrichedIssue) -> protocol::EnrichedIssueWire {
+    protocol::EnrichedIssueWire {
+        r#ref: issue.r#ref,
+        state: issue.state,
+        labels: issue.labels,
+        assignees: issue.assignees,
+        body: issue.body,
+    }
+}
+
+/// Scan active workflows for the first one whose PRD or implementation list
+/// contains `url`. Used to attribute ambient issue events (close, comment) to
+/// a workflow when the caller didn't supply one explicitly.
+async fn find_workflow_id_for_issue_url(state: &AppState, url: &str) -> Option<String> {
+    let store = state.workflows.lock().await;
+    workflow_id_for_issue_url_locked(&store, url)
+}
+
+fn workflow_id_for_issue_url_locked(store: &WorkflowStore, url: &str) -> Option<String> {
+    store
+        .data
+        .workflows
+        .iter()
+        .find(|workflow| {
+            workflow.state.prd_issue_url.as_deref() == Some(url)
+                || workflow
+                    .state
+                    .implementation_issue_urls
+                    .iter()
+                    .any(|candidate| candidate == url)
+        })
+        .map(|workflow| workflow.state.workflow_id.clone())
 }
 
 async fn emit_workflow_state_delta(state: &AppState, workflow_id: &str) {

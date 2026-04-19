@@ -17,7 +17,6 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::protocol;
@@ -36,26 +35,21 @@ pub struct EnrichedIssue {
     pub body: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IssueState {
-    Open,
-    Closed,
+// `IssueState` now lives in `crate::protocol` so the wire format can reference it
+// directly. Re-exported here for existing call-sites.
+pub use crate::protocol::IssueState;
+
+pub(crate) fn issue_state_parse(s: &str) -> IssueState {
+    match s.to_lowercase().as_str() {
+        "closed" => IssueState::Closed,
+        _ => IssueState::Open,
+    }
 }
 
-impl IssueState {
-    fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "closed" => Self::Closed,
-            _ => Self::Open,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Closed => "closed",
-        }
+pub(crate) fn issue_state_as_str(state: &IssueState) -> &'static str {
+    match state {
+        IssueState::Open => "open",
+        IssueState::Closed => "closed",
     }
 }
 
@@ -74,7 +68,10 @@ pub trait IssueTransport: Send + Sync {
     /// Kind identifier for the returned `WorkflowIssuePlatform` in list responses.
     fn kind(&self) -> protocol::WorkflowIssuePlatform;
 
-    /// List open issues with the given label, newest first, capped at `limit`.
+    /// List open issues, newest first, capped at `limit`. An empty `label`
+    /// means "no filter" (all issues); any non-empty value filters to issues
+    /// carrying that label. All transports list OPEN issues only; closed-issue
+    /// filtering is post-processed by callers that need it.
     async fn list(
         &self,
         label: &str,
@@ -166,20 +163,20 @@ impl IssueTransport for GithubTransport {
         limit: u32,
     ) -> Result<Vec<protocol::WorkflowIssueRef>, String> {
         let limit_str = limit.to_string();
+        let mut args: Vec<&str> = vec!["issue", "list", "--state", "open"];
+        if !label.is_empty() {
+            args.push("--label");
+            args.push(label);
+        }
+        args.extend_from_slice(&[
+            "--limit",
+            &limit_str,
+            "--json",
+            "number,title,url,createdAt,author,body",
+        ]);
         let output = Command::new("gh")
             .current_dir(&self.project_path)
-            .args([
-                "issue",
-                "list",
-                "--label",
-                label,
-                "--state",
-                "open",
-                "--limit",
-                &limit_str,
-                "--json",
-                "number,title,url,createdAt,author,body",
-            ])
+            .args(&args)
             .output()
             .await
             .map_err(|err| format!("gh issue list failed to start: {err}"))?;
@@ -344,7 +341,7 @@ fn gh_row_to_enriched(row: serde_json::Value) -> EnrichedIssue {
     let state = row
         .get("state")
         .and_then(serde_json::Value::as_str)
-        .map(IssueState::parse)
+        .map(issue_state_parse)
         .unwrap_or(IssueState::Open);
     let labels = row
         .get("labels")
@@ -397,19 +394,15 @@ impl IssueTransport for GitlabTransport {
         limit: u32,
     ) -> Result<Vec<protocol::WorkflowIssueRef>, String> {
         let limit_str = limit.to_string();
+        let mut args: Vec<&str> = vec!["issue", "list", "--opened"];
+        if !label.is_empty() {
+            args.push("--label");
+            args.push(label);
+        }
+        args.extend_from_slice(&["--per-page", &limit_str, "--output", "json"]);
         let output = Command::new("glab")
             .current_dir(&self.project_path)
-            .args([
-                "issue",
-                "list",
-                "--label",
-                label,
-                "--opened",
-                "--per-page",
-                &limit_str,
-                "--output",
-                "json",
-            ])
+            .args(&args)
             .output()
             .await
             .map_err(|err| format!("glab issue list failed to start: {err}"))?;
@@ -566,7 +559,7 @@ fn glab_row_to_enriched(row: serde_json::Value) -> EnrichedIssue {
     let state = row
         .get("state")
         .and_then(serde_json::Value::as_str)
-        .map(IssueState::parse)
+        .map(issue_state_parse)
         .unwrap_or(IssueState::Open);
     let labels = row
         .get("labels")
@@ -694,7 +687,7 @@ impl IssueTransport for LocalTransport {
             if parsed.state != IssueState::Open {
                 continue;
             }
-            if !parsed.labels.iter().any(|l| l == label) {
+            if !label.is_empty() && !parsed.labels.iter().any(|l| l == label) {
                 continue;
             }
             issues.push(parsed.into_ref());
@@ -840,7 +833,7 @@ impl LocalIssue {
         let mut out = String::from("---\n");
         out.push_str(&format!("number: {}\n", self.number));
         out.push_str(&format!("title: \"{}\"\n", escape_yaml(&self.title)));
-        out.push_str(&format!("state: {}\n", self.state.as_str()));
+        out.push_str(&format!("state: {}\n", issue_state_as_str(&self.state)));
         out.push_str(&format!("labels: [{labels}]\n"));
         out.push_str(&format!("assignees: [{assignees}]\n"));
         if let Some(author) = &self.author {
@@ -879,7 +872,7 @@ fn parse_local_issue_file(contents: &str) -> Option<LocalIssue> {
         } else if let Some(v) = line.strip_prefix("title:") {
             title = unquote_yaml(v.trim()).to_string();
         } else if let Some(v) = line.strip_prefix("state:") {
-            state = IssueState::parse(v.trim());
+            state = issue_state_parse(v.trim());
         } else if let Some(v) = line.strip_prefix("labels:") {
             labels = parse_yaml_list(v.trim());
         } else if let Some(v) = line.strip_prefix("assignees:") {

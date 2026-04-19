@@ -1067,11 +1067,20 @@ pub struct WorkflowCompleteParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct WorkflowListIssuesParams {
+pub struct IssueListParams {
     pub project_id: String,
-    /// Override the issue label that identifies PRDs. Defaults to "prd".
+    /// Optional label filter. `None` means no label filter (all issues).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Desired state filter. Defaults to `Open`. State filtering for `scope=All`
+    /// / `scope=Prds` is currently a no-op — transports list open issues only —
+    /// and is honored only when `scope=LinkedTo` (post-filtered via `resolve`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<IssueListState>,
+    /// Scope the listing: all repo issues, PRDs only, or the issues linked to a
+    /// specific workflow. Defaults to `All`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<IssueListScope>,
     /// Maximum number of issues to return. Capped server-side at 100; defaults to 50.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -1079,6 +1088,36 @@ pub struct WorkflowListIssuesParams {
     /// result is still written back to the cache. UI refresh buttons should set this.
     #[serde(default)]
     pub bypass_cache: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueListState {
+    Open,
+    Closed,
+    All,
+}
+
+impl Default for IssueListState {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+/// Scope selector for `issue.list`. Serialized with an internal `kind` tag so
+/// the wire form stays `{ "kind": "linked_to", "workflow_id": "..." }` etc.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IssueListScope {
+    All,
+    LinkedTo { workflow_id: String },
+    Prds,
+}
+
+impl Default for IssueListScope {
+    fn default() -> Self {
+        Self::All
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1106,14 +1145,158 @@ pub struct WorkflowIssueRef {
     pub body_preview: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueState {
+    Open,
+    Closed,
+}
+
+/// Wire-format mirror of the internal `EnrichedIssue`. Kept in `protocol` so
+/// the Mac-side decoder doesn't have to pull in `services::issues`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct WorkflowListIssuesResult {
+pub struct EnrichedIssueWire {
+    pub r#ref: WorkflowIssueRef,
+    pub state: IssueState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignees: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+/// Wire-format mirror of the internal `IssueDraft`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueDraftWire {
+    pub title: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignees: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueListResult {
     pub platform: WorkflowIssuePlatform,
     pub issues: Vec<WorkflowIssueRef>,
     /// True when this response came from the 30s TTL cache rather than a fresh
     /// gh/glab shell-out. UI can use this to skip flashing spinners.
     #[serde(default)]
     pub cached: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueResolveParams {
+    pub project_id: String,
+    pub url: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueResolveResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<EnrichedIssueWire>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueCloseParams {
+    pub project_id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_worker_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueCloseResult {
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueCommentParams {
+    pub project_id: String,
+    pub url: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_worker_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueCommentResult {
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueCreateParams {
+    pub project_id: String,
+    pub draft: IssueDraftWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_to_workflow_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IssueCreateResult {
+    pub issue_ref: WorkflowIssueRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_workflow_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowAddLinkedIssueParams {
+    pub workflow_id: String,
+    pub url: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowAddLinkedIssueResult {
+    pub workflow: WorkflowState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowResolveLinkedIssuesParams {
+    pub workflow_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowResolveLinkedIssuesResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prd: Option<EnrichedIssueWire>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementations: Vec<EnrichedIssueWire>,
+}
+
+// ---------- Issue event payloads (direct events, not state deltas) ----------
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowIssueClosedEvent {
+    pub project_id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowIssueCommentedEvent {
+    pub project_id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkflowIssueCreatedEvent {
+    pub project_id: String,
+    pub issue_ref: WorkflowIssueRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_workflow_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1571,8 +1754,14 @@ pub const METHOD_WORKFLOW_LIST_REVIEWERS: &str = "workflow.list_reviewers";
 pub const METHOD_WORKFLOW_RECORD_FINDINGS: &str = "workflow.record_findings";
 pub const METHOD_WORKFLOW_COMPLETE: &str = "workflow.complete";
 pub const METHOD_WORKFLOW_RESOLVE_FINDING: &str = "workflow.resolve_finding";
-pub const METHOD_WORKFLOW_LIST_ISSUES: &str = "workflow.list_issues";
 pub const METHOD_WORKFLOW_START_FROM_ISSUE: &str = "workflow.start_from_issue";
+pub const METHOD_WORKFLOW_ADD_LINKED_ISSUE: &str = "workflow.add_linked_issue";
+pub const METHOD_WORKFLOW_RESOLVE_LINKED_ISSUES: &str = "workflow.resolve_linked_issues";
+pub const METHOD_ISSUE_LIST: &str = "issue.list";
+pub const METHOD_ISSUE_RESOLVE: &str = "issue.resolve";
+pub const METHOD_ISSUE_CLOSE: &str = "issue.close";
+pub const METHOD_ISSUE_COMMENT: &str = "issue.comment";
+pub const METHOD_ISSUE_CREATE: &str = "issue.create";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatsParams {}
@@ -1725,10 +1914,22 @@ pub enum RequestDispatch {
     WorkflowComplete(WorkflowCompleteParams),
     #[serde(rename = "workflow.resolve_finding")]
     WorkflowResolveFinding(WorkflowResolveFindingParams),
-    #[serde(rename = "workflow.list_issues")]
-    WorkflowListIssues(WorkflowListIssuesParams),
     #[serde(rename = "workflow.start_from_issue")]
     WorkflowStartFromIssue(WorkflowStartFromIssueParams),
+    #[serde(rename = "workflow.add_linked_issue")]
+    WorkflowAddLinkedIssue(WorkflowAddLinkedIssueParams),
+    #[serde(rename = "workflow.resolve_linked_issues")]
+    WorkflowResolveLinkedIssues(WorkflowResolveLinkedIssuesParams),
+    #[serde(rename = "issue.list")]
+    IssueList(IssueListParams),
+    #[serde(rename = "issue.resolve")]
+    IssueResolve(IssueResolveParams),
+    #[serde(rename = "issue.close")]
+    IssueClose(IssueCloseParams),
+    #[serde(rename = "issue.comment")]
+    IssueComment(IssueCommentParams),
+    #[serde(rename = "issue.create")]
+    IssueCreate(IssueCreateParams),
     #[serde(rename = "system.stats")]
     SystemStats(SystemStatsParams),
     #[serde(rename = "agent.registry.list")]
@@ -1923,14 +2124,36 @@ pub fn parse_request_dispatch(
                 .map(RequestDispatch::WorkflowResolveFinding)
                 .map_err(|err| format!("invalid workflow.resolve_finding params: {err}"))
         }
-        METHOD_WORKFLOW_LIST_ISSUES => serde_json::from_value::<WorkflowListIssuesParams>(params)
-            .map(RequestDispatch::WorkflowListIssues)
-            .map_err(|err| format!("invalid workflow.list_issues params: {err}")),
         METHOD_WORKFLOW_START_FROM_ISSUE => {
             serde_json::from_value::<WorkflowStartFromIssueParams>(params)
                 .map(RequestDispatch::WorkflowStartFromIssue)
                 .map_err(|err| format!("invalid workflow.start_from_issue params: {err}"))
         }
+        METHOD_WORKFLOW_ADD_LINKED_ISSUE => {
+            serde_json::from_value::<WorkflowAddLinkedIssueParams>(params)
+                .map(RequestDispatch::WorkflowAddLinkedIssue)
+                .map_err(|err| format!("invalid workflow.add_linked_issue params: {err}"))
+        }
+        METHOD_WORKFLOW_RESOLVE_LINKED_ISSUES => {
+            serde_json::from_value::<WorkflowResolveLinkedIssuesParams>(params)
+                .map(RequestDispatch::WorkflowResolveLinkedIssues)
+                .map_err(|err| format!("invalid workflow.resolve_linked_issues params: {err}"))
+        }
+        METHOD_ISSUE_LIST => serde_json::from_value::<IssueListParams>(params)
+            .map(RequestDispatch::IssueList)
+            .map_err(|err| format!("invalid issue.list params: {err}")),
+        METHOD_ISSUE_RESOLVE => serde_json::from_value::<IssueResolveParams>(params)
+            .map(RequestDispatch::IssueResolve)
+            .map_err(|err| format!("invalid issue.resolve params: {err}")),
+        METHOD_ISSUE_CLOSE => serde_json::from_value::<IssueCloseParams>(params)
+            .map(RequestDispatch::IssueClose)
+            .map_err(|err| format!("invalid issue.close params: {err}")),
+        METHOD_ISSUE_COMMENT => serde_json::from_value::<IssueCommentParams>(params)
+            .map(RequestDispatch::IssueComment)
+            .map_err(|err| format!("invalid issue.comment params: {err}")),
+        METHOD_ISSUE_CREATE => serde_json::from_value::<IssueCreateParams>(params)
+            .map(RequestDispatch::IssueCreate)
+            .map_err(|err| format!("invalid issue.create params: {err}")),
         METHOD_SYSTEM_STATS => serde_json::from_value::<SystemStatsParams>(params)
             .map(RequestDispatch::SystemStats)
             .map_err(|err| format!("invalid system.stats params: {err}")),
