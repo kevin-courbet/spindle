@@ -1356,6 +1356,37 @@ impl WorkflowService {
         let scope = params.scope.unwrap_or_default();
         let limit = params.limit.unwrap_or(50).min(100);
 
+        // Reject state filter combos the underlying transport can't honor.
+        // `gh`/`glab` `list` surface only OPEN issues; post-filtering an
+        // unscoped list would require a resolve per row (O(N) shell-outs).
+        // Surface the limitation explicitly rather than silently returning
+        // open-only results that don't match the user's stated intent.
+        if let Some(state_filter) = params.state.as_ref() {
+            let needs_closed = matches!(
+                state_filter,
+                protocol::IssueListState::Closed | protocol::IssueListState::All
+            );
+            let scope_label = match &scope {
+                protocol::IssueListScope::All => Some("all"),
+                protocol::IssueListScope::Prds => Some("prds"),
+                protocol::IssueListScope::LinkedTo { .. } => None,
+            };
+            if needs_closed {
+                if let Some(scope_name) = scope_label {
+                    let state_name = match state_filter {
+                        protocol::IssueListState::Closed => "closed",
+                        protocol::IssueListState::All => "all",
+                        protocol::IssueListState::Open => "open",
+                    };
+                    return Err(format!(
+                        "state={state_name} not supported for scope={scope_name} — \
+                         underlying transport only exposes open issues. Use \
+                         scope=linked_to for state filtering."
+                    ));
+                }
+            }
+        }
+
         // Resolve project path.
         let project_path = {
             let store = state.store.lock().await;
@@ -1390,33 +1421,59 @@ impl WorkflowService {
                     }
                 }
 
-                let transport = crate::services::issues::for_project(&project_path, None).await;
+                let transport: Arc<dyn crate::services::issues::IssueTransport> =
+                    Arc::from(crate::services::issues::for_project(&project_path, None).await);
                 let platform = transport.kind();
                 let state_filter = params.state.unwrap_or_default();
-                let mut issues = Vec::new();
-                for url in ordered {
-                    match transport.resolve(&url).await {
-                        Ok(Some(enriched)) => {
-                            let keep = match state_filter {
-                                protocol::IssueListState::All => true,
-                                protocol::IssueListState::Open => {
-                                    enriched.state == protocol::IssueState::Open
-                                }
-                                protocol::IssueListState::Closed => {
-                                    enriched.state == protocol::IssueState::Closed
-                                }
-                            };
-                            if keep {
-                                issues.push(enriched.r#ref);
+                let needs_filter = !matches!(state_filter, protocol::IssueListState::All);
+
+                // Trim BEFORE resolving when no state filter is active — no
+                // reason to fetch issues we'll discard. With a state filter we
+                // must resolve more rows than `limit` (since some will be
+                // dropped by the filter) but cap at ISSUE_RESOLVE_MAX_FANOUT to
+                // bound the per-call shell-out cost.
+                let to_resolve: Vec<String> = if needs_filter {
+                    ordered.into_iter().take(ISSUE_RESOLVE_MAX_FANOUT).collect()
+                } else {
+                    ordered.into_iter().take(limit as usize).collect()
+                };
+
+                let resolves = to_resolve.iter().map(|url| {
+                    let url = url.clone();
+                    let transport = Arc::clone(&transport);
+                    async move {
+                        match timeout(ISSUE_RESOLVE_TIMEOUT, transport.resolve(&url)).await {
+                            Ok(Ok(Some(enriched))) => Some(enriched),
+                            Ok(Ok(None)) => None,
+                            Ok(Err(err)) => {
+                                warn!("issue.list linked_to: resolve failed for {url}: {err}");
+                                None
+                            }
+                            Err(_elapsed) => {
+                                warn!("issue.list linked_to: resolve timed out for {url}");
+                                None
                             }
                         }
-                        Ok(None) | Err(_) => {
-                            // Transport failed or issue vanished. Skip — linked-to
-                            // lists favor showing what we have over failing wholesale.
-                        }
                     }
-                    if issues.len() as u32 >= limit {
-                        break;
+                });
+                let resolved = futures_util::future::join_all(resolves).await;
+
+                let mut issues = Vec::new();
+                for enriched in resolved.into_iter().flatten() {
+                    let keep = match state_filter {
+                        protocol::IssueListState::All => true,
+                        protocol::IssueListState::Open => {
+                            enriched.state == protocol::IssueState::Open
+                        }
+                        protocol::IssueListState::Closed => {
+                            enriched.state == protocol::IssueState::Closed
+                        }
+                    };
+                    if keep {
+                        issues.push(enriched.r#ref);
+                        if issues.len() as u32 >= limit {
+                            break;
+                        }
                     }
                 }
                 Ok(protocol::IssueListResult {
@@ -2004,17 +2061,49 @@ fn touch_workflow(workflow: &mut protocol::WorkflowState) {
     workflow.updated_at = Utc::now().to_rfc3339();
 }
 
+/// Maximum body length injected into a worker's initial prompt. Issues with
+/// long descriptions can blow past the agent's context budget; we cap at 4KB
+/// of chars and append an elision marker so the agent knows there's more.
+const ISSUE_BODY_INJECT_CAP: usize = 4000;
+
+/// Truncate `body` at `cap` chars (not bytes) on a char boundary. If
+/// truncation occurred, append the elision marker. Returns the input
+/// unchanged when shorter than the cap.
+fn cap_issue_body(body: &str, cap: usize) -> String {
+    let total = body.chars().count();
+    if total <= cap {
+        return body.to_string();
+    }
+    // char_indices yields byte offsets at char boundaries — the (cap)th
+    // char-index is the safe split point. Falling back to body.len() means
+    // "no truncation needed" which we already short-circuited above.
+    let split_byte = body
+        .char_indices()
+        .nth(cap)
+        .map(|(idx, _)| idx)
+        .unwrap_or(body.len());
+    let elided = total - cap;
+    let mut out = String::with_capacity(split_byte + 32);
+    out.push_str(&body[..split_byte]);
+    out.push_str(&format!("\n\n…[truncated, {elided} chars elided]"));
+    out
+}
+
 fn prepend_issue_context(
     base: Option<String>,
     url: &str,
     issue: &crate::services::issues::EnrichedIssue,
 ) -> Option<String> {
+    let body = match issue.body.as_deref() {
+        Some(b) => cap_issue_body(b, ISSUE_BODY_INJECT_CAP),
+        None => "(no body)".to_string(),
+    };
     let header = format!(
         "# Linked issue\n\nURL: {}\nTitle: {}\nState: {}\n\n{}\n\n---\n\n",
         url,
         issue.r#ref.title,
         crate::services::issues::issue_state_as_str(&issue.state),
-        issue.body.as_deref().unwrap_or("(no body)"),
+        body,
     );
     Some(match base {
         Some(prompt) if !prompt.trim().is_empty() => format!("{header}{prompt}"),
