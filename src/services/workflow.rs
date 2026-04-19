@@ -1671,17 +1671,33 @@ impl WorkflowService {
             )
         };
 
+        // Resolve project path via thread → project, falling back to a direct
+        // project lookup if the thread is gone. Thread deletion shouldn't
+        // strand the workflow's linked-issue view; the project remains the
+        // source of truth for transport configuration.
         let project_path = {
             let store = state.store.lock().await;
-            let thread = store
+            let project_id_opt = store
                 .thread_by_id(&thread_id)
-                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-            thread.worktree_path.clone()
+                .map(|thread| thread.project_id.clone());
+            match project_id_opt {
+                Some(project_id) => store
+                    .project_by_id(&project_id)
+                    .ok_or_else(|| format!("project not found for workflow: {project_id}"))?
+                    .path
+                    .clone(),
+                None => {
+                    return Err(format!(
+                        "project not found for workflow (thread {thread_id} missing)"
+                    ));
+                }
+            }
         };
-        let transport = crate::services::issues::for_project(&project_path, None).await;
+        let transport: Arc<dyn crate::services::issues::IssueTransport> =
+            Arc::from(crate::services::issues::for_project(&project_path, None).await);
 
-        // Intra-call dedupe — build a HashMap<url, resolved> so a URL that
-        // appears as both PRD and implementation only hits the transport once.
+        // Intra-call dedupe — only hit the transport once per URL even if the
+        // same URL appears as both PRD and implementation.
         let mut unique_urls: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
         if let Some(ref url) = prd_url {
@@ -1695,17 +1711,35 @@ impl WorkflowService {
             }
         }
 
-        let mut resolved =
-            std::collections::HashMap::<String, Option<protocol::EnrichedIssueWire>>::new();
-        for url in &unique_urls {
-            let wire = transport
-                .resolve(url)
+        // Resolve all unique URLs in parallel with a per-call timeout. Failures
+        // and timeouts collapse to `None` for that entry rather than failing the
+        // whole RPC — callers prefer a partial list over a hard error.
+        let resolves = unique_urls.iter().map(|url| {
+            let url = url.clone();
+            let transport = Arc::clone(&transport);
+            async move {
+                let wire = match timeout(ISSUE_RESOLVE_TIMEOUT, transport.resolve(&url)).await {
+                    Ok(Ok(Some(issue))) => Some(enriched_to_wire(issue)),
+                    Ok(Ok(None)) => None,
+                    Ok(Err(err)) => {
+                        warn!(
+                            "workflow.resolve_linked_issues: resolve failed for {url}: {err}"
+                        );
+                        None
+                    }
+                    Err(_elapsed) => {
+                        warn!("workflow.resolve_linked_issues: resolve timed out for {url}");
+                        None
+                    }
+                };
+                (url, wire)
+            }
+        });
+        let resolved: std::collections::HashMap<String, Option<protocol::EnrichedIssueWire>> =
+            futures_util::future::join_all(resolves)
                 .await
-                .ok()
-                .flatten()
-                .map(enriched_to_wire);
-            resolved.insert(url.clone(), wire);
-        }
+                .into_iter()
+                .collect();
 
         let prd = prd_url
             .as_ref()
