@@ -1778,9 +1778,7 @@ impl WorkflowService {
                     Ok(Ok(Some(issue))) => Some(enriched_to_wire(issue)),
                     Ok(Ok(None)) => None,
                     Ok(Err(err)) => {
-                        warn!(
-                            "workflow.resolve_linked_issues: resolve failed for {url}: {err}"
-                        );
+                        warn!("workflow.resolve_linked_issues: resolve failed for {url}: {err}");
                         None
                     }
                     Err(_elapsed) => {
@@ -3076,12 +3074,7 @@ mod tests {
                 Some(url),
                 &[],
             ),
-            make_persisted_workflow_for_url(
-                "wf-b",
-                protocol::WorkflowPhase::Testing,
-                None,
-                &[url],
-            ),
+            make_persisted_workflow_for_url("wf-b", protocol::WorkflowPhase::Testing, None, &[url]),
         ]);
         let result = workflow_id_for_issue_url_locked(&store, url);
         assert!(result.is_none(), "ambiguous match must not attribute");
