@@ -1090,34 +1090,26 @@ pub struct IssueListParams {
     pub bypass_cache: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IssueListState {
+    #[default]
     Open,
     Closed,
     All,
 }
 
-impl Default for IssueListState {
-    fn default() -> Self {
-        Self::Open
-    }
-}
-
 /// Scope selector for `issue.list`. Serialized with an internal `kind` tag so
 /// the wire form stays `{ "kind": "linked_to", "workflow_id": "..." }` etc.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IssueListScope {
+    #[default]
     All,
-    LinkedTo { workflow_id: String },
+    LinkedTo {
+        workflow_id: String,
+    },
     Prds,
-}
-
-impl Default for IssueListScope {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
