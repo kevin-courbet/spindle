@@ -2,12 +2,23 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Per-issue resolve timeout. Transports shell out to `gh`/`glab` which can
+/// hang on auth issues or network blackholes — capping per call keeps the
+/// caller responsive and lets us fall back gracefully.
+const ISSUE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard ceiling on per-call transport fan-out when post-filtering is required
+/// (e.g. `issue.list` scope=LinkedTo with a state filter). Prevents pathological
+/// O(N) shell-outs on workflows with absurdly long linked-issue lists.
+const ISSUE_RESOLVE_MAX_FANOUT: usize = 100;
 
 use crate::{protocol, services::chat::ChatService, AppState};
 
@@ -757,16 +768,20 @@ impl WorkflowService {
                 match worktree {
                     Some(worktree) => {
                         let transport = crate::services::issues::for_project(&worktree, None).await;
-                        match transport.resolve(url).await {
-                            Ok(Some(issue)) => {
+                        match timeout(ISSUE_RESOLVE_TIMEOUT, transport.resolve(url)).await {
+                            Ok(Ok(Some(issue))) => {
                                 prepend_issue_context(params.initial_prompt.clone(), url, &issue)
                             }
-                            Ok(None) => {
+                            Ok(Ok(None)) => {
                                 warn!("spawn_worker: issue not found for injection: {url}");
                                 params.initial_prompt.clone()
                             }
-                            Err(err) => {
+                            Ok(Err(err)) => {
                                 warn!("spawn_worker: issue resolve failed for {url}: {err}");
+                                params.initial_prompt.clone()
+                            }
+                            Err(_elapsed) => {
+                                warn!("spawn_worker: issue resolve timed out for {url}");
                                 params.initial_prompt.clone()
                             }
                         }
