@@ -924,12 +924,17 @@ async fn issue_create_with_link_to_workflow_appends_url() {
         "LocalTransport should mint local URL, got {created_url}"
     );
 
-    // workflow.issue_created direct event fires.
+    // workflow.issue_created direct event fires. The event is the project-level
+    // lifecycle signal and intentionally does not carry workflow ownership —
+    // linkage is observable via the concurrent WorkflowUpsert state delta.
     let event = harness
         .wait_for_event("workflow.issue_created", Duration::from_secs(5))
         .await
         .expect("workflow.issue_created event");
-    assert_eq!(event["params"]["linked_workflow_id"], workflow_id);
+    assert!(
+        event["params"].get("linked_workflow_id").is_none(),
+        "workflow.issue_created must not carry linked_workflow_id"
+    );
     assert_eq!(event["params"]["issue_ref"]["url"], created_url);
 
     let status = harness

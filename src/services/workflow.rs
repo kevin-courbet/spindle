@@ -1607,7 +1607,6 @@ impl WorkflowService {
             protocol::WorkflowIssueCreatedEvent {
                 project_id: params.project_id.clone(),
                 issue_ref: issue_ref.clone(),
-                linked_workflow_id: linked_workflow_id.clone(),
             },
         );
         Ok(protocol::IssueCreateResult {

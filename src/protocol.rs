@@ -1283,12 +1283,16 @@ pub struct WorkflowIssueCommentedEvent {
     pub workflow_id: Option<String>,
 }
 
+/// Project-level lifecycle signal that an issue was just created. Linkage to
+/// a workflow (when `link_to_workflow_id` is supplied to `issue.create`) is
+/// observed via the concurrent `WorkflowUpsert` state delta — that delta is
+/// the sole source of truth for workflow ownership of an issue. This event
+/// intentionally does not carry a workflow id so consumers don't race the
+/// delta or treat it as authoritative.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorkflowIssueCreatedEvent {
     pub project_id: String,
     pub issue_ref: WorkflowIssueRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub linked_workflow_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
