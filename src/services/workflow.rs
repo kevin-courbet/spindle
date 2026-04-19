@@ -729,6 +729,7 @@ impl WorkflowService {
                     handoff: None,
                     failure_message: None,
                     agent_status: None,
+                    issue_url: params.issue_url.clone(),
                 });
                 touch_workflow(&mut workflow.state);
                 (
@@ -741,13 +742,54 @@ impl WorkflowService {
             tuple
         };
 
+        // Best-effort issue context injection: if the caller bound this worker
+        // to an issue, resolve its body via IssueTransport and prepend to
+        // initial_prompt so the agent boots with full context. Resolve failures
+        // log a warning and fall through with the caller's original prompt.
+        let initial_prompt = match params.issue_url.as_ref() {
+            Some(url) => {
+                let worktree = {
+                    let store = state.store.lock().await;
+                    store
+                        .thread_by_id(&thread_id)
+                        .map(|thread| thread.worktree_path.clone())
+                };
+                match worktree {
+                    Some(worktree) => {
+                        let transport =
+                            crate::services::issues::for_project(&worktree, None).await;
+                        match transport.resolve(url).await {
+                            Ok(Some(issue)) => prepend_issue_context(
+                                params.initial_prompt.clone(),
+                                url,
+                                &issue,
+                            ),
+                            Ok(None) => {
+                                warn!("spawn_worker: issue not found for injection: {url}");
+                                params.initial_prompt.clone()
+                            }
+                            Err(err) => {
+                                warn!("spawn_worker: issue resolve failed for {url}: {err}");
+                                params.initial_prompt.clone()
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("spawn_worker: thread {thread_id} not found for issue injection");
+                        params.initial_prompt.clone()
+                    }
+                }
+            }
+            None => params.initial_prompt.clone(),
+        };
+
         let chat_result = ChatService::start(
             Arc::clone(&state),
             protocol::ChatStartParams {
                 thread_id: thread_id.clone(),
                 agent_name: params.agent_name,
                 system_prompt: params.system_prompt,
-                initial_prompt: params.initial_prompt,
+                initial_prompt,
                 display_name: params.display_name,
                 parent_session_id: params.parent_session_id,
                 preferred_model: params.preferred_model,
@@ -1586,6 +1628,24 @@ fn touch_workflow(workflow: &mut protocol::WorkflowState) {
     workflow.updated_at = Utc::now().to_rfc3339();
 }
 
+fn prepend_issue_context(
+    base: Option<String>,
+    url: &str,
+    issue: &crate::services::issues::EnrichedIssue,
+) -> Option<String> {
+    let header = format!(
+        "# Linked issue\n\nURL: {}\nTitle: {}\nState: {}\n\n{}\n\n---\n\n",
+        url,
+        issue.r#ref.title,
+        issue.state.as_str(),
+        issue.body.as_deref().unwrap_or("(no body)"),
+    );
+    Some(match base {
+        Some(prompt) if !prompt.trim().is_empty() => format!("{header}{prompt}"),
+        _ => header.trim_end_matches("\n\n---\n\n").to_string(),
+    })
+}
+
 fn validate_phase_transition(
     current: &protocol::WorkflowPhase,
     next: &protocol::WorkflowPhase,
@@ -2173,6 +2233,7 @@ mod tests {
                     handoff: None,
                     failure_message: Some("stale error".to_string()),
                     agent_status: None,
+                    issue_url: None,
                 }],
                 reviewers: Vec::new(),
                 findings: Vec::new(),
@@ -2324,5 +2385,50 @@ mod tests {
             workflow.reviewers[0].agent_status,
             Some(protocol::AgentStatus::Idle)
         );
+    }
+
+    fn make_issue(title: &str, body: Option<&str>) -> crate::services::issues::EnrichedIssue {
+        crate::services::issues::EnrichedIssue {
+            r#ref: protocol::WorkflowIssueRef {
+                number: 42,
+                title: title.to_string(),
+                url: "https://example.com/42".to_string(),
+                author: None,
+                created_at: None,
+                body_preview: None,
+            },
+            state: crate::services::issues::IssueState::Open,
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            body: body.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn prepend_issue_context_wraps_existing_prompt() {
+        let issue = make_issue("Add thing", Some("Long description of the thing"));
+        let result =
+            prepend_issue_context(Some("Do it now.".to_string()), "url-42", &issue).unwrap();
+        assert!(result.contains("URL: url-42"));
+        assert!(result.contains("Title: Add thing"));
+        assert!(result.contains("State: open"));
+        assert!(result.contains("Long description of the thing"));
+        assert!(result.ends_with("Do it now."));
+    }
+
+    #[test]
+    fn prepend_issue_context_handles_missing_base_prompt() {
+        let issue = make_issue("Add thing", Some("Body here"));
+        let result = prepend_issue_context(None, "url-42", &issue).unwrap();
+        assert!(result.contains("Body here"));
+        assert!(!result.ends_with("---\n\n"));
+    }
+
+    #[test]
+    fn prepend_issue_context_handles_empty_body() {
+        let issue = make_issue("Stub", None);
+        let result = prepend_issue_context(Some("Prompt".into()), "url", &issue).unwrap();
+        assert!(result.contains("(no body)"));
+        assert!(result.ends_with("Prompt"));
     }
 }

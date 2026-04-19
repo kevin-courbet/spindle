@@ -291,6 +291,12 @@ pub struct WorkflowWorker {
     pub failure_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<AgentStatus>,
+    /// URL of the implementation issue this worker is assigned to. When set at
+    /// spawn time, Spindle resolves the issue body via `IssueTransport` and
+    /// prepends it to the worker's initial prompt so the agent boots with full
+    /// context. Used by the Mac inspector to render "Working on #42" per worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -966,6 +972,12 @@ pub struct WorkflowSpawnWorkerParams {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    /// Implementation issue URL this worker owns. If set, Spindle resolves the
+    /// issue via `IssueTransport` at spawn time and prepends the body to
+    /// `initial_prompt`. Best-effort: resolve failures skip injection but do
+    /// not fail the spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
