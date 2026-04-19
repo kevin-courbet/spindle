@@ -40,6 +40,10 @@ enum Command {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    Issue {
+        #[command(subcommand)]
+        command: IssueCommand,
+    },
     Status {
         #[arg(long)]
         pretty: bool,
@@ -296,6 +300,123 @@ enum WorkflowCommand {
         #[arg(long)]
         pretty: bool,
     },
+    /// Append an implementation issue URL to a workflow's linked issues list
+    AddLinkedIssue {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Resolve live state for the workflow's PRD + all implementation issues
+    ResolveLinkedIssues {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        pretty: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IssueCommand {
+    /// List issues on a project (filter by label, state, scope)
+    List {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, value_enum)]
+        state: Option<IssueStateArg>,
+        /// Scope selector: `all`, `prds`, or `linked-to` (requires --workflow-id)
+        #[arg(long, value_enum)]
+        scope: Option<IssueScopeArg>,
+        /// Required when `--scope linked-to`
+        #[arg(long, required_if_eq("scope", "linked-to"))]
+        workflow_id: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        bypass_cache: bool,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Resolve live state for a single issue by URL
+    Resolve {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Close an issue (optionally posts reason as comment first)
+    Close {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        by_worker_id: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Post a comment on an issue
+    Comment {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long)]
+        by_worker_id: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Create a new issue (optionally link to an existing workflow)
+    Create {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        #[arg(long = "assignee")]
+        assignees: Vec<String>,
+        #[arg(long)]
+        link_to_workflow_id: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum IssueStateArg {
+    Open,
+    Closed,
+    All,
+}
+
+impl IssueStateArg {
+    fn as_rpc_value(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum IssueScopeArg {
+    All,
+    Prds,
+    LinkedTo,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -486,6 +607,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Workflow { command } => {
             handle_workflow(command, &ws_url, auth_token.as_deref()).await
         }
+        Command::Issue { command } => handle_issue(command, &ws_url, auth_token.as_deref()).await,
         Command::Status { pretty } => {
             let ping = rpc_request(&ws_url, auth_token.as_deref(), "ping", json!({})).await?;
             let output = json!({
@@ -1190,6 +1312,151 @@ async fn handle_workflow(
             .await?;
             print_json(&result, pretty)
         }
+        WorkflowCommand::AddLinkedIssue {
+            workflow_id,
+            url,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.add_linked_issue",
+                json!({ "workflow_id": workflow_id, "url": url }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+        WorkflowCommand::ResolveLinkedIssues {
+            workflow_id,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "workflow.resolve_linked_issues",
+                json!({ "workflow_id": workflow_id }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+    }
+}
+
+async fn handle_issue(
+    command: IssueCommand,
+    ws_url: &str,
+    auth_token: Option<&str>,
+) -> Result<(), CliError> {
+    match command {
+        IssueCommand::List {
+            project_id,
+            label,
+            state,
+            scope,
+            workflow_id,
+            limit,
+            bypass_cache,
+            pretty,
+        } => {
+            let mut params = json!({ "project_id": project_id });
+            if let Some(label) = label {
+                params["label"] = json!(label);
+            }
+            if let Some(state) = state {
+                params["state"] = json!(state.as_rpc_value());
+            }
+            if let Some(scope) = scope {
+                let scope_value = match scope {
+                    IssueScopeArg::All => json!({ "kind": "all" }),
+                    IssueScopeArg::Prds => json!({ "kind": "prds" }),
+                    IssueScopeArg::LinkedTo => {
+                        // clap's required_if_eq guarantees workflow_id is Some here.
+                        let wid = workflow_id.ok_or_else(|| {
+                            CliError::error("--workflow-id is required when --scope linked-to")
+                        })?;
+                        json!({ "kind": "linked_to", "workflow_id": wid })
+                    }
+                };
+                params["scope"] = scope_value;
+            }
+            if let Some(limit) = limit {
+                params["limit"] = json!(limit);
+            }
+            if bypass_cache {
+                params["bypass_cache"] = json!(true);
+            }
+            let result = rpc_request(ws_url, auth_token, "issue.list", params).await?;
+            print_json(&result, pretty)
+        }
+        IssueCommand::Resolve {
+            project_id,
+            url,
+            pretty,
+        } => {
+            let result = rpc_request(
+                ws_url,
+                auth_token,
+                "issue.resolve",
+                json!({ "project_id": project_id, "url": url }),
+            )
+            .await?;
+            print_json(&result, pretty)
+        }
+        IssueCommand::Close {
+            project_id,
+            url,
+            reason,
+            by_worker_id,
+            pretty,
+        } => {
+            let mut params = json!({ "project_id": project_id, "url": url });
+            if let Some(reason) = reason {
+                params["reason"] = json!(reason);
+            }
+            if let Some(wid) = by_worker_id {
+                params["by_worker_id"] = json!(wid);
+            }
+            let result = rpc_request(ws_url, auth_token, "issue.close", params).await?;
+            print_json(&result, pretty)
+        }
+        IssueCommand::Comment {
+            project_id,
+            url,
+            body,
+            by_worker_id,
+            pretty,
+        } => {
+            let mut params = json!({ "project_id": project_id, "url": url, "body": body });
+            if let Some(wid) = by_worker_id {
+                params["by_worker_id"] = json!(wid);
+            }
+            let result = rpc_request(ws_url, auth_token, "issue.comment", params).await?;
+            print_json(&result, pretty)
+        }
+        IssueCommand::Create {
+            project_id,
+            title,
+            body,
+            labels,
+            assignees,
+            link_to_workflow_id,
+            pretty,
+        } => {
+            let mut params = json!({
+                "project_id": project_id,
+                "draft": {
+                    "title": title,
+                    "body": body,
+                    "labels": labels,
+                    "assignees": assignees,
+                },
+            });
+            if let Some(wid) = link_to_workflow_id {
+                params["link_to_workflow_id"] = json!(wid);
+            }
+            let result = rpc_request(ws_url, auth_token, "issue.create", params).await?;
+            print_json(&result, pretty)
+        }
     }
 }
 
@@ -1655,6 +1922,125 @@ fn mcp_tool_catalog() -> Vec<McpTool> {
                 }
             }),
             dispatch: McpDispatch::Direct("workflow.complete"),
+        },
+        // --- issue.* surface ---
+        McpTool {
+            name: "issue_list",
+            description: "List issues on a project. Supports filtering by label, state (open/closed/all), \
+                          and scope (all issues, PRD-labeled only, or issues linked to a specific workflow).",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project_id"],
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "label": {"type": "string"},
+                    "state": {"type": "string", "enum": ["open", "closed", "all"]},
+                    "scope": {
+                        "type": "object",
+                        "required": ["kind"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["all", "prds", "linked_to"]},
+                            "workflow_id": {"type": "string", "description": "Required when kind=linked_to."}
+                        }
+                    },
+                    "limit": {"type": "integer"},
+                    "bypass_cache": {"type": "boolean"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("issue.list"),
+        },
+        McpTool {
+            name: "issue_resolve",
+            description: "Fetch the live state of a single issue by URL — state, labels, assignees, and full body.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project_id", "url"],
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "url": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("issue.resolve"),
+        },
+        McpTool {
+            name: "issue_close",
+            description: "Close an issue. Optionally posts a reason as a comment before closing. \
+                          Emits a workflow.issue_closed event if the issue is linked to any active workflow.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project_id", "url"],
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "url": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "by_worker_id": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("issue.close"),
+        },
+        McpTool {
+            name: "issue_comment",
+            description: "Post a comment on an issue. Emits workflow.issue_commented.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project_id", "url", "body"],
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "url": {"type": "string"},
+                    "body": {"type": "string"},
+                    "by_worker_id": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("issue.comment"),
+        },
+        McpTool {
+            name: "issue_create",
+            description: "Create a new issue. Optionally links it to an existing workflow, which appends \
+                          the new URL to the workflow's implementation_issue_urls and updates the inspector.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["project_id", "draft"],
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "draft": {
+                        "type": "object",
+                        "required": ["title", "body"],
+                        "properties": {
+                            "title": {"type": "string"},
+                            "body": {"type": "string"},
+                            "labels": {"type": "array", "items": {"type": "string"}},
+                            "assignees": {"type": "array", "items": {"type": "string"}}
+                        }
+                    },
+                    "link_to_workflow_id": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("issue.create"),
+        },
+        McpTool {
+            name: "workflow_add_linked_issue",
+            description: "Append an implementation issue URL to a workflow's linked issues list. \
+                          Dedupes existing URLs. Emits a workflow upsert state delta.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id", "url"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "url": {"type": "string"}
+                }
+            }),
+            dispatch: McpDispatch::Direct("workflow.add_linked_issue"),
+        },
+        McpTool {
+            name: "workflow_resolve_linked_issues",
+            description: "Resolve live state for the workflow's PRD and all implementation issues in one call. \
+                          Returns EnrichedIssueWire for each, with null entries for URLs the transport cannot find.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["workflow_id"],
+                "properties": {"workflow_id": {"type": "string"}}
+            }),
+            dispatch: McpDispatch::Direct("workflow.resolve_linked_issues"),
         },
         // --- read-only helpers ---
         McpTool {

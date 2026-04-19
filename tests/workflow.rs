@@ -790,3 +790,165 @@ async fn workflow_review_records_findings_and_reconciles_after_restart() {
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
+
+#[tokio::test]
+async fn workflow_add_linked_issue_appends_url_and_emits_delta() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping workflow_add_linked_issue_appends_url_and_emits_delta: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+    let workflow_id = create_workflow(&mut harness, &thread_id).await;
+
+    let first = harness
+        .rpc(
+            "workflow.add_linked_issue",
+            json!({
+                "workflow_id": workflow_id,
+                "url": "threadmill-local://42",
+            }),
+        )
+        .await
+        .expect("workflow.add_linked_issue first call");
+    let urls = first["workflow"]["implementation_issue_urls"]
+        .as_array()
+        .expect("implementation_issue_urls array");
+    assert!(
+        urls.iter().any(|url| url == "threadmill-local://42"),
+        "new URL should be appended; got {urls:?}"
+    );
+
+    // WorkflowUpsert delta should have been broadcast. Earlier deltas from
+    // project/thread/workflow creation are buffered, so keep draining until we
+    // find the upsert that carries our appended URL.
+    let mut found_upsert = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !found_upsert {
+        let delta = match harness
+            .wait_for_event("state.delta", Duration::from_secs(1))
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let Some(ops) = delta["params"]["operations"].as_array() else {
+            continue;
+        };
+        for op in ops {
+            if op["type"] != "workflow.upsert" {
+                continue;
+            }
+            if op["workflow"]["workflow_id"] != workflow_id {
+                continue;
+            }
+            let urls = op["workflow"]["implementation_issue_urls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if urls.iter().any(|url| url == "threadmill-local://42") {
+                found_upsert = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_upsert,
+        "expected workflow.upsert delta carrying threadmill-local://42"
+    );
+
+    // Second call with the same URL is idempotent — no duplicate.
+    let second = harness
+        .rpc(
+            "workflow.add_linked_issue",
+            json!({
+                "workflow_id": workflow_id,
+                "url": "threadmill-local://42",
+            }),
+        )
+        .await
+        .expect("workflow.add_linked_issue second call");
+    let urls_after = second["workflow"]["implementation_issue_urls"]
+        .as_array()
+        .expect("implementation_issue_urls array after second call");
+    let matching = urls_after
+        .iter()
+        .filter(|url| *url == "threadmill-local://42")
+        .count();
+    assert_eq!(matching, 1, "idempotent re-add should not duplicate");
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn issue_create_with_link_to_workflow_appends_url() {
+    if !common::tmux_available().await {
+        eprintln!("skipping issue_create_with_link_to_workflow_appends_url: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+    let workflow_id = create_workflow(&mut harness, &thread_id).await;
+
+    let created = harness
+        .rpc(
+            "issue.create",
+            json!({
+                "project_id": project_id,
+                "draft": {
+                    "title": "Follow-up work",
+                    "body": "## Problem\nAuto-linked from the test.\n",
+                    "labels": ["impl"],
+                    "assignees": []
+                },
+                "link_to_workflow_id": workflow_id,
+            }),
+        )
+        .await
+        .expect("issue.create with link");
+    let created_url = created["issue_ref"]["url"]
+        .as_str()
+        .expect("issue_ref.url")
+        .to_string();
+    assert_eq!(created["linked_workflow_id"], workflow_id);
+    assert!(
+        created_url.starts_with("threadmill-local://"),
+        "LocalTransport should mint local URL, got {created_url}"
+    );
+
+    // workflow.issue_created direct event fires. The event is the project-level
+    // lifecycle signal and intentionally does not carry workflow ownership —
+    // linkage is observable via the concurrent WorkflowUpsert state delta.
+    let event = harness
+        .wait_for_event("workflow.issue_created", Duration::from_secs(5))
+        .await
+        .expect("workflow.issue_created event");
+    assert!(
+        event["params"].get("linked_workflow_id").is_none(),
+        "workflow.issue_created must not carry linked_workflow_id"
+    );
+    assert_eq!(event["params"]["issue_ref"]["url"], created_url);
+
+    let status = harness
+        .rpc("workflow.status", json!({ "workflow_id": workflow_id }))
+        .await
+        .expect("workflow.status after linked issue.create");
+    assert!(
+        status["implementation_issue_urls"]
+            .as_array()
+            .expect("implementation_issue_urls array")
+            .iter()
+            .any(|url| url == &created_url),
+        "implementation_issue_urls should include newly-created url"
+    );
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}

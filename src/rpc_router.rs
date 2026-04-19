@@ -473,17 +473,53 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("workflow.resolve_finding", message))?;
             to_value("workflow.resolve_finding", result)
         }
-        RequestDispatch::WorkflowListIssues(params) => {
-            let result = WorkflowService::list_issues(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.list_issues", message))?;
-            to_value("workflow.list_issues", result)
-        }
         RequestDispatch::WorkflowStartFromIssue(params) => {
             let result = WorkflowService::start_from_issue(state, params)
                 .await
                 .map_err(|message| map_service_error("workflow.start_from_issue", message))?;
             to_value("workflow.start_from_issue", result)
+        }
+        RequestDispatch::WorkflowAddLinkedIssue(params) => {
+            let result = WorkflowService::workflow_add_linked_issue(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.add_linked_issue", message))?;
+            to_value("workflow.add_linked_issue", result)
+        }
+        RequestDispatch::WorkflowResolveLinkedIssues(params) => {
+            let result = WorkflowService::workflow_resolve_linked_issues(state, params)
+                .await
+                .map_err(|message| map_service_error("workflow.resolve_linked_issues", message))?;
+            to_value("workflow.resolve_linked_issues", result)
+        }
+        RequestDispatch::IssueList(params) => {
+            let result = WorkflowService::issue_list(state, params)
+                .await
+                .map_err(|message| map_service_error("issue.list", message))?;
+            to_value("issue.list", result)
+        }
+        RequestDispatch::IssueResolve(params) => {
+            let result = WorkflowService::issue_resolve(state, params)
+                .await
+                .map_err(|message| map_service_error("issue.resolve", message))?;
+            to_value("issue.resolve", result)
+        }
+        RequestDispatch::IssueClose(params) => {
+            let result = WorkflowService::issue_close(state, params)
+                .await
+                .map_err(|message| map_service_error("issue.close", message))?;
+            to_value("issue.close", result)
+        }
+        RequestDispatch::IssueComment(params) => {
+            let result = WorkflowService::issue_comment(state, params)
+                .await
+                .map_err(|message| map_service_error("issue.comment", message))?;
+            to_value("issue.comment", result)
+        }
+        RequestDispatch::IssueCreate(params) => {
+            let result = WorkflowService::issue_create(state, params)
+                .await
+                .map_err(|message| map_service_error("issue.create", message))?;
+            to_value("issue.create", result)
         }
         RequestDispatch::AgentRegistryList(_) => {
             let entries = crate::services::agent_registry::discover_agents();
