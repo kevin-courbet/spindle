@@ -497,6 +497,9 @@ impl ChatService {
                 models: None,
                 config_options: None,
                 injection_prompt_id: None,
+                user_prompt_count: 0,
+                first_prompt_text: None,
+                title_gen: None,
             };
             chat.sessions.insert(fork_session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -4947,5 +4950,155 @@ mod tests {
         assert!(history.next_cursor.is_none());
 
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn fork_copies_history_and_creates_session() {
+        let state = make_test_state();
+        let thread_id = "thread-1";
+        let source_session_id = "source-session";
+
+        // Set up history root and source session
+        let history_root = {
+            let chat = state.chat.lock().await;
+            chat.history_root_path().to_path_buf()
+        };
+        let source_history = history_path_for_session(&history_root, thread_id, source_session_id);
+        fs::create_dir_all(source_history.parent().unwrap()).unwrap();
+        fs::write(
+            &source_history,
+            concat!(
+                "{\"sessionId\":\"acp-1\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}}}\n",
+                "{\"sessionId\":\"acp-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"hi there\"}}}\n",
+                "{\"sessionId\":\"acp-1\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"do something\"}}}\n",
+                "{\"sessionId\":\"acp-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"done\"}}}\n",
+            ),
+        )
+        .unwrap();
+
+        // Register source session in chat state
+        {
+            let mut chat = state.chat.lock().await;
+            let runtime = ChatSessionRuntime {
+                summary: protocol::ChatSessionSummary {
+                    session_id: source_session_id.to_string(),
+                    agent_type: "opencode".to_string(),
+                    status: protocol::ChatSessionStatus::Ready,
+                    agent_status: protocol::AgentStatus::Idle,
+                    worker_count: 0,
+                    title: None,
+                    model_id: None,
+                    created_at: Utc::now().to_rfc3339(),
+                    display_name: Some("Test Session".to_string()),
+                    parent_session_id: None,
+                },
+                thread_id: thread_id.to_string(),
+                display_name: Some("Test Session".to_string()),
+                parent_session_id: None,
+                system_prompt: None,
+                initial_prompt: None,
+                conversation_context: None,
+                acp_session_id: Some("acp-1".to_string()),
+                attached_channels: HashSet::new(),
+                input_tx: None,
+                stop_tx: None,
+                status_notify: Arc::new(Notify::new()),
+                ended_emitted: false,
+                history_path: source_history.clone(),
+                input_buffer: Vec::new(),
+                output_buffer: Vec::new(),
+                active_tools: HashSet::new(),
+                total_tool_count: 0,
+                latest_tool_name: None,
+                latest_tool_title: None,
+                started_at: Some(Utc::now()),
+                pending_prompt_ids: HashSet::new(),
+                checkpoint_seq: 0,
+                last_update_time: None,
+                stall_generation: 0,
+                stall_task: None,
+                modes: None,
+                models: None,
+                config_options: None,
+                injection_prompt_id: None,
+                user_prompt_count: 0,
+                first_prompt_text: None,
+                title_gen: None,
+            };
+            chat.sessions
+                .insert(source_session_id.to_string(), runtime);
+            chat.sessions_by_thread
+                .entry(thread_id.to_string())
+                .or_default()
+                .push(source_session_id.to_string());
+        }
+
+        // Fork at cursor=2 (first user+assistant turn)
+        let result = ChatService::fork(
+            Arc::clone(&state),
+            protocol::ChatForkParams {
+                thread_id: thread_id.to_string(),
+                source_session_id: source_session_id.to_string(),
+                message_cursor: 2,
+            },
+        )
+        .await
+        .expect("fork should succeed");
+
+        // Verify result
+        assert_eq!(result.agent_type, "opencode");
+        assert!(result.display_name.as_ref().unwrap().contains("fork #1"));
+        assert!(!result.session_id.is_empty());
+
+        // Verify forked JSONL has exactly 2 lines
+        let fork_history = history_path_for_session(&history_root, thread_id, &result.session_id);
+        assert!(fork_history.exists(), "fork history file should exist");
+        let fork_line_count = fs::read_to_string(&fork_history)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(fork_line_count, 2, "fork should have exactly 2 lines (cursor=2)");
+
+        // Verify session registered in state
+        {
+            let chat = state.chat.lock().await;
+            let fork_session = chat.sessions.get(&result.session_id).unwrap();
+            assert_eq!(fork_session.summary.status, protocol::ChatSessionStatus::Ended);
+            assert_eq!(
+                fork_session.parent_session_id.as_deref(),
+                Some(source_session_id)
+            );
+            assert!(
+                fork_session.conversation_context.is_some(),
+                "fork should have conversation_context built"
+            );
+        }
+
+        // Verify cursor validation — out of range
+        let err = ChatService::fork(
+            Arc::clone(&state),
+            protocol::ChatForkParams {
+                thread_id: thread_id.to_string(),
+                source_session_id: source_session_id.to_string(),
+                message_cursor: 99,
+            },
+        )
+        .await;
+        assert!(err.is_err(), "cursor beyond line count should fail");
+        assert!(err.unwrap_err().contains("exceeds"));
+
+        // Fork again to verify incrementing fork count
+        let result2 = ChatService::fork(
+            Arc::clone(&state),
+            protocol::ChatForkParams {
+                thread_id: thread_id.to_string(),
+                source_session_id: source_session_id.to_string(),
+                message_cursor: 1,
+            },
+        )
+        .await
+        .expect("second fork should succeed");
+        assert!(result2.display_name.as_ref().unwrap().contains("fork #2"));
     }
 }
