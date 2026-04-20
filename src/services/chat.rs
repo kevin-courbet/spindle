@@ -88,6 +88,52 @@ struct ChatSessionRuntime {
     /// Tracks the injection prompt request ID so we can detect when the injection turn completes.
     /// Set when injection is sent, cleared when the response arrives in apply_outbound_status_updates.
     injection_prompt_id: Option<String>,
+    /// Number of user-originated prompts routed through this session.
+    user_prompt_count: u32,
+    /// Text of the first user prompt, captured for title generation.
+    first_prompt_text: Option<String>,
+    /// State machine for ephemeral title generation session.
+    title_gen: Option<TitleGeneration>,
+}
+
+/// Ephemeral ACP session for generating a thread title after the first user turn.
+struct TitleGeneration {
+    state: TitleGenState,
+    text_chunks: Vec<String>,
+}
+
+enum TitleGenState {
+    /// session/new sent on the same agent process, awaiting response.
+    CreatingSession { request_id: String },
+    /// session/setModel sent to switch to a small model, awaiting response.
+    SettingModel { session_id: String, request_id: String },
+    /// session/prompt sent with title system prompt, collecting agent_message_chunk notifications.
+    Collecting { session_id: String, request_id: String },
+}
+
+const TITLE_SYSTEM_PROMPT: &str = "\
+You are a title generator. Output ONLY a thread title. Nothing else.\n\
+Generate a brief title for this conversation.\n\
+- Single line, ≤50 characters, no explanations\n\
+- Same language as the user message\n\
+- Keep technical terms, filenames, numbers exact\n\
+- Remove articles (the, a, an)\n\
+- Focus on WHAT the user wants to do\n\
+- Never use tools";
+
+const SMALL_MODEL_PATTERNS: &[&str] = &["haiku", "flash", "nano", "mini", "gpt-4o-mini"];
+
+fn pick_small_model(models: &Vec<Value>) -> Option<String> {
+    for pattern in SMALL_MODEL_PATTERNS {
+        for model in models {
+            if let Some(id) = model.get("modelId").and_then(Value::as_str) {
+                if id.to_lowercase().contains(pattern) {
+                    return Some(id.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 impl ChatState {
@@ -184,6 +230,9 @@ impl ChatService {
                 models: None,
                 config_options: None,
                 injection_prompt_id: None,
+                user_prompt_count: 0,
+                first_prompt_text: None,
+                title_gen: None,
             };
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -1498,6 +1547,31 @@ fn apply_inbound_status_updates(
                 session.pending_prompt_ids.insert(id);
             }
 
+            // Capture first user prompt text for title generation
+            if session.user_prompt_count == 0 {
+                if let Some(text) = params
+                    .and_then(|p| p.get("prompt"))
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| {
+                                if p.get("type")?.as_str() == Some("text") {
+                                    p.get("text")?.as_str()
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|t| !t.is_empty())
+                {
+                    session.first_prompt_text = Some(text);
+                }
+            }
+            session.user_prompt_count += 1;
+
             if let Some(conversation_context) = session.conversation_context.as_deref() {
                 let context_block = format!("{conversation_context}\n\n---\n\n");
                 if prepend_prompt_text_block(message, &context_block) {
@@ -1639,14 +1713,23 @@ fn user_prompt_history_update(session_id_value: Value, text: &str) -> Value {
     })
 }
 
-/// Returns (status_transitions, injection_just_completed).
+struct OutboundResult {
+    transitions: Vec<StatusTransition>,
+    injection_completed: bool,
+    should_start_title_gen: bool,
+}
+
+/// Returns status transitions, injection completion flag, and whether to start title generation.
 fn apply_outbound_status_updates(
     state: &Arc<AppState>,
     session: &mut ChatSessionRuntime,
     messages: Vec<Value>,
-) -> (Vec<StatusTransition>, bool) {
-    let mut transitions = Vec::new();
-    let mut injection_completed = false;
+) -> OutboundResult {
+    let mut result = OutboundResult {
+        transitions: Vec::new(),
+        injection_completed: false,
+        should_start_title_gen: false,
+    };
 
     for message in messages {
         if let Some(method) = message.get("method").and_then(Value::as_str) {
@@ -1655,7 +1738,11 @@ fn apply_outbound_status_updates(
                 if session.summary.agent_status == protocol::AgentStatus::Busy {
                     restart_stall_timer(state, session);
                 } else if session.summary.agent_status == protocol::AgentStatus::Stalled {
-                    apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
+                    apply_status_transition(
+                        session,
+                        protocol::AgentStatus::Busy,
+                        &mut result.transitions,
+                    );
                     restart_stall_timer(state, session);
                 }
             }
@@ -1675,13 +1762,227 @@ fn apply_outbound_status_updates(
         // Detect injection turn completion
         if session.injection_prompt_id.as_deref() == Some(&id) {
             session.injection_prompt_id = None;
-            injection_completed = true;
+            result.injection_completed = true;
         }
 
-        reset_status_tracking(session, &mut transitions);
+        reset_status_tracking(session, &mut result.transitions);
+
+        // Detect first user turn completion → trigger title generation
+        if !result.injection_completed
+            && session.user_prompt_count > 0
+            && session.title_gen.is_none()
+            && session.first_prompt_text.is_some()
+            && session.summary.parent_session_id.is_none()
+        {
+            result.should_start_title_gen = true;
+        }
     }
 
-    (transitions, injection_completed)
+    result
+}
+
+/// Request to send to the agent process after releasing the chat lock.
+struct TitleAcpRequest {
+    request_id: u64,
+    method: &'static str,
+    params: Value,
+}
+
+/// Filters title-session messages from `messages` (removing them so they don't fan out),
+/// advances the title state machine, and returns any ACP request to send + completed title.
+fn process_title_messages(
+    session: &mut ChatSessionRuntime,
+    messages: &mut Vec<Value>,
+) -> (Option<TitleAcpRequest>, Option<String>) {
+    if session.title_gen.is_none() {
+        return (None, None);
+    }
+
+    // Determine the title session's ACP ID (if we have one yet)
+    let title_session_id = match &session.title_gen.as_ref().unwrap().state {
+        TitleGenState::Collecting { session_id, .. }
+        | TitleGenState::SettingModel { session_id, .. } => Some(session_id.clone()),
+        TitleGenState::CreatingSession { .. } => None,
+    };
+
+    // Filter out notifications belonging to the title session (collect text chunks)
+    if let Some(ref tsid) = title_session_id {
+        let tg = session.title_gen.as_mut().unwrap();
+        messages.retain(|msg| {
+            let sid = msg
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if sid != tsid {
+                return true;
+            }
+            if msg
+                .pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("agent_message_chunk")
+            {
+                if let Some(text) = msg
+                    .pointer("/params/update/content/text")
+                    .and_then(Value::as_str)
+                {
+                    tg.text_chunks.push(text.to_owned());
+                }
+            }
+            false
+        });
+    }
+
+    // Check for responses that advance the title state machine
+    let mut action: Option<TitleAcpRequest> = None;
+    let mut completed_title: Option<String> = None;
+    let mut clear_title_gen = false;
+    let first_prompt = session.first_prompt_text.clone().unwrap_or_default();
+
+    // Extract current state info before the retain closure
+    let state_snapshot = {
+        let tg = session.title_gen.as_ref().unwrap();
+        match &tg.state {
+            TitleGenState::CreatingSession { request_id } => {
+                (0u8, request_id.clone(), String::new())
+            }
+            TitleGenState::SettingModel {
+                session_id,
+                request_id,
+            } => (1, request_id.clone(), session_id.clone()),
+            TitleGenState::Collecting {
+                session_id: _,
+                request_id,
+            } => (2, request_id.clone(), String::new()),
+        }
+    };
+    let (state_kind, expected_id, setting_model_sid) = state_snapshot;
+
+    messages.retain(|msg| {
+        if !(msg.get("result").is_some() || msg.get("error").is_some()) {
+            return true;
+        }
+        let Some(id) = request_id_key(msg.get("id")) else {
+            return true;
+        };
+        if id != expected_id {
+            return true;
+        }
+
+        match state_kind {
+            // CreatingSession
+            0 => {
+                if let Some(result) = msg.get("result") {
+                    let new_sid = result
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+
+                    let small_model = result
+                        .pointer("/models/availableModels")
+                        .and_then(Value::as_array)
+                        .and_then(pick_small_model);
+
+                    if let Some(model_id) = small_model {
+                        let req_id = injection_request_id();
+                        action = Some(TitleAcpRequest {
+                            request_id: req_id,
+                            method: "session/setModel",
+                            params: json!({
+                                "sessionId": new_sid,
+                                "modelId": model_id,
+                            }),
+                        });
+                        // State update deferred below
+                    } else {
+                        let req_id = injection_request_id();
+                        let prompt =
+                            format!("{TITLE_SYSTEM_PROMPT}\n\nUser message:\n{first_prompt}");
+                        action = Some(TitleAcpRequest {
+                            request_id: req_id,
+                            method: CHAT_PROMPT_METHOD,
+                            params: json!({
+                                "sessionId": new_sid,
+                                "prompt": [{ "type": "text", "text": prompt }],
+                            }),
+                        });
+                    }
+                } else {
+                    tracing::warn!("title generation: session/new failed");
+                    clear_title_gen = true;
+                }
+                false
+            }
+            // SettingModel
+            1 => {
+                let req_id = injection_request_id();
+                let prompt = format!("{TITLE_SYSTEM_PROMPT}\n\nUser message:\n{first_prompt}");
+                action = Some(TitleAcpRequest {
+                    request_id: req_id,
+                    method: CHAT_PROMPT_METHOD,
+                    params: json!({
+                        "sessionId": setting_model_sid,
+                        "prompt": [{ "type": "text", "text": prompt }],
+                    }),
+                });
+                false
+            }
+            // Collecting
+            2 => {
+                // Will extract title after retain
+                false
+            }
+            _ => true,
+        }
+    });
+
+    // Apply deferred state updates
+    if clear_title_gen {
+        session.title_gen = None;
+        return (None, None);
+    }
+
+    if let Some(ref act) = action {
+        let tg = session.title_gen.as_mut().unwrap();
+        // Determine the new session_id from the action params
+        let new_sid = act
+            .params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let new_req_id = act.request_id.to_string();
+        if act.method == "session/setModel" {
+            tg.state = TitleGenState::SettingModel {
+                session_id: new_sid,
+                request_id: new_req_id,
+            };
+        } else {
+            tg.state = TitleGenState::Collecting {
+                session_id: new_sid,
+                request_id: new_req_id,
+            };
+        }
+    } else if state_kind == 2 {
+        // Collecting state and we matched the response — extract title
+        let tg = session.title_gen.as_ref().unwrap();
+        let raw = tg.text_chunks.join("");
+        let title = raw
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let title = if title.len() > 100 {
+            &title[..title.floor_char_boundary(100)]
+        } else {
+            title
+        };
+        if !title.is_empty() {
+            completed_title = Some(title.to_owned());
+        }
+    }
+
+    (action, completed_title)
 }
 
 fn apply_worker_update(session: &mut ChatSessionRuntime, params: Option<&Value>) {
@@ -1836,18 +2137,34 @@ fn rewrite_session_id(payload: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
 }
 
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
-    let (targets, history_path, updates, transitions, injection_completed, thread_id) = {
+    let (
+        targets,
+        history_path,
+        updates,
+        transitions,
+        injection_completed,
+        thread_id,
+        should_start_title_gen,
+        title_action,
+        title_complete,
+        input_tx,
+    ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
-        let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let mut messages =
+            extract_json_messages(&mut session.output_buffer, payload, "output");
+
+        // Filter title-session messages before normal processing
+        let (title_action, title_complete) = process_title_messages(session, &mut messages);
+
         let updates = collect_session_update_params(&messages);
-        let (transitions, injection_completed) =
-            apply_outbound_status_updates(&state, session, messages);
+        let outbound = apply_outbound_status_updates(&state, session, messages);
         let thread_id = session.thread_id.clone();
         let history_path = session.history_path.clone();
+        let input_tx = session.input_tx.clone();
         let attached_channels = session
             .attached_channels
             .iter()
@@ -1868,9 +2185,13 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             targets,
             history_path,
             updates,
-            transitions,
-            injection_completed,
+            outbound.transitions,
+            outbound.injection_completed,
             thread_id,
+            outbound.should_start_title_gen,
+            title_action,
+            title_complete,
+            input_tx,
         )
     };
 
@@ -1939,7 +2260,90 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
     }
 
     if !dead_channels.is_empty() {
-        detach_channels(state, dead_channels).await;
+        detach_channels(Arc::clone(&state), dead_channels).await;
+    }
+
+    // --- Title generation: ephemeral session on the same agent process ---
+
+    // Start title generation by sending session/new
+    if should_start_title_gen {
+        if let Some(ref input_tx) = input_tx {
+            let cwd = {
+                let store = state.store.lock().await;
+                store
+                    .data
+                    .threads
+                    .iter()
+                    .find(|t| t.id == thread_id)
+                    .map(|t| t.worktree_path.clone())
+                    .unwrap_or_default()
+            };
+            if !cwd.is_empty() {
+                let req_id = injection_request_id();
+                if send_acp_request(
+                    input_tx,
+                    req_id,
+                    "session/new",
+                    json!({ "cwd": cwd, "mcpServers": [] }),
+                )
+                .await
+                .is_ok()
+                {
+                    let mut chat = state.chat.lock().await;
+                    if let Some(session) = chat.sessions.get_mut(session_id) {
+                        session.title_gen = Some(TitleGeneration {
+                            state: TitleGenState::CreatingSession {
+                                request_id: req_id.to_string(),
+                            },
+                            text_chunks: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Send follow-up ACP request for title state machine (setModel or prompt)
+    if let Some(action) = title_action {
+        if let Some(ref input_tx) = input_tx {
+            if let Err(err) =
+                send_acp_request(input_tx, action.request_id, action.method, action.params).await
+            {
+                tracing::warn!(session_id, error = %err, "title generation: failed to send {}", action.method);
+                let mut chat = state.chat.lock().await;
+                if let Some(session) = chat.sessions.get_mut(session_id) {
+                    session.title_gen = None;
+                }
+            }
+        }
+    }
+
+    // Title generation complete — persist and emit delta
+    if let Some(title) = title_complete {
+        tracing::info!(session_id, %title, "title generated for thread");
+
+        // Update session summary title
+        {
+            let mut chat = state.chat.lock().await;
+            if let Some(session) = chat.sessions.get_mut(session_id) {
+                session.summary.title = Some(title.clone());
+                session.title_gen = None;
+            }
+        }
+
+        // Persist display_name on the thread
+        {
+            let mut store = state.store.lock().await;
+            if let Some(thread) = store.data.threads.iter_mut().find(|t| t.id == thread_id) {
+                thread.display_name = Some(title);
+            }
+            if let Err(err) = store.save() {
+                tracing::warn!(error = %err, "failed to save state store after title update");
+            }
+        }
+
+        // Emit chat.session_updated delta so Threadmill picks up the title
+        emit_state_delta_updated(&state, &thread_id, session_id).await;
     }
 }
 
@@ -3136,6 +3540,9 @@ fn discover_history_sessions(
                 models: None,
                 config_options: None,
                 injection_prompt_id: None,
+                user_prompt_count: 0,
+                first_prompt_text: None,
+                title_gen: None,
             });
         }
     }
@@ -3319,18 +3726,18 @@ mod tests {
                     path: "/tmp/project".to_string(),
                     default_branch: "main".to_string(),
                 }],
-                threads: vec![Thread {
-                    id: "thread-1".to_string(),
-                    project_id: "project-1".to_string(),
-                    name: "thread".to_string(),
-                    branch: "main".to_string(),
-                    worktree_path: "/tmp/project".to_string(),
-                    status: protocol::ThreadStatus::Active,
-                    source_type: protocol::SourceType::ExistingBranch,
-                    created_at: Utc::now(),
-                    tmux_session: "tm_test".to_string(),
-                    port_offset: 0,
-                }],
+                threads: vec![Thread::new(
+                    "thread-1".to_string(),
+                    "project-1".to_string(),
+                    "thread".to_string(),
+                    "main".to_string(),
+                    "/tmp/project".to_string(),
+                    protocol::ThreadStatus::Active,
+                    protocol::SourceType::ExistingBranch,
+                    Utc::now(),
+                    "tm_test".to_string(),
+                    0,
+                )],
             },
         }))
     }
@@ -3378,6 +3785,9 @@ mod tests {
             injection_prompt_id: None,
             stall_generation: 0,
             stall_task: None,
+            user_prompt_count: 0,
+            first_prompt_text: None,
+            title_gen: None,
         }
     }
 
@@ -3923,18 +4333,18 @@ mod tests {
                     path: "/tmp/project".to_string(),
                     default_branch: "main".to_string(),
                 }],
-                threads: vec![Thread {
-                    id: thread_id.clone(),
-                    project_id: "project-1".to_string(),
-                    name: "thread".to_string(),
-                    branch: "main".to_string(),
-                    worktree_path: "/tmp/project".to_string(),
-                    status: protocol::ThreadStatus::Closed,
-                    source_type: protocol::SourceType::ExistingBranch,
-                    created_at: Utc::now(),
-                    tmux_session: "tm_test".to_string(),
-                    port_offset: 0,
-                }],
+                threads: vec![Thread::new(
+                    thread_id.clone(),
+                    "project-1".to_string(),
+                    "thread".to_string(),
+                    "main".to_string(),
+                    "/tmp/project".to_string(),
+                    protocol::ThreadStatus::Closed,
+                    protocol::SourceType::ExistingBranch,
+                    Utc::now(),
+                    "tm_test".to_string(),
+                    0,
+                )],
             },
         }));
 
@@ -3992,18 +4402,18 @@ mod tests {
                     path: "/tmp/project".to_string(),
                     default_branch: "main".to_string(),
                 }],
-                threads: vec![Thread {
-                    id: thread_id.clone(),
-                    project_id: "project-1".to_string(),
-                    name: "thread".to_string(),
-                    branch: "main".to_string(),
-                    worktree_path: "/tmp/project".to_string(),
-                    status: protocol::ThreadStatus::Closed,
-                    source_type: protocol::SourceType::ExistingBranch,
-                    created_at: Utc::now(),
-                    tmux_session: "tm_test".to_string(),
-                    port_offset: 0,
-                }],
+                threads: vec![Thread::new(
+                    thread_id.clone(),
+                    "project-1".to_string(),
+                    "thread".to_string(),
+                    "main".to_string(),
+                    "/tmp/project".to_string(),
+                    protocol::ThreadStatus::Closed,
+                    protocol::SourceType::ExistingBranch,
+                    Utc::now(),
+                    "tm_test".to_string(),
+                    0,
+                )],
             },
         }));
 
@@ -4055,18 +4465,18 @@ mod tests {
                     path: "/tmp/project".to_string(),
                     default_branch: "main".to_string(),
                 }],
-                threads: vec![Thread {
-                    id: thread_id.clone(),
-                    project_id: "project-1".to_string(),
-                    name: "thread".to_string(),
-                    branch: "main".to_string(),
-                    worktree_path: "/tmp/project".to_string(),
-                    status: protocol::ThreadStatus::Closed,
-                    source_type: protocol::SourceType::ExistingBranch,
-                    created_at: Utc::now(),
-                    tmux_session: "tm_test".to_string(),
-                    port_offset: 0,
-                }],
+                threads: vec![Thread::new(
+                    thread_id.clone(),
+                    "project-1".to_string(),
+                    "thread".to_string(),
+                    "main".to_string(),
+                    "/tmp/project".to_string(),
+                    protocol::ThreadStatus::Closed,
+                    protocol::SourceType::ExistingBranch,
+                    Utc::now(),
+                    "tm_test".to_string(),
+                    0,
+                )],
             },
         }));
 
@@ -4122,7 +4532,7 @@ mod tests {
         let mut session = make_test_session();
         session.summary.agent_status = protocol::AgentStatus::Busy;
 
-        let (started, _) = apply_outbound_status_updates(
+        let OutboundResult { transitions: started, .. } = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({
@@ -4134,7 +4544,7 @@ mod tests {
         assert!(started.is_empty());
         assert_eq!(session.summary.worker_count, 1);
 
-        let (completed, _) = apply_outbound_status_updates(
+        let OutboundResult { transitions: completed, .. } = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({
@@ -4158,7 +4568,7 @@ mod tests {
         session.active_tools.insert("tool-1".to_string());
         session.summary.worker_count = 1;
 
-        let (transitions, _) = apply_outbound_status_updates(
+        let OutboundResult { transitions, .. } = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}})],
@@ -4179,7 +4589,7 @@ mod tests {
         let mut session = make_test_session();
         session.summary.agent_status = protocol::AgentStatus::Stalled;
 
-        let (transitions, _) = apply_outbound_status_updates(
+        let OutboundResult { transitions, .. } = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![
@@ -4332,18 +4742,18 @@ mod tests {
                     path: "/tmp/project".to_string(),
                     default_branch: "main".to_string(),
                 }],
-                threads: vec![Thread {
-                    id: thread_id.clone(),
-                    project_id: "project-1".to_string(),
-                    name: "thread".to_string(),
-                    branch: "main".to_string(),
-                    worktree_path: "/tmp/project".to_string(),
-                    status: protocol::ThreadStatus::Closed,
-                    source_type: protocol::SourceType::ExistingBranch,
-                    created_at: Utc::now(),
-                    tmux_session: "tm_test".to_string(),
-                    port_offset: 0,
-                }],
+                threads: vec![Thread::new(
+                    thread_id.clone(),
+                    "project-1".to_string(),
+                    "thread".to_string(),
+                    "main".to_string(),
+                    "/tmp/project".to_string(),
+                    protocol::ThreadStatus::Closed,
+                    protocol::SourceType::ExistingBranch,
+                    Utc::now(),
+                    "tm_test".to_string(),
+                    0,
+                )],
             },
         }));
 

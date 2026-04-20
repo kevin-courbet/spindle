@@ -74,6 +74,8 @@ pub struct Thread {
     pub port_offset: u16,
     #[serde(default)]
     pub chat_sessions: Vec<ChatSessionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

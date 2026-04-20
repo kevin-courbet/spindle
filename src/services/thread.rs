@@ -144,18 +144,18 @@ impl ThreadService {
             let config = load_threadmill_config(&worktree_path, &project.path)?;
             let port_offset = store.allocate_port_offset(&project.id, config.ports.offset)?;
 
-            let thread = Thread {
-                id: Uuid::new_v4().to_string(),
-                project_id: project.id.clone(),
-                name: thread_name,
+            let thread = Thread::new(
+                Uuid::new_v4().to_string(),
+                project.id.clone(),
+                thread_name,
                 branch,
                 worktree_path,
-                status: protocol::ThreadStatus::Creating,
-                source_type: params.source_type.clone(),
-                created_at: Utc::now(),
+                protocol::ThreadStatus::Creating,
+                params.source_type.clone(),
+                Utc::now(),
                 tmux_session,
                 port_offset,
-            };
+            );
 
             let protocol_thread = thread.to_protocol();
             store.data.threads.push(thread.clone());

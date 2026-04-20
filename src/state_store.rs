@@ -43,6 +43,8 @@ pub struct Thread {
     pub tmux_session: String,
     #[serde(default)]
     pub port_offset: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl Project {
@@ -97,6 +99,34 @@ impl Project {
 }
 
 impl Thread {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        project_id: String,
+        name: String,
+        branch: String,
+        worktree_path: String,
+        status: protocol::ThreadStatus,
+        source_type: protocol::SourceType,
+        created_at: DateTime<Utc>,
+        tmux_session: String,
+        port_offset: u16,
+    ) -> Self {
+        Self {
+            id,
+            project_id,
+            name,
+            branch,
+            worktree_path,
+            status,
+            source_type,
+            created_at,
+            tmux_session,
+            port_offset,
+            display_name: None,
+        }
+    }
+
     pub fn to_protocol(&self) -> protocol::Thread {
         protocol::Thread {
             id: self.id.clone(),
@@ -110,6 +140,7 @@ impl Thread {
             tmux_session: self.tmux_session.clone(),
             port_offset: self.port_offset,
             chat_sessions: Vec::new(),
+            display_name: self.display_name.clone(),
         }
     }
 }
