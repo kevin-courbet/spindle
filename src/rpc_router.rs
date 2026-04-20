@@ -401,6 +401,12 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("chat.status", message))?;
             to_value("chat.status", result)
         }
+        RequestDispatch::ChatFork(params) => {
+            let result = ChatService::fork(state, params)
+                .await
+                .map_err(|message| map_service_error("chat.fork", message))?;
+            to_value("chat.fork", result)
+        }
         RequestDispatch::WorkflowCreate(params) => {
             let result = WorkflowService::create(state, params)
                 .await

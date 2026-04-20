@@ -1618,6 +1618,21 @@ pub struct ChatStartResult {
 pub type ChatLoadResult = ChatStartResult;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatForkParams {
+    pub thread_id: String,
+    pub source_session_id: String,
+    pub message_cursor: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatForkResult {
+    pub session_id: String,
+    pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatStopResult {
     pub archived: bool,
 }
@@ -1741,6 +1756,7 @@ pub const METHOD_CHAT_ATTACH: &str = "chat.attach";
 pub const METHOD_CHAT_DETACH: &str = "chat.detach";
 pub const METHOD_CHAT_HISTORY: &str = "chat.history";
 pub const METHOD_CHAT_STATUS: &str = "chat.status";
+pub const METHOD_CHAT_FORK: &str = "chat.fork";
 pub const METHOD_WORKFLOW_CREATE: &str = "workflow.create";
 pub const METHOD_WORKFLOW_STATUS: &str = "workflow.status";
 pub const METHOD_WORKFLOW_LIST: &str = "workflow.list";
@@ -1889,6 +1905,7 @@ pub enum RequestDispatch {
     ChatHistory(ChatHistoryParams),
     #[serde(rename = "chat.status")]
     ChatStatus(ChatStatusParams),
+    ChatFork(ChatForkParams),
     #[serde(rename = "workflow.create")]
     WorkflowCreate(WorkflowCreateParams),
     #[serde(rename = "workflow.status")]
@@ -2077,6 +2094,9 @@ pub fn parse_request_dispatch(
         METHOD_CHAT_STATUS => serde_json::from_value::<ChatStatusParams>(params)
             .map(RequestDispatch::ChatStatus)
             .map_err(|err| format!("invalid chat.status params: {err}")),
+        METHOD_CHAT_FORK => serde_json::from_value::<ChatForkParams>(params)
+            .map(RequestDispatch::ChatFork)
+            .map_err(|err| format!("invalid chat.fork params: {err}")),
         METHOD_WORKFLOW_CREATE => serde_json::from_value::<WorkflowCreateParams>(params)
             .map(RequestDispatch::WorkflowCreate)
             .map_err(|err| format!("invalid workflow.create params: {err}")),

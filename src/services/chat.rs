@@ -366,6 +366,161 @@ impl ChatService {
         })
     }
 
+    /// Fork a session at a given JSONL cursor, creating a new session with conversation
+    /// context built from the source history up to that point.
+    pub async fn fork(
+        state: Arc<AppState>,
+        params: protocol::ChatForkParams,
+    ) -> Result<protocol::ChatForkResult, String> {
+        let (source_agent_type, source_display_name, history_root) = {
+            let chat = state.chat.lock().await;
+            let source = chat
+                .sessions
+                .get(&params.source_session_id)
+                .ok_or_else(|| {
+                    format!("source session not found: {}", params.source_session_id)
+                })?;
+            if source.thread_id != params.thread_id {
+                return Err(format!(
+                    "source session {} does not belong to thread {}",
+                    params.source_session_id, params.thread_id
+                ));
+            }
+            (
+                source.summary.agent_type.clone(),
+                source.display_name.clone(),
+                chat.history_root_path().to_path_buf(),
+            )
+        };
+
+        // Validate cursor against source JSONL
+        let source_path =
+            history_path_for_session(&history_root, &params.thread_id, &params.source_session_id);
+        if source_path.exists() {
+            let line_count = count_lines(&source_path)?;
+            if params.message_cursor > line_count {
+                return Err(format!(
+                    "message_cursor {} exceeds source history line count {}",
+                    params.message_cursor, line_count
+                ));
+            }
+        }
+
+        // Copy source JSONL up to cursor into new session file
+        let fork_session_id = Uuid::new_v4().to_string();
+        let fork_path =
+            history_path_for_session(&history_root, &params.thread_id, &fork_session_id);
+
+        if source_path.exists() && params.message_cursor > 0 {
+            if let Some(parent) = fork_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create fork history dir: {e}"))?;
+            }
+            let src_file = fs::File::open(&source_path)
+                .map_err(|e| format!("failed to open source history: {e}"))?;
+            let reader = BufReader::new(src_file);
+            let mut dst_file = fs::File::create(&fork_path)
+                .map_err(|e| format!("failed to create fork history: {e}"))?;
+            for (i, line) in reader.lines().enumerate() {
+                if i as u64 >= params.message_cursor {
+                    break;
+                }
+                let line = line.map_err(|e| format!("failed to read source history line: {e}"))?;
+                use std::io::Write;
+                writeln!(dst_file, "{line}")
+                    .map_err(|e| format!("failed to write fork history: {e}"))?;
+            }
+        }
+
+        // Build conversation context from the copied JSONL
+        let conversation_context = build_conversation_context(&fork_path, None);
+
+        // Generate display name with fork count
+        let fork_display_name = {
+            let chat = state.chat.lock().await;
+            let base = source_display_name
+                .as_deref()
+                .unwrap_or(&source_agent_type);
+            let existing_forks = chat
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.parent_session_id.as_deref() == Some(&params.source_session_id)
+                })
+                .count();
+            Some(format!("{base} (fork #{})", existing_forks + 1))
+        };
+
+        // Create session runtime (status: Ended — Mac will call chat.load to start agent)
+        let created_at = Utc::now().to_rfc3339();
+        {
+            let mut chat = state.chat.lock().await;
+            let runtime = ChatSessionRuntime {
+                summary: protocol::ChatSessionSummary {
+                    session_id: fork_session_id.clone(),
+                    agent_type: source_agent_type.clone(),
+                    status: protocol::ChatSessionStatus::Ended,
+                    agent_status: protocol::AgentStatus::Idle,
+                    worker_count: 0,
+                    title: None,
+                    model_id: None,
+                    created_at,
+                    display_name: fork_display_name.clone(),
+                    parent_session_id: Some(params.source_session_id.clone()),
+                },
+                thread_id: params.thread_id.clone(),
+                display_name: fork_display_name.clone(),
+                parent_session_id: Some(params.source_session_id.clone()),
+                system_prompt: None,
+                initial_prompt: None,
+                conversation_context,
+                acp_session_id: None,
+                attached_channels: HashSet::new(),
+                input_tx: None,
+                stop_tx: None,
+                status_notify: Arc::new(Notify::new()),
+                ended_emitted: false,
+                history_path: fork_path,
+                input_buffer: Vec::new(),
+                output_buffer: Vec::new(),
+                active_tools: HashSet::new(),
+                total_tool_count: 0,
+                latest_tool_name: None,
+                latest_tool_title: None,
+                started_at: None,
+                pending_prompt_ids: HashSet::new(),
+                checkpoint_seq: 0,
+                last_update_time: None,
+                stall_generation: 0,
+                stall_task: None,
+                modes: None,
+                models: None,
+                config_options: None,
+                injection_prompt_id: None,
+            };
+            chat.sessions.insert(fork_session_id.clone(), runtime);
+            chat.sessions_by_thread
+                .entry(params.thread_id.clone())
+                .or_default()
+                .push(fork_session_id.clone());
+        }
+
+        state.emit_chat_session_created(protocol::ChatSessionCreatedEvent {
+            thread_id: params.thread_id.clone(),
+            session_id: fork_session_id.clone(),
+            agent_type: source_agent_type.clone(),
+            display_name: fork_display_name.clone(),
+            parent_session_id: Some(params.source_session_id.clone()),
+        });
+        emit_state_delta_added(&state, &params.thread_id, &fork_session_id).await;
+
+        Ok(protocol::ChatForkResult {
+            session_id: fork_session_id,
+            agent_type: source_agent_type,
+            display_name: fork_display_name,
+        })
+    }
+
     pub async fn stop(
         state: Arc<AppState>,
         params: protocol::ChatStopParams,
