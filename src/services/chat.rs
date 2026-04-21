@@ -2043,6 +2043,14 @@ fn process_title_messages(
     };
     let (state_kind, expected_id, setting_model_sid) = state_snapshot;
 
+    tracing::info!(
+        session_id = %session.summary.session_id,
+        state_kind,
+        expected_id = %expected_id,
+        msg_count = messages.len(),
+        "process_title_messages checking responses"
+    );
+
     messages.retain(|msg| {
         if !(msg.get("result").is_some() || msg.get("error").is_some()) {
             return true;
@@ -2053,6 +2061,14 @@ fn process_title_messages(
         if id != expected_id {
             return true;
         }
+
+        tracing::info!(
+            %id,
+            state_kind,
+            has_result = msg.get("result").is_some(),
+            has_error = msg.get("error").is_some(),
+            "process_title_messages MATCHED response"
+        );
 
         match state_kind {
             // CreatingSession
