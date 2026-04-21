@@ -1942,13 +1942,24 @@ fn apply_outbound_status_updates(
 
         // Detect first user turn completion → trigger title generation.
         // Only for genuine new sessions (not reverted/loaded with context).
-        if !result.injection_completed
+        let title_eligible = !result.injection_completed
             && session.user_prompt_count > 0
             && session.title_gen.is_none()
             && session.first_prompt_text.is_some()
             && session.summary.parent_session_id.is_none()
-            && !session.had_conversation_context
-        {
+            && !session.had_conversation_context;
+        tracing::info!(
+            session_id = %session.summary.session_id,
+            title_eligible,
+            injection_completed = result.injection_completed,
+            user_prompt_count = session.user_prompt_count,
+            has_first_prompt = session.first_prompt_text.is_some(),
+            has_parent = session.summary.parent_session_id.is_some(),
+            had_context = session.had_conversation_context,
+            title_gen_active = session.title_gen.is_some(),
+            "title trigger check after Idle"
+        );
+        if title_eligible {
             result.should_start_title_gen = true;
         }
     }
