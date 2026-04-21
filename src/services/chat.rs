@@ -94,6 +94,8 @@ struct ChatSessionRuntime {
     first_prompt_text: Option<String>,
     /// State machine for ephemeral title generation session.
     title_gen: Option<TitleGeneration>,
+    /// True if session was created with conversation_context (revert/fork). Suppresses title gen.
+    had_conversation_context: bool,
 }
 
 /// Ephemeral ACP session for generating a thread title after the first user turn.
@@ -233,6 +235,7 @@ impl ChatService {
                 user_prompt_count: 0,
                 first_prompt_text: None,
                 title_gen: None,
+                had_conversation_context: false,
             };
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -324,6 +327,9 @@ impl ChatService {
         {
             let mut chat = state.chat.lock().await;
             if let Some(session) = chat.sessions.get_mut(&params.session_id) {
+                if conversation_context.is_some() {
+                    session.had_conversation_context = true;
+                }
                 session.conversation_context = conversation_context;
             }
         }
@@ -500,6 +506,7 @@ impl ChatService {
                 user_prompt_count: 0,
                 first_prompt_text: None,
                 title_gen: None,
+                had_conversation_context: true,
             };
             chat.sessions.insert(fork_session_id.clone(), runtime);
             chat.sessions_by_thread
@@ -584,6 +591,9 @@ impl ChatService {
             let mut chat = state.chat.lock().await;
             if let Some(session) = chat.sessions.get_mut(session_id) {
                 session.acp_session_id = None;
+                if conversation_context.is_some() {
+                    session.had_conversation_context = true;
+                }
                 session.conversation_context = conversation_context.clone();
                 true
             } else {
@@ -1844,10 +1854,15 @@ fn prepend_prompt_text_block(message: &mut Value, prompt_text: &str) -> bool {
         .entry("prompt".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
 
+    let context_block = json!({
+        "type": "text",
+        "text": prompt_text,
+        "annotations": { "audience": ["assistant"] }
+    });
     if let Some(prompt_array) = prompt.as_array_mut() {
-        prompt_array.insert(0, json!({ "type": "text", "text": prompt_text }));
+        prompt_array.insert(0, context_block);
     } else {
-        *prompt = json!([{ "type": "text", "text": prompt_text }]);
+        *prompt = Value::Array(vec![context_block]);
     }
     true
 }
@@ -1925,12 +1940,14 @@ fn apply_outbound_status_updates(
 
         reset_status_tracking(session, &mut result.transitions);
 
-        // Detect first user turn completion → trigger title generation
+        // Detect first user turn completion → trigger title generation.
+        // Only for genuine new sessions (not reverted/loaded with context).
         if !result.injection_completed
             && session.user_prompt_count > 0
             && session.title_gen.is_none()
             && session.first_prompt_text.is_some()
             && session.summary.parent_session_id.is_none()
+            && !session.had_conversation_context
         {
             result.should_start_title_gen = true;
         }
@@ -2306,6 +2323,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         title_action,
         title_complete,
         input_tx,
+        filtered_payload,
     ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
@@ -2316,7 +2334,14 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             extract_json_messages(&mut session.output_buffer, payload, "output");
 
         // Filter title-session messages before normal processing
+        let msg_count_before = messages.len();
         let (title_action, title_complete) = process_title_messages(session, &mut messages);
+        // If messages were filtered, rebuild payload so title data doesn't leak to clients
+        let filtered_payload = if messages.len() < msg_count_before {
+            serialize_json_messages(&messages)
+        } else {
+            None
+        };
 
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
@@ -2350,6 +2375,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             title_action,
             title_complete,
             input_tx,
+            filtered_payload,
         )
     };
 
@@ -2383,12 +2409,15 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         }
     }
 
+    // Use filtered payload (title messages removed) or raw payload
+    let base_payload = filtered_payload.as_deref().unwrap_or(payload);
+
     // Rewrite ACP session ID to Spindle session ID in outbound payload
     let rewritten_payload = {
         let chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get(session_id) {
             if let Some(ref acp_id) = session.acp_session_id {
-                rewrite_session_id(payload, acp_id, session_id)
+                rewrite_session_id(base_payload, acp_id, session_id)
             } else {
                 None
             }
@@ -2396,7 +2425,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             None
         }
     };
-    let out_payload = rewritten_payload.as_deref().unwrap_or(payload);
+    let out_payload = rewritten_payload.as_deref().unwrap_or(base_payload);
 
     if let Ok(s) = std::str::from_utf8(out_payload) {
         warn!(
@@ -3701,6 +3730,7 @@ fn discover_history_sessions(
                 user_prompt_count: 0,
                 first_prompt_text: None,
                 title_gen: None,
+                had_conversation_context: false,
             });
         }
     }
@@ -3946,6 +3976,7 @@ mod tests {
             user_prompt_count: 0,
             first_prompt_text: None,
             title_gen: None,
+            had_conversation_context: false,
         }
     }
 
@@ -4020,7 +4051,8 @@ mod tests {
             json!([
                 {
                     "type": "text",
-                    "text": "prior context\n\n---\n\n"
+                    "text": "prior context\n\n---\n\n",
+                    "annotations": { "audience": ["assistant"] }
                 },
                 {"type": "text", "text": "first block"},
                 {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}},
@@ -4101,7 +4133,8 @@ mod tests {
             json!([
                 {
                     "type": "text",
-                    "text": "prior context\n\n---\n\n"
+                    "text": "prior context\n\n---\n\n",
+                    "annotations": { "audience": ["assistant"] }
                 },
                 {"type": "text", "text": "new prompt"}
             ])
@@ -4227,7 +4260,8 @@ mod tests {
             json!([
                 {
                     "type": "text",
-                    "text": "prior context\n\n---\n\n"
+                    "text": "prior context\n\n---\n\n",
+                    "annotations": { "audience": ["assistant"] }
                 },
                 {"type": "image", "source": {"mediaType": "image/png", "data": "abc"}}
             ])
@@ -5024,6 +5058,7 @@ mod tests {
                 user_prompt_count: 0,
                 first_prompt_text: None,
                 title_gen: None,
+                had_conversation_context: false,
             };
             chat.sessions
                 .insert(source_session_id.to_string(), runtime);
