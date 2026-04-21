@@ -123,10 +123,15 @@ Generate a brief title for this conversation.\n\
 - Focus on WHAT the user wants to do\n\
 - Never use tools";
 
-const SMALL_MODEL_PATTERNS: &[&str] = &["haiku", "flash", "nano", "mini", "gpt-4o-mini"];
-
-fn pick_small_model(models: &Vec<Value>) -> Option<String> {
-    for pattern in SMALL_MODEL_PATTERNS {
+fn pick_small_model(models: &Vec<Value>, agent_type: &str) -> Option<String> {
+    let patterns: &[&str] = match agent_type {
+        "claude" => &["haiku"],
+        "codex" => &["-mini", "-nano"],
+        "gemini" => &["flash"],
+        // opencode: anthropic auth unavailable through opencode provider
+        _ => &["-nano", "-mini", "flash"],
+    };
+    for pattern in patterns {
         for model in models {
             if let Some(id) = model.get("modelId").and_then(Value::as_str) {
                 if id.to_lowercase().contains(pattern) {
@@ -2100,10 +2105,11 @@ fn process_title_messages(
                         .unwrap_or_default()
                         .to_owned();
 
+                    let agent_type = session.summary.agent_type.as_str();
                     let small_model = result
                         .pointer("/models/availableModels")
                         .and_then(Value::as_array)
-                        .and_then(pick_small_model);
+                        .and_then(|m| pick_small_model(m, agent_type));
 
                     if let Some(model_id) = small_model {
                         let req_id = injection_request_id();
