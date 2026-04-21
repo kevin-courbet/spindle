@@ -1959,9 +1959,10 @@ fn apply_outbound_status_updates(
             title_gen_active = session.title_gen.is_some(),
             "title trigger check after Idle"
         );
-        if title_eligible {
-            result.should_start_title_gen = true;
-        }
+        // Title generation via ephemeral session disabled — response buffering
+        // issue causes the prompt response to never arrive after streaming completes.
+        // TODO: switch to agent-native title (sessionInfoUpdate) or polling approach.
+        let _ = title_eligible;
     }
 
     result
