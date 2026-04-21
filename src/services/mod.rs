@@ -9,6 +9,7 @@ pub mod preset;
 pub mod project;
 pub mod terminal;
 pub mod thread;
+pub mod title;
 pub mod workflow;
 
 pub fn sanitize_name(value: &str) -> String {

@@ -42,6 +42,7 @@ pub struct AppState {
     pub workflows: Arc<Mutex<services::workflow::WorkflowStore>>,
     pub chat: Arc<Mutex<services::chat::ChatState>>,
     pub create_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    pub title: Arc<services::title::TitleService>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +70,7 @@ impl AppState {
             workflows: Arc::new(Mutex::new(workflows)),
             chat: Arc::new(Mutex::new(services::chat::ChatState::new(history_root))),
             create_tasks: Arc::new(Mutex::new(HashMap::new())),
+            title: Arc::new(services::title::TitleService::new()),
         }
     }
 

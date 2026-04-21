@@ -92,55 +92,8 @@ struct ChatSessionRuntime {
     user_prompt_count: u32,
     /// Text of the first user prompt, captured for title generation.
     first_prompt_text: Option<String>,
-    /// State machine for ephemeral title generation session.
-    title_gen: Option<TitleGeneration>,
     /// True if session was created with conversation_context (revert/fork). Suppresses title gen.
     had_conversation_context: bool,
-}
-
-/// Ephemeral ACP session for generating a thread title after the first user turn.
-struct TitleGeneration {
-    state: TitleGenState,
-    text_chunks: Vec<String>,
-}
-
-enum TitleGenState {
-    /// session/new sent on the same agent process, awaiting response.
-    CreatingSession { request_id: String },
-    /// session/setModel sent to switch to a small model, awaiting response.
-    SettingModel { session_id: String, request_id: String },
-    /// session/prompt sent with title system prompt, collecting agent_message_chunk notifications.
-    Collecting { session_id: String, request_id: String },
-}
-
-const TITLE_SYSTEM_PROMPT: &str = "\
-You are a title generator. Output ONLY a thread title. Nothing else.\n\
-Generate a brief title for this conversation.\n\
-- Single line, ≤50 characters, no explanations\n\
-- Same language as the user message\n\
-- Keep technical terms, filenames, numbers exact\n\
-- Remove articles (the, a, an)\n\
-- Focus on WHAT the user wants to do\n\
-- Never use tools";
-
-fn pick_small_model(models: &Vec<Value>, agent_type: &str) -> Option<String> {
-    let patterns: &[&str] = match agent_type {
-        "claude" => &["haiku"],
-        "codex" => &["-mini", "-nano"],
-        "gemini" => &["flash"],
-        // opencode: anthropic auth unavailable through opencode provider
-        _ => &["-nano", "-mini", "flash"],
-    };
-    for pattern in patterns {
-        for model in models {
-            if let Some(id) = model.get("modelId").and_then(Value::as_str) {
-                if id.to_lowercase().contains(pattern) {
-                    return Some(id.to_owned());
-                }
-            }
-        }
-    }
-    None
 }
 
 impl ChatState {
@@ -239,7 +192,6 @@ impl ChatService {
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
-                title_gen: None,
                 had_conversation_context: false,
             };
             chat.sessions.insert(session_id.clone(), runtime);
@@ -510,7 +462,6 @@ impl ChatService {
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
-                title_gen: None,
                 had_conversation_context: true,
             };
             chat.sessions.insert(fork_session_id.clone(), runtime);
@@ -1947,270 +1898,18 @@ fn apply_outbound_status_updates(
 
         // Detect first user turn completion → trigger title generation.
         // Only for genuine new sessions (not reverted/loaded with context).
-        let title_eligible = !result.injection_completed
+        if !result.injection_completed
             && session.user_prompt_count > 0
-            && session.title_gen.is_none()
             && session.first_prompt_text.is_some()
             && session.summary.parent_session_id.is_none()
-            && !session.had_conversation_context;
-        tracing::info!(
-            session_id = %session.summary.session_id,
-            title_eligible,
-            injection_completed = result.injection_completed,
-            user_prompt_count = session.user_prompt_count,
-            has_first_prompt = session.first_prompt_text.is_some(),
-            has_parent = session.summary.parent_session_id.is_some(),
-            had_context = session.had_conversation_context,
-            title_gen_active = session.title_gen.is_some(),
-            "title trigger check after Idle"
-        );
-        // Title generation via ephemeral session disabled — response buffering
-        // issue causes the prompt response to never arrive after streaming completes.
-        // TODO: switch to agent-native title (sessionInfoUpdate) or polling approach.
-        let _ = title_eligible;
+            && !session.had_conversation_context
+            && session.summary.title.is_none()
+        {
+            result.should_start_title_gen = true;
+        }
     }
 
     result
-}
-
-/// Request to send to the agent process after releasing the chat lock.
-struct TitleAcpRequest {
-    request_id: u64,
-    method: &'static str,
-    params: Value,
-}
-
-/// Filters title-session messages from `messages` (removing them so they don't fan out),
-/// advances the title state machine, and returns any ACP request to send + completed title.
-fn process_title_messages(
-    session: &mut ChatSessionRuntime,
-    messages: &mut Vec<Value>,
-) -> (Option<TitleAcpRequest>, Option<String>) {
-    if session.title_gen.is_none() {
-        return (None, None);
-    }
-
-    // Determine the title session's ACP ID (if we have one yet)
-    let title_session_id = match &session.title_gen.as_ref().unwrap().state {
-        TitleGenState::Collecting { session_id, .. }
-        | TitleGenState::SettingModel { session_id, .. } => Some(session_id.clone()),
-        TitleGenState::CreatingSession { .. } => None,
-    };
-
-    // Filter out notifications belonging to the title session (collect text chunks)
-    if let Some(ref tsid) = title_session_id {
-        let tg = session.title_gen.as_mut().unwrap();
-        messages.retain(|msg| {
-            let sid = msg
-                .pointer("/params/sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if sid != tsid {
-                return true;
-            }
-            if msg
-                .pointer("/params/update/sessionUpdate")
-                .and_then(Value::as_str)
-                == Some("agent_message_chunk")
-            {
-                if let Some(text) = msg
-                    .pointer("/params/update/content/text")
-                    .and_then(Value::as_str)
-                {
-                    tg.text_chunks.push(text.to_owned());
-                }
-            }
-            false
-        });
-    }
-
-    // Check for responses that advance the title state machine
-    let mut action: Option<TitleAcpRequest> = None;
-    let mut completed_title: Option<String> = None;
-    let mut clear_title_gen = false;
-    let first_prompt = session.first_prompt_text.clone().unwrap_or_default();
-
-    // Extract current state info before the retain closure
-    let state_snapshot = {
-        let tg = session.title_gen.as_ref().unwrap();
-        match &tg.state {
-            TitleGenState::CreatingSession { request_id } => {
-                (0u8, request_id.clone(), String::new())
-            }
-            TitleGenState::SettingModel {
-                session_id,
-                request_id,
-            } => (1, request_id.clone(), session_id.clone()),
-            TitleGenState::Collecting {
-                session_id: _,
-                request_id,
-            } => (2, request_id.clone(), String::new()),
-        }
-    };
-    let (state_kind, expected_id, setting_model_sid) = state_snapshot;
-
-    tracing::info!(
-        session_id = %session.summary.session_id,
-        state_kind,
-        expected_id = %expected_id,
-        msg_count = messages.len(),
-        "process_title_messages checking responses"
-    );
-
-    // Log all remaining messages to see if the response is present
-    for (i, msg) in messages.iter().enumerate() {
-        let has_result = msg.get("result").is_some();
-        let has_error = msg.get("error").is_some();
-        let msg_id = request_id_key(msg.get("id")).unwrap_or_default();
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or("-");
-        if has_result || has_error || !msg_id.is_empty() {
-            tracing::info!(
-                i,
-                %msg_id,
-                method,
-                has_result,
-                has_error,
-                %expected_id,
-                "process_title_messages: message in vec"
-            );
-        }
-    }
-
-    messages.retain(|msg| {
-        if !(msg.get("result").is_some() || msg.get("error").is_some()) {
-            return true;
-        }
-        let Some(id) = request_id_key(msg.get("id")) else {
-            return true;
-        };
-        if id != expected_id {
-            return true;
-        }
-
-        tracing::info!(
-            %id,
-            state_kind,
-            has_result = msg.get("result").is_some(),
-            has_error = msg.get("error").is_some(),
-            "process_title_messages MATCHED response"
-        );
-
-        match state_kind {
-            // CreatingSession
-            0 => {
-                if let Some(result) = msg.get("result") {
-                    let new_sid = result
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-
-                    let agent_type = session.summary.agent_type.as_str();
-                    let small_model = result
-                        .pointer("/models/availableModels")
-                        .and_then(Value::as_array)
-                        .and_then(|m| pick_small_model(m, agent_type));
-
-                    if let Some(model_id) = small_model {
-                        let req_id = injection_request_id();
-                        action = Some(TitleAcpRequest {
-                            request_id: req_id,
-                            method: "session/setModel",
-                            params: json!({
-                                "sessionId": new_sid,
-                                "modelId": model_id,
-                            }),
-                        });
-                        // State update deferred below
-                    } else {
-                        let req_id = injection_request_id();
-                        let prompt =
-                            format!("{TITLE_SYSTEM_PROMPT}\n\nUser message:\n{first_prompt}");
-                        action = Some(TitleAcpRequest {
-                            request_id: req_id,
-                            method: CHAT_PROMPT_METHOD,
-                            params: json!({
-                                "sessionId": new_sid,
-                                "prompt": [{ "type": "text", "text": prompt }],
-                            }),
-                        });
-                    }
-                } else {
-                    tracing::warn!("title generation: session/new failed");
-                    clear_title_gen = true;
-                }
-                false
-            }
-            // SettingModel
-            1 => {
-                let req_id = injection_request_id();
-                let prompt = format!("{TITLE_SYSTEM_PROMPT}\n\nUser message:\n{first_prompt}");
-                action = Some(TitleAcpRequest {
-                    request_id: req_id,
-                    method: CHAT_PROMPT_METHOD,
-                    params: json!({
-                        "sessionId": setting_model_sid,
-                        "prompt": [{ "type": "text", "text": prompt }],
-                    }),
-                });
-                false
-            }
-            // Collecting
-            2 => {
-                // Will extract title after retain
-                false
-            }
-            _ => true,
-        }
-    });
-
-    // Apply deferred state updates
-    if clear_title_gen {
-        session.title_gen = None;
-        return (None, None);
-    }
-
-    if let Some(ref act) = action {
-        let tg = session.title_gen.as_mut().unwrap();
-        // Determine the new session_id from the action params
-        let new_sid = act
-            .params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let new_req_id = act.request_id.to_string();
-        if act.method == "session/setModel" {
-            tg.state = TitleGenState::SettingModel {
-                session_id: new_sid,
-                request_id: new_req_id,
-            };
-        } else {
-            tg.state = TitleGenState::Collecting {
-                session_id: new_sid,
-                request_id: new_req_id,
-            };
-        }
-    } else if state_kind == 2 {
-        // Collecting state and we matched the response — extract title
-        let tg = session.title_gen.as_ref().unwrap();
-        let raw = tg.text_chunks.join("");
-        let title = raw
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-            .trim();
-        let title = if title.len() > 100 {
-            &title[..title.floor_char_boundary(100)]
-        } else {
-            title
-        };
-        if !title.is_empty() {
-            completed_title = Some(title.to_owned());
-        }
-    }
-
-    (action, completed_title)
 }
 
 fn apply_worker_update(session: &mut ChatSessionRuntime, params: Option<&Value>) {
@@ -2373,10 +2072,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         injection_completed,
         thread_id,
         should_start_title_gen,
-        title_action,
-        title_complete,
         input_tx,
-        filtered_payload,
     ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
@@ -2385,16 +2081,6 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
 
         let mut messages =
             extract_json_messages(&mut session.output_buffer, payload, "output");
-
-        // Filter title-session messages before normal processing
-        let msg_count_before = messages.len();
-        let (title_action, title_complete) = process_title_messages(session, &mut messages);
-        // If messages were filtered, rebuild payload so title data doesn't leak to clients
-        let filtered_payload = if messages.len() < msg_count_before {
-            serialize_json_messages(&messages)
-        } else {
-            None
-        };
 
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
@@ -2425,10 +2111,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.injection_completed,
             thread_id,
             outbound.should_start_title_gen,
-            title_action,
-            title_complete,
             input_tx,
-            filtered_payload,
         )
     };
 
@@ -2462,10 +2145,8 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         }
     }
 
-    // Use filtered payload (title messages removed) or raw payload
-    let base_payload = filtered_payload.as_deref().unwrap_or(payload);
-
     // Rewrite ACP session ID to Spindle session ID in outbound payload
+    let base_payload = payload;
     let rewritten_payload = {
         let chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get(session_id) {
@@ -2503,87 +2184,46 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         detach_channels(Arc::clone(&state), dead_channels).await;
     }
 
-    // --- Title generation: ephemeral session on the same agent process ---
-
-    // Start title generation by sending session/new
+    // --- Title generation via dedicated TitleService ---
     if should_start_title_gen {
-        if let Some(ref input_tx) = input_tx {
-            let cwd = {
-                let store = state.store.lock().await;
-                store
-                    .data
-                    .threads
-                    .iter()
-                    .find(|t| t.id == thread_id)
-                    .map(|t| t.worktree_path.clone())
-                    .unwrap_or_default()
-            };
-            if !cwd.is_empty() {
-                let req_id = injection_request_id();
-                if send_acp_request(
-                    input_tx,
-                    req_id,
-                    "session/new",
-                    json!({ "cwd": cwd, "mcpServers": [] }),
-                )
-                .await
-                .is_ok()
-                {
-                    let mut chat = state.chat.lock().await;
-                    if let Some(session) = chat.sessions.get_mut(session_id) {
-                        session.title_gen = Some(TitleGeneration {
-                            state: TitleGenState::CreatingSession {
-                                request_id: req_id.to_string(),
-                            },
-                            text_chunks: Vec::new(),
-                        });
+        let first_prompt = {
+            let chat = state.chat.lock().await;
+            chat.sessions
+                .get(session_id)
+                .and_then(|s| s.first_prompt_text.clone())
+                .unwrap_or_default()
+        };
+        if !first_prompt.is_empty() {
+            let state = Arc::clone(&state);
+            let session_id = session_id.to_owned();
+            let thread_id = thread_id.clone();
+            tokio::spawn(async move {
+                match state.title.generate_title(&first_prompt).await {
+                    Ok(title) => {
+                        tracing::info!(%session_id, %title, "title generated");
+                        {
+                            let mut chat = state.chat.lock().await;
+                            if let Some(session) = chat.sessions.get_mut(&session_id) {
+                                session.summary.title = Some(title.clone());
+                            }
+                        }
+                        {
+                            let mut store = state.store.lock().await;
+                            if let Some(thread) =
+                                store.data.threads.iter_mut().find(|t| t.id == thread_id)
+                            {
+                                thread.display_name = Some(title);
+                            }
+                            store.save().ok();
+                        }
+                        emit_state_delta_updated(&state, &thread_id, &session_id).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%session_id, error = %err, "title generation failed");
                     }
                 }
-            }
+            });
         }
-    }
-
-    // Send follow-up ACP request for title state machine (setModel or prompt)
-    if let Some(action) = title_action {
-        if let Some(ref input_tx) = input_tx {
-            if let Err(err) =
-                send_acp_request(input_tx, action.request_id, action.method, action.params).await
-            {
-                tracing::warn!(session_id, error = %err, "title generation: failed to send {}", action.method);
-                let mut chat = state.chat.lock().await;
-                if let Some(session) = chat.sessions.get_mut(session_id) {
-                    session.title_gen = None;
-                }
-            }
-        }
-    }
-
-    // Title generation complete — persist and emit delta
-    if let Some(title) = title_complete {
-        tracing::info!(session_id, %title, "title generated for thread");
-
-        // Update session summary title
-        {
-            let mut chat = state.chat.lock().await;
-            if let Some(session) = chat.sessions.get_mut(session_id) {
-                session.summary.title = Some(title.clone());
-                session.title_gen = None;
-            }
-        }
-
-        // Persist display_name on the thread
-        {
-            let mut store = state.store.lock().await;
-            if let Some(thread) = store.data.threads.iter_mut().find(|t| t.id == thread_id) {
-                thread.display_name = Some(title);
-            }
-            if let Err(err) = store.save() {
-                tracing::warn!(error = %err, "failed to save state store after title update");
-            }
-        }
-
-        // Emit chat.session_updated delta so Threadmill picks up the title
-        emit_state_delta_updated(&state, &thread_id, session_id).await;
     }
 }
 
@@ -3782,7 +3422,6 @@ fn discover_history_sessions(
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
-                title_gen: None,
                 had_conversation_context: false,
             });
         }
@@ -4028,7 +3667,6 @@ mod tests {
             stall_task: None,
             user_prompt_count: 0,
             first_prompt_text: None,
-            title_gen: None,
             had_conversation_context: false,
         }
     }
@@ -5110,7 +4748,6 @@ mod tests {
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
-                title_gen: None,
                 had_conversation_context: false,
             };
             chat.sessions
