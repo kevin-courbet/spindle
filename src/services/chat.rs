@@ -2052,6 +2052,25 @@ fn process_title_messages(
         "process_title_messages checking responses"
     );
 
+    // Log all remaining messages to see if the response is present
+    for (i, msg) in messages.iter().enumerate() {
+        let has_result = msg.get("result").is_some();
+        let has_error = msg.get("error").is_some();
+        let msg_id = request_id_key(msg.get("id")).unwrap_or_default();
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or("-");
+        if has_result || has_error || !msg_id.is_empty() {
+            tracing::info!(
+                i,
+                %msg_id,
+                method,
+                has_result,
+                has_error,
+                %expected_id,
+                "process_title_messages: message in vec"
+            );
+        }
+    }
+
     messages.retain(|msg| {
         if !(msg.get("result").is_some() || msg.get("error").is_some()) {
             return true;
