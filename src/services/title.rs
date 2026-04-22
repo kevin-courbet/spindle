@@ -95,8 +95,8 @@ impl TitleService {
                 Err(_) => return Err("title generation timed out".to_string()),
             };
 
-            let msg: Value = serde_json::from_str(&line)
-                .map_err(|e| format!("invalid JSON from agent: {e}"))?;
+            let msg: Value =
+                serde_json::from_str(&line).map_err(|e| format!("invalid JSON from agent: {e}"))?;
 
             // Collect text chunks
             if msg
@@ -151,10 +151,7 @@ async fn start_title_session() -> Result<TitleSession, String> {
         .find_map(|id| agents.iter().find(|a| a.id == *id && a.installed))
         .ok_or("no installed agent available for title generation")?;
 
-    let command = agent
-        .resolved_path
-        .as_deref()
-        .unwrap_or(&agent.command);
+    let command = agent.resolved_path.as_deref().unwrap_or(&agent.command);
 
     info!(agent = %agent.id, command = %command, "starting title generation agent");
 
@@ -170,14 +167,8 @@ async fn start_title_session() -> Result<TitleSession, String> {
         .spawn()
         .map_err(|e| format!("failed to spawn title agent: {e}"))?;
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or("title agent has no stdin")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("title agent has no stdout")?;
+    let stdin = child.stdin.take().ok_or("title agent has no stdin")?;
+    let stdout = child.stdout.take().ok_or("title agent has no stdout")?;
     let mut stdout = BufReader::new(stdout);
     let mut stdin = stdin;
 

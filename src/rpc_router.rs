@@ -626,10 +626,11 @@ fn terminal_attach_session_missing(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
 
     use serde_json::json;
     use tokio::sync::{mpsc, Mutex};
+    use uuid::Uuid;
 
     use super::{dispatch_request, map_service_error};
     use crate::{
@@ -641,8 +642,13 @@ mod tests {
 
     #[tokio::test]
     async fn session_hello_stays_pending_until_acknowledged() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "threadmill-session-hello-tests-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create test state dir");
         let state = Arc::new(AppState::new(StateStore {
-            path: std::env::temp_dir().join("threadmill-session-hello-state.json"),
+            path: state_dir.join("state.json"),
             data: AppData::default(),
         }));
         let connection_state = Arc::new(Mutex::new(TerminalConnectionState::default()));
@@ -671,6 +677,8 @@ mod tests {
             !guard.is_initialized(),
             "session.hello should stay pending until its success response is queued"
         );
+
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

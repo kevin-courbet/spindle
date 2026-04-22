@@ -24,7 +24,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    protocol,
+    config, protocol,
     services::{
         agent_registry,
         checkpoint::CheckpointService,
@@ -340,9 +340,7 @@ impl ChatService {
             let source = chat
                 .sessions
                 .get(&params.source_session_id)
-                .ok_or_else(|| {
-                    format!("source session not found: {}", params.source_session_id)
-                })?;
+                .ok_or_else(|| format!("source session not found: {}", params.source_session_id))?;
             if source.thread_id != params.thread_id {
                 return Err(format!(
                     "source session {} does not belong to thread {}",
@@ -401,15 +399,11 @@ impl ChatService {
         // Generate display name with fork count
         let fork_display_name = {
             let chat = state.chat.lock().await;
-            let base = source_display_name
-                .as_deref()
-                .unwrap_or(&source_agent_type);
+            let base = source_display_name.as_deref().unwrap_or(&source_agent_type);
             let existing_forks = chat
                 .sessions
                 .values()
-                .filter(|s| {
-                    s.parent_session_id.as_deref() == Some(&params.source_session_id)
-                })
+                .filter(|s| s.parent_session_id.as_deref() == Some(&params.source_session_id))
                 .count();
             Some(format!("{base} (fork #{})", existing_forks + 1))
         };
@@ -1169,9 +1163,10 @@ async fn run_session_task(
             (sp, ip)
         };
 
-        // Read platform system prompt from ~/.config/threadmill/system-prompt.md
+        // Read platform system prompt from <config>/threadmill/system-prompt.md
+        // (XDG_CONFIG_HOME if set, else platform default).
         let platform_prompt = {
-            let config_dir = dirs::config_dir().unwrap_or_default();
+            let config_dir = config::config_dir().unwrap_or_default();
             let platform_path = config_dir.join("threadmill").join("system-prompt.md");
             match std::fs::read_to_string(&platform_path) {
                 Ok(content) => {
@@ -2079,8 +2074,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             return;
         };
 
-        let mut messages =
-            extract_json_messages(&mut session.output_buffer, payload, "output");
+        let mut messages = extract_json_messages(&mut session.output_buffer, payload, "output");
 
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
@@ -3551,6 +3545,10 @@ mod tests {
     use super::*;
     use crate::state_store::{AppData, Project, StateStore, Thread};
 
+    fn unique_test_id(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+    }
+
     async fn register_test_session(
         state: &Arc<AppState>,
         channel_id: u16,
@@ -3586,7 +3584,7 @@ mod tests {
         (root, path)
     }
 
-    fn make_test_state() -> Arc<AppState> {
+    fn make_test_state_with_thread(thread_id: &str) -> Arc<AppState> {
         // Isolate the state parent dir per test. AppState::new derives
         // history_root from state_path.parent(), so tests sharing the same
         // parent (e.g. /tmp) clobber each other's marker files when run in
@@ -3607,7 +3605,7 @@ mod tests {
                     default_branch: "main".to_string(),
                 }],
                 threads: vec![Thread::new(
-                    "thread-1".to_string(),
+                    thread_id.to_string(),
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
@@ -3622,10 +3620,18 @@ mod tests {
         }))
     }
 
-    fn make_test_session() -> ChatSessionRuntime {
+    fn make_test_state() -> Arc<AppState> {
+        make_test_state_with_thread("thread-1")
+    }
+
+    fn make_test_session_with_ids(
+        thread_id: &str,
+        session_id: &str,
+        acp_session_id: &str,
+    ) -> ChatSessionRuntime {
         ChatSessionRuntime {
             summary: protocol::ChatSessionSummary {
-                session_id: "session-1".to_string(),
+                session_id: session_id.to_string(),
                 agent_type: "opencode".to_string(),
                 status: protocol::ChatSessionStatus::Ready,
                 agent_status: protocol::AgentStatus::Idle,
@@ -3636,13 +3642,13 @@ mod tests {
                 display_name: None,
                 parent_session_id: None,
             },
-            thread_id: "thread-1".to_string(),
+            thread_id: thread_id.to_string(),
             display_name: None,
             parent_session_id: None,
             system_prompt: None,
             initial_prompt: None,
             conversation_context: None,
-            acp_session_id: Some("acp-session-1".to_string()),
+            acp_session_id: Some(acp_session_id.to_string()),
             attached_channels: HashSet::new(),
             input_tx: None,
             stop_tx: None,
@@ -3669,6 +3675,10 @@ mod tests {
             first_prompt_text: None,
             had_conversation_context: false,
         }
+    }
+
+    fn make_test_session() -> ChatSessionRuntime {
+        make_test_session_with_ids("thread-1", "session-1", "acp-session-1")
     }
 
     #[tokio::test]
@@ -3780,15 +3790,18 @@ mod tests {
 
     #[tokio::test]
     async fn handle_binary_frame_prepends_context_block_but_persists_original_history() {
-        let state = make_test_state();
+        let thread_id = unique_test_id("thread");
+        let session_id = unique_test_id("session");
+        let acp_session_id = unique_test_id("acp-session");
+        let state = make_test_state_with_thread(&thread_id);
         let (temp_root, history_path) = write_history_file(&[]);
         let history_root = {
             let chat = state.chat.lock().await;
             chat.history_root_path().to_path_buf()
         };
-        persist_restored_session_marker(&history_root, "thread-1", "session-1")
+        persist_restored_session_marker(&history_root, &thread_id, &session_id)
             .expect("persist restore marker");
-        let mut session = make_test_session();
+        let mut session = make_test_session_with_ids(&thread_id, &session_id, &acp_session_id);
         session.history_path = history_path.clone();
         session.conversation_context = Some("prior context".to_string());
 
@@ -3803,7 +3816,7 @@ mod tests {
                 "id": 42,
                 "method": "session/prompt",
                 "params": {
-                    "sessionId": "session-1",
+                    "sessionId": session_id,
                     "prompt": [{"type": "text", "text": "new prompt"}]
                 }
             })
@@ -3818,7 +3831,7 @@ mod tests {
 
         let forwarded = input_rx.recv().await.expect("forwarded payload");
         let rewritten: Value = serde_json::from_slice(&forwarded).expect("parse forwarded payload");
-        assert_eq!(rewritten["params"]["sessionId"], "acp-session-1");
+        assert_eq!(rewritten["params"]["sessionId"], acp_session_id);
         assert_eq!(
             rewritten["params"]["prompt"],
             json!([
@@ -3836,35 +3849,38 @@ mod tests {
         assert_eq!(persisted_lines.len(), 1);
         let persisted_entry: Value =
             serde_json::from_str(persisted_lines[0]).expect("parse history entry");
-        assert_eq!(persisted_entry["sessionId"], "session-1");
+        assert_eq!(persisted_entry["sessionId"], session_id);
         assert_eq!(persisted_entry["update"]["content"]["text"], "new prompt");
 
         assert!(
-            !restored_session_marker_exists(&history_root, "thread-1", "session-1")
+            !restored_session_marker_exists(&history_root, &thread_id, &session_id)
                 .expect("read restore marker state")
         );
         {
             let chat = state.chat.lock().await;
-            let session = chat.sessions.get("session-1").expect("registered session");
+            let session = chat.sessions.get(&session_id).expect("registered session");
             assert_eq!(session.conversation_context, None);
         }
 
-        cancel_registered_stall_timer(&state, "session-1").await;
+        cancel_registered_stall_timer(&state, &session_id).await;
         let _ = fs::remove_dir_all(temp_root);
     }
 
     #[tokio::test]
     async fn handle_binary_frame_keeps_restore_state_when_prompt_queue_fails() {
-        let state = make_test_state();
+        let thread_id = unique_test_id("thread");
+        let session_id = unique_test_id("session");
+        let acp_session_id = unique_test_id("acp-session");
+        let state = make_test_state_with_thread(&thread_id);
         let (temp_root, history_path) = write_history_file(&[]);
         let history_root = {
             let chat = state.chat.lock().await;
             chat.history_root_path().to_path_buf()
         };
-        persist_restored_session_marker(&history_root, "thread-1", "session-1")
+        persist_restored_session_marker(&history_root, &thread_id, &session_id)
             .expect("persist restore marker");
 
-        let mut session = make_test_session();
+        let mut session = make_test_session_with_ids(&thread_id, &session_id, &acp_session_id);
         session.history_path = history_path;
         session.conversation_context = Some("prior context".to_string());
 
@@ -3882,7 +3898,7 @@ mod tests {
                 "id": 45,
                 "method": "session/prompt",
                 "params": {
-                    "sessionId": "session-1",
+                    "sessionId": session_id,
                     "prompt": [{"type": "text", "text": "new prompt"}]
                 }
             })
@@ -3895,27 +3911,30 @@ mod tests {
         assert!(error.contains("failed to queue chat input"));
 
         assert!(
-            restored_session_marker_exists(&history_root, "thread-1", "session-1")
+            restored_session_marker_exists(&history_root, &thread_id, &session_id)
                 .expect("read restore marker state")
         );
         {
             let chat = state.chat.lock().await;
-            let session = chat.sessions.get("session-1").expect("registered session");
+            let session = chat.sessions.get(&session_id).expect("registered session");
             assert_eq!(
                 session.conversation_context.as_deref(),
                 Some("prior context")
             );
         }
 
-        cancel_registered_stall_timer(&state, "session-1").await;
+        cancel_registered_stall_timer(&state, &session_id).await;
         let _ = fs::remove_dir_all(temp_root);
     }
 
     #[tokio::test]
     async fn handle_binary_frame_preserves_non_text_prompt_blocks_when_context_injected() {
-        let state = make_test_state();
+        let thread_id = unique_test_id("thread");
+        let session_id = unique_test_id("session");
+        let acp_session_id = unique_test_id("acp-session");
+        let state = make_test_state_with_thread(&thread_id);
         let (temp_root, history_path) = write_history_file(&[]);
-        let mut session = make_test_session();
+        let mut session = make_test_session_with_ids(&thread_id, &session_id, &acp_session_id);
         session.history_path = history_path.clone();
         session.conversation_context = Some("prior context".to_string());
 
@@ -3930,7 +3949,7 @@ mod tests {
                 "id": 44,
                 "method": "session/prompt",
                 "params": {
-                    "sessionId": "session-1",
+                    "sessionId": session_id,
                     "prompt": [{"type": "image", "source": {"mediaType": "image/png", "data": "abc"}}]
                 }
             })
@@ -3945,7 +3964,7 @@ mod tests {
 
         let forwarded = input_rx.recv().await.expect("forwarded payload");
         let rewritten: Value = serde_json::from_slice(&forwarded).expect("parse forwarded payload");
-        assert_eq!(rewritten["params"]["sessionId"], "acp-session-1");
+        assert_eq!(rewritten["params"]["sessionId"], acp_session_id);
         assert_eq!(
             rewritten["params"]["prompt"],
             json!([
@@ -3961,15 +3980,18 @@ mod tests {
         let persisted = fs::read_to_string(&history_path).expect("read persisted history");
         assert!(persisted.is_empty());
 
-        cancel_registered_stall_timer(&state, "session-1").await;
+        cancel_registered_stall_timer(&state, &session_id).await;
         let _ = fs::remove_dir_all(temp_root);
     }
 
     #[tokio::test]
     async fn handle_binary_frame_keeps_normal_prompt_flow_when_context_absent() {
-        let state = make_test_state();
+        let thread_id = unique_test_id("thread");
+        let session_id = unique_test_id("session");
+        let acp_session_id = unique_test_id("acp-session");
+        let state = make_test_state_with_thread(&thread_id);
         let (temp_root, history_path) = write_history_file(&[]);
-        let mut session = make_test_session();
+        let mut session = make_test_session_with_ids(&thread_id, &session_id, &acp_session_id);
         session.history_path = history_path.clone();
 
         let (input_tx, mut input_rx) = mpsc::channel(1);
@@ -3983,7 +4005,7 @@ mod tests {
                 "id": 43,
                 "method": "session/prompt",
                 "params": {
-                    "sessionId": "session-1",
+                    "sessionId": session_id,
                     "prompt": [{"type": "text", "text": "plain prompt"}]
                 }
             })
@@ -3999,7 +4021,7 @@ mod tests {
         let forwarded = input_rx.recv().await.expect("forwarded payload");
         let forwarded_message: Value =
             serde_json::from_slice(&forwarded).expect("parse forwarded payload");
-        assert_eq!(forwarded_message["params"]["sessionId"], "acp-session-1");
+        assert_eq!(forwarded_message["params"]["sessionId"], acp_session_id);
         assert_eq!(
             forwarded_message["params"]["prompt"],
             json!([{
@@ -4013,10 +4035,10 @@ mod tests {
         assert_eq!(persisted_lines.len(), 1);
         let persisted_entry: Value =
             serde_json::from_str(persisted_lines[0]).expect("parse history entry");
-        assert_eq!(persisted_entry["sessionId"], "session-1");
+        assert_eq!(persisted_entry["sessionId"], session_id);
         assert_eq!(persisted_entry["update"]["content"]["text"], "plain prompt");
 
-        cancel_registered_stall_timer(&state, "session-1").await;
+        cancel_registered_stall_timer(&state, &session_id).await;
         let _ = fs::remove_dir_all(temp_root);
     }
 
@@ -4415,7 +4437,10 @@ mod tests {
         let mut session = make_test_session();
         session.summary.agent_status = protocol::AgentStatus::Busy;
 
-        let OutboundResult { transitions: started, .. } = apply_outbound_status_updates(
+        let OutboundResult {
+            transitions: started,
+            ..
+        } = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({
@@ -4427,7 +4452,10 @@ mod tests {
         assert!(started.is_empty());
         assert_eq!(session.summary.worker_count, 1);
 
-        let OutboundResult { transitions: completed, .. } = apply_outbound_status_updates(
+        let OutboundResult {
+            transitions: completed,
+            ..
+        } = apply_outbound_status_updates(
             &state,
             &mut session,
             vec![json!({
@@ -4750,8 +4778,7 @@ mod tests {
                 first_prompt_text: None,
                 had_conversation_context: false,
             };
-            chat.sessions
-                .insert(source_session_id.to_string(), runtime);
+            chat.sessions.insert(source_session_id.to_string(), runtime);
             chat.sessions_by_thread
                 .entry(thread_id.to_string())
                 .or_default()
@@ -4783,13 +4810,19 @@ mod tests {
             .lines()
             .filter(|l| !l.is_empty())
             .count();
-        assert_eq!(fork_line_count, 2, "fork should have exactly 2 lines (cursor=2)");
+        assert_eq!(
+            fork_line_count, 2,
+            "fork should have exactly 2 lines (cursor=2)"
+        );
 
         // Verify session registered in state
         {
             let chat = state.chat.lock().await;
             let fork_session = chat.sessions.get(&result.session_id).unwrap();
-            assert_eq!(fork_session.summary.status, protocol::ChatSessionStatus::Ended);
+            assert_eq!(
+                fork_session.summary.status,
+                protocol::ChatSessionStatus::Ended
+            );
             assert_eq!(
                 fork_session.parent_session_id.as_deref(),
                 Some(source_session_id)

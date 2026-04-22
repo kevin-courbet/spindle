@@ -51,19 +51,9 @@ pub async fn create_window(
     command: &str,
     cwd: &str,
 ) -> Result<(), String> {
-    tmux_run_owned(vec![
-        "new-window".to_string(),
-        "-d".to_string(),
-        "-t".to_string(),
-        session.to_string(),
-        "-n".to_string(),
-        name.to_string(),
-        "-c".to_string(),
-        cwd.to_string(),
-        command.to_string(),
-    ])
-    .await
-    .map(|_| ())
+    tmux_run_owned(build_create_window_args(session, name, command, cwd))
+        .await
+        .map(|_| ())
 }
 
 pub async fn split_window(
@@ -72,18 +62,56 @@ pub async fn split_window(
     command: &str,
     cwd: &str,
 ) -> Result<(), String> {
+    tmux_run_owned(build_split_window_args(session, name, command, cwd))
+        .await
+        .map(|_| ())
+}
+
+/// Build the argv for `tmux new-window`. Preset commands are wrapped in
+/// `/bin/sh -c …` so that shell metacharacters (`$VAR`, `&&`, pipes,
+/// quoting) work as users expect when they declare `commands: ["$SHELL"]`
+/// or `npm run dev` in `.threadmill.yml`. Without the wrapper tmux passes
+/// the command straight to `execvp`, which treats `$SHELL` as a literal
+/// path and exits the pane immediately.
+pub(crate) fn build_create_window_args(
+    session: &str,
+    name: &str,
+    command: &str,
+    cwd: &str,
+) -> Vec<String> {
+    vec![
+        "new-window".to_string(),
+        "-d".to_string(),
+        "-t".to_string(),
+        session.to_string(),
+        "-n".to_string(),
+        name.to_string(),
+        "-c".to_string(),
+        cwd.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]
+}
+
+pub(crate) fn build_split_window_args(
+    session: &str,
+    name: &str,
+    command: &str,
+    cwd: &str,
+) -> Vec<String> {
     let target = format!("{session}:{name}");
-    tmux_run_owned(vec![
+    vec![
         "split-window".to_string(),
         "-d".to_string(),
         "-t".to_string(),
         target,
         "-c".to_string(),
         cwd.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
         command.to_string(),
-    ])
-    .await
-    .map(|_| ())
+    ]
 }
 
 pub async fn select_layout(session: &str, name: &str, layout: &str) -> Result<(), String> {
@@ -168,5 +196,59 @@ pub async fn session_exists(name: &str) -> Result<bool, String> {
         Ok(false)
     } else {
         Err(format!("tmux has-session failed: {}", stderr.trim()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_window_args_invoke_command_via_shell_so_env_vars_expand() {
+        let args = build_create_window_args("ses1", "aux", "$SHELL", "/tmp/work");
+        assert_eq!(
+            args,
+            vec![
+                "new-window".to_string(),
+                "-d".to_string(),
+                "-t".to_string(),
+                "ses1".to_string(),
+                "-n".to_string(),
+                "aux".to_string(),
+                "-c".to_string(),
+                "/tmp/work".to_string(),
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "$SHELL".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_window_args_preserve_compound_shell_commands_intact() {
+        let args =
+            build_create_window_args("ses1", "dev", "npm install && npm run dev", "/tmp/work");
+        assert_eq!(args.last(), Some(&"npm install && npm run dev".to_string()));
+        let sh_index = args
+            .iter()
+            .position(|arg| arg == "/bin/sh")
+            .expect("argv must include /bin/sh");
+        assert_eq!(args.get(sh_index + 1), Some(&"-c".to_string()));
+    }
+
+    #[test]
+    fn split_window_args_target_named_window_and_wrap_in_shell() {
+        let args = build_split_window_args("ses1", "dev", "tail -f log", "/tmp/work");
+        assert_eq!(args[0], "split-window");
+        assert!(
+            args.contains(&"ses1:dev".to_string()),
+            "split-window must target {{session}}:{{name}}, got argv={args:?}"
+        );
+        let sh_index = args
+            .iter()
+            .position(|arg| arg == "/bin/sh")
+            .expect("argv must include /bin/sh");
+        assert_eq!(args.get(sh_index + 1), Some(&"-c".to_string()));
+        assert_eq!(args.last(), Some(&"tail -f log".to_string()));
     }
 }

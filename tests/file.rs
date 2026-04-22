@@ -38,6 +38,11 @@ async fn file_list_and_read_enforce_workspace_rules() {
     )
     .expect("write large fixture");
 
+    // Spindle canonicalises paths before returning entries (TOCTOU hardening).
+    // On macOS, `/var/folders/…` resolves to `/private/var/folders/…`, so
+    // compare against the canonicalised fixture path to stay platform-agnostic.
+    let fixture_path = fs::canonicalize(&fixture_path).expect("canonicalise fixture path");
+
     let listed = harness
         .rpc(
             "file.list",

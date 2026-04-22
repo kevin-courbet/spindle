@@ -550,15 +550,25 @@ async fn thread_cancel_inflight_creation_marks_failed_and_cleans_worktree() {
         .expect("cancel creating thread");
     assert_eq!(cancelled["status"], "failed");
 
+    // Status transitions arrive inside state.delta operations — see
+    // `StateDeltaOperationPayload::ThreadStatusChanged` in src/protocol.rs.
+    // `thread.status_changed` is no longer a top-level event (commit bce295f
+    // consolidated status emission onto state.delta as the sole replication
+    // channel).
     loop {
-        let status_event = harness
-            .wait_for_event("thread.status_changed", Duration::from_secs(45))
+        let event = harness
+            .wait_for_event("state.delta", Duration::from_secs(45))
             .await
-            .expect("wait for thread.status_changed");
-        if status_event["params"]["thread_id"] != thread_id {
-            continue;
-        }
-        if status_event["params"]["new"] == "failed" {
+            .expect("wait for state.delta with thread status change");
+        let operations = event["params"]["operations"]
+            .as_array()
+            .expect("state.delta operations array");
+        let observed_failed = operations.iter().any(|operation| {
+            operation["type"] == "thread.status_changed"
+                && operation["thread_id"] == thread_id
+                && operation["new"] == "failed"
+        });
+        if observed_failed {
             break;
         }
     }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
-    protocol,
+    config, protocol,
     services::{project, thread::load_threadmill_config, thread::remove_worktree},
     tmux,
 };
@@ -153,7 +153,7 @@ pub struct StateStore {
 impl StateStore {
     pub fn load() -> Result<Self, String> {
         let config_dir =
-            dirs::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
+            config::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
         let dir = config_dir.join("threadmill");
         fs::create_dir_all(&dir)
             .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;

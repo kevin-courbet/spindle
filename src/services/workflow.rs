@@ -20,7 +20,7 @@ const ISSUE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// O(N) shell-outs on workflows with absurdly long linked-issue lists.
 const ISSUE_RESOLVE_MAX_FANOUT: usize = 100;
 
-use crate::{protocol, services::chat::ChatService, AppState};
+use crate::{config, protocol, services::chat::ChatService, AppState};
 
 pub struct WorkflowService;
 
@@ -90,7 +90,7 @@ fn resolve_persona_path(worktree: &Path, name: &str) -> Option<PathBuf> {
     if project.exists() {
         return Some(project);
     }
-    let global = dirs::config_dir()?
+    let global = config::config_dir()?
         .join("threadmill/agents")
         .join(format!("{name}.md"));
     if global.exists() {
@@ -392,7 +392,7 @@ impl WorkflowStore {
 
     pub fn load() -> Result<Self, String> {
         let config_dir =
-            dirs::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
+            config::config_dir().ok_or_else(|| "unable to locate config dir".to_string())?;
         let dir = config_dir.join("threadmill");
         Self::load_from_dir(&dir)
     }

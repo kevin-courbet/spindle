@@ -3,6 +3,7 @@ use std::{env, fs, process::ExitCode};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use spindle::config;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_WS_URL: &str = "ws://127.0.0.1:19990";
@@ -688,8 +689,9 @@ fn resolve_agent_def_path(name: &str) -> Result<std::path::PathBuf, CliError> {
         return Ok(project_path);
     }
 
-    // Try global: ~/.config/threadmill/agents/<name>.md
-    if let Some(config_dir) = dirs::config_dir() {
+    // Try global: <config>/threadmill/agents/<name>.md
+    // (XDG_CONFIG_HOME if set, else platform default — must match daemon).
+    if let Some(config_dir) = config::config_dir() {
         let global_path = config_dir
             .join("threadmill/agents")
             .join(format!("{name}.md"));
@@ -1654,7 +1656,7 @@ fn print_json(value: &Value, pretty: bool) -> Result<(), CliError> {
 }
 
 fn read_auth_token() -> Option<String> {
-    let config_dir = dirs::config_dir()?;
+    let config_dir = config::config_dir()?;
     let path = config_dir.join("threadmill").join("auth_token");
     let token = fs::read_to_string(path).ok()?;
     let token = token.trim();
