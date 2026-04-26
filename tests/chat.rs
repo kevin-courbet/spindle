@@ -172,7 +172,8 @@ async fn create_thread_with_worktree(
             json!({
                 "project_id": project_id,
                 "name": common::unique_name("chat"),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await

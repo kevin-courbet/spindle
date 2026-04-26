@@ -3500,13 +3500,14 @@ async fn build_agent_env_vars(
         (thread, project)
     };
 
-    let port_base =
-        match crate::services::thread::load_threadmill_config(&thread.worktree_path, &project.path)
-        {
-            Ok(config) => state_store::port_base_with_offset(config.ports.base, thread.port_offset)
-                .unwrap_or(3000),
-            Err(_) => 3000,
-        };
+    let port_base = match crate::services::thread::load_threadmill_config(
+        thread.checkout_path(&project.path),
+        &project.path,
+    ) {
+        Ok(config) => state_store::port_base_with_offset(config.ports.base, thread.port_offset)
+            .unwrap_or(3000),
+        Err(_) => 3000,
+    };
 
     let mut env = state_store::thread_env(&project, &thread, port_base);
     env.push(("THREADMILL_SESSION_ID".to_string(), session_id.to_string()));
@@ -3528,7 +3529,8 @@ async fn resolve_agent_launch(
             .project_by_id(&thread.project_id)
             .ok_or_else(|| format!("project not found: {}", thread.project_id))?
             .clone();
-        (project.path, thread.worktree_path)
+        let worktree_path = thread.checkout_path(&project.path).to_string();
+        (project.path, worktree_path)
     };
 
     let command = project_agent_command(&project_path, agent_name)
@@ -3609,7 +3611,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Active,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4243,7 +4245,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4312,7 +4314,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4375,7 +4377,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4658,7 +4660,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),

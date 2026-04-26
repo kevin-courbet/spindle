@@ -160,7 +160,8 @@ async fn create_thread(harness: &mut common::TestHarness, project_id: &str) -> s
             json!({
                 "project_id": project_id,
                 "name": common::unique_name("checkpoint-thread"),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await
@@ -202,6 +203,46 @@ async fn cleanup_thread_project(
     let _ = harness
         .rpc("project.remove", json!({ "project_id": project_id }))
         .await;
+}
+
+#[tokio::test]
+async fn checkpoint_restore_rejects_base_checkout_threads() {
+    if !common::tmux_available().await {
+        eprintln!("skipping checkpoint_restore_rejects_base_checkout_threads: tmux unavailable");
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness, None).await;
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("base-checkpoint-thread"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create base-checkout thread");
+    assert!(created["worktree_path"].is_null());
+
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let error = harness
+        .rpc_expect_error(
+            "checkpoint.restore",
+            json!({ "thread_id": thread_id.clone(), "seq": 1 }),
+        )
+        .await;
+
+    assert!(
+        error.to_lowercase().contains("dedicated worktree"),
+        "expected dedicated worktree error, got: {error}"
+    );
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
 
 async fn wait_for_chat_ready(harness: &mut common::TestHarness, thread_id: &str, session_id: &str) {

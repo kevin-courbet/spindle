@@ -43,21 +43,22 @@ impl PresetService {
                 .clone();
             (thread, project)
         };
+        let checkout_path = thread.checkout_path(&project.path).to_string();
 
         if !tmux::session_exists(&thread.tmux_session).await? {
             // Tmux session died (beast reboot, manual kill, etc.) — recreate it.
             // Same logic as StateStore startup reconciliation.
-            let config = load_threadmill_config(&thread.worktree_path, &project.path)?;
+            let config = load_threadmill_config(&checkout_path, &project.path)?;
             let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
             let env = thread_env(&project, &thread, port_base);
-            tmux::create_session(&thread.tmux_session, &thread.worktree_path, &env).await?;
+            tmux::create_session(&thread.tmux_session, &checkout_path, &env).await?;
         }
 
         if tmux::window_exists(&thread.tmux_session, &effective_id).await? {
             return Ok(protocol::PresetStartResult { ok: true });
         }
 
-        let config = load_threadmill_config(&thread.worktree_path, &project.path)?;
+        let config = load_threadmill_config(&checkout_path, &project.path)?;
         let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
         let env = thread_env(&project, &thread, port_base);
         tmux::set_session_environment(&thread.tmux_session, &env).await?;
@@ -66,7 +67,7 @@ impl PresetService {
         let preset_config = project_presets.iter().find(|p| p.name == params.preset);
 
         if let Some(preset) = preset_config {
-            let cwd = resolve_preset_cwd(&thread.worktree_path, preset.cwd.as_deref())?;
+            let cwd = resolve_preset_cwd(&checkout_path, preset.cwd.as_deref())?;
             tmux::create_window(&thread.tmux_session, &effective_id, &preset.command, &cwd).await?;
         } else {
             start_legacy_preset(&thread, &params.preset, &effective_id, &project.path).await?;
@@ -172,7 +173,8 @@ async fn start_legacy_preset(
     window_name: &str,
     project_path: &str,
 ) -> Result<(), String> {
-    let config = load_threadmill_config(&thread.worktree_path, project_path)?;
+    let checkout_path = thread.checkout_path(project_path);
+    let config = load_threadmill_config(checkout_path, project_path)?;
     let preset = config
         .presets
         .get(preset_name)
@@ -188,30 +190,18 @@ async fn start_legacy_preset(
             &thread.tmux_session,
             window_name,
             &preset.commands[0],
-            &thread.worktree_path,
+            checkout_path,
         )
         .await?;
 
         for command in preset.commands.iter().skip(1) {
-            tmux::split_window(
-                &thread.tmux_session,
-                window_name,
-                command,
-                &thread.worktree_path,
-            )
-            .await?;
+            tmux::split_window(&thread.tmux_session, window_name, command, checkout_path).await?;
         }
 
         tmux::select_layout(&thread.tmux_session, window_name, "tiled").await?;
     } else {
         let command = preset.commands.join(" && ");
-        tmux::create_window(
-            &thread.tmux_session,
-            window_name,
-            &command,
-            &thread.worktree_path,
-        )
-        .await?;
+        tmux::create_window(&thread.tmux_session, window_name, &command, checkout_path).await?;
     }
 
     Ok(())

@@ -307,7 +307,8 @@ async fn file_git_status_returns_modified_entries_for_worktree_files() {
             json!({
                 "project_id": project_id.clone(),
                 "name": common::unique_name("git-status"),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await
@@ -374,7 +375,8 @@ async fn file_git_status_handles_quoted_and_spaced_paths() {
             json!({
                 "project_id": project_id,
                 "name": common::unique_name("git-status-quotes"),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await
@@ -442,7 +444,8 @@ async fn file_git_status_reports_renamed_and_modified_entries() {
             json!({
                 "project_id": project_id,
                 "name": common::unique_name("git-status-rename-modified"),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await
@@ -517,7 +520,8 @@ async fn create_ready_thread(
             json!({
                 "project_id": project_id.clone(),
                 "name": common::unique_name(name),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await

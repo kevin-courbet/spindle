@@ -65,7 +65,8 @@ pub struct Thread {
     pub project_id: String,
     pub name: String,
     pub branch: String,
-    pub worktree_path: String,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
     pub status: ThreadStatus,
     pub source_type: SourceType,
     pub created_at: String,
@@ -802,6 +803,8 @@ pub struct ThreadCreateParams {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    #[serde(default)]
+    pub sandbox: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -822,6 +825,11 @@ pub struct ThreadReopenParams {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadHideParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadWorktreeMutationParams {
     pub thread_id: String,
 }
 
@@ -1742,6 +1750,8 @@ pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
 pub const METHOD_THREAD_REOPEN: &str = "thread.reopen";
 pub const METHOD_THREAD_HIDE: &str = "thread.hide";
 pub const METHOD_THREAD_LIST: &str = "thread.list";
+pub const METHOD_THREAD_PROMOTE_TO_WORKTREE: &str = "thread.promoteToWorktree";
+pub const METHOD_THREAD_DEMOTE_TO_BASE: &str = "thread.demoteToBase";
 pub const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
 pub const METHOD_TERMINAL_DETACH: &str = "terminal.detach";
 pub const METHOD_TERMINAL_RESIZE: &str = "terminal.resize";
@@ -1877,6 +1887,10 @@ pub enum RequestDispatch {
     ThreadHide(ThreadHideParams),
     #[serde(rename = "thread.list")]
     ThreadList(ThreadListParams),
+    #[serde(rename = "thread.promoteToWorktree")]
+    ThreadPromoteToWorktree(ThreadWorktreeMutationParams),
+    #[serde(rename = "thread.demoteToBase")]
+    ThreadDemoteToBase(ThreadWorktreeMutationParams),
     #[serde(rename = "terminal.attach")]
     TerminalAttach(TerminalAttachParams),
     #[serde(rename = "terminal.detach")]
@@ -2052,6 +2066,16 @@ pub fn parse_request_dispatch(
         METHOD_THREAD_LIST => serde_json::from_value::<ThreadListParams>(params)
             .map(RequestDispatch::ThreadList)
             .map_err(|err| format!("invalid thread.list params: {err}")),
+        METHOD_THREAD_PROMOTE_TO_WORKTREE => {
+            serde_json::from_value::<ThreadWorktreeMutationParams>(params)
+                .map(RequestDispatch::ThreadPromoteToWorktree)
+                .map_err(|err| format!("invalid thread.promoteToWorktree params: {err}"))
+        }
+        METHOD_THREAD_DEMOTE_TO_BASE => {
+            serde_json::from_value::<ThreadWorktreeMutationParams>(params)
+                .map(RequestDispatch::ThreadDemoteToBase)
+                .map_err(|err| format!("invalid thread.demoteToBase params: {err}"))
+        }
         METHOD_TERMINAL_ATTACH => serde_json::from_value::<TerminalAttachParams>(params)
             .map(RequestDispatch::TerminalAttach)
             .map_err(|err| format!("invalid terminal.attach params: {err}")),
@@ -2264,5 +2288,48 @@ mod tests {
         assert_eq!(start_review_value["reviewers"], json!([]));
         assert_eq!(review_started_value["reviewers"], json!([]));
         assert_eq!(findings_recorded_value["findings"], json!([]));
+    }
+
+    #[test]
+    fn thread_create_params_default_sandbox_to_false() {
+        let request = parse_request_dispatch(
+            METHOD_THREAD_CREATE,
+            json!({
+                "project_id": "project-1",
+                "name": "thread-1",
+                "source_type": "new_feature"
+            }),
+        )
+        .expect("parse thread.create request");
+
+        let RequestDispatch::ThreadCreate(params) = request else {
+            panic!("expected thread.create dispatch");
+        };
+
+        assert!(!params.sandbox);
+    }
+
+    #[test]
+    fn promote_and_demote_thread_requests_parse_exact_method_names() {
+        let promote = parse_request_dispatch(
+            METHOD_THREAD_PROMOTE_TO_WORKTREE,
+            json!({ "thread_id": "thread-1" }),
+        )
+        .expect("parse promote request");
+        let demote = parse_request_dispatch(
+            METHOD_THREAD_DEMOTE_TO_BASE,
+            json!({ "thread_id": "thread-1" }),
+        )
+        .expect("parse demote request");
+
+        let RequestDispatch::ThreadPromoteToWorktree(promote_params) = promote else {
+            panic!("expected thread.promoteToWorktree dispatch");
+        };
+        let RequestDispatch::ThreadDemoteToBase(demote_params) = demote else {
+            panic!("expected thread.demoteToBase dispatch");
+        };
+
+        assert_eq!(promote_params.thread_id, "thread-1");
+        assert_eq!(demote_params.thread_id, "thread-1");
     }
 }
