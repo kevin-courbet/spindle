@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -684,8 +689,13 @@ impl ThreadService {
     ) {
         warn!(thread_id = %thread_id, error = %reason, "worktree mutation left thread failed");
         let mut store = state.store.lock().await;
-        if Self::set_status_locked(&state, &mut store, thread_id, protocol::ThreadStatus::Failed)
-            .is_ok()
+        if Self::set_status_locked(
+            &state,
+            &mut store,
+            thread_id,
+            protocol::ThreadStatus::Failed,
+        )
+        .is_ok()
         {
             let _ = store.save();
         }
@@ -1251,9 +1261,17 @@ async fn ensure_demotable_worktree(
     // persisted state points at wrong path. Require Threadmill-managed path,
     // git registration, and branch identity before removing so one thread can
     // never delete another thread's clean checkout.
-    let expected_worktree_path = planned_worktree_path(project, &thread.name, &thread.source_type, true)
-        .ok_or_else(|| format!("thread {} cannot derive expected managed worktree path", thread.id))?;
-    if normalize_absolute_path(path) != normalize_absolute_path(Path::new(&expected_worktree_path)) {
+    let expected_worktree_path =
+        planned_worktree_path(project, &thread.name, &thread.source_type, true).ok_or_else(
+            || {
+                format!(
+                    "thread {} cannot derive expected managed worktree path",
+                    thread.id
+                )
+            },
+        )?;
+    if normalize_absolute_path(path) != normalize_absolute_path(Path::new(&expected_worktree_path))
+    {
         return Err(format!(
             "worktree does not belong to thread {}; expected managed worktree path {} but found {}",
             thread.id, expected_worktree_path, worktree_path
@@ -1563,11 +1581,11 @@ mod tests {
     use std::{
         env,
         path::{Path, PathBuf},
-        sync::{Mutex, OnceLock},
+        sync::OnceLock,
     };
 
     use chrono::Utc;
-    use tokio::process::Command;
+    use tokio::{process::Command, sync::Mutex};
     use uuid::Uuid;
 
     use crate::{state_store::StateStore, AppState, ServerEvent};
@@ -1581,7 +1599,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_disabled_create_returns_thread_without_worktree_path() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
         let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");
@@ -1625,7 +1643,7 @@ mod tests {
 
     #[tokio::test]
     async fn promote_to_worktree_persists_and_emits_thread_delta() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
         let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");
@@ -1687,7 +1705,7 @@ mod tests {
 
     #[tokio::test]
     async fn demote_to_base_persists_null_path_and_removes_worktree() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
         let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");
@@ -1801,7 +1819,7 @@ mod tests {
 
     #[tokio::test]
     async fn demote_to_base_rejects_registered_worktree_owned_by_another_thread() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
         let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");
@@ -1855,8 +1873,7 @@ mod tests {
         .expect_err("worktree ownership mismatch should be rejected");
 
         assert!(
-            error.contains("expected managed worktree path")
-                || error.contains("does not belong"),
+            error.contains("expected managed worktree path") || error.contains("does not belong"),
             "{error}"
         );
         assert!(owner_worktree_path.exists());
@@ -1868,7 +1885,7 @@ mod tests {
 
     #[tokio::test]
     async fn demote_to_base_rejects_ignored_files_in_worktree() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
         let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");

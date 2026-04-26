@@ -285,7 +285,9 @@ async fn thread_context(state: &Arc<AppState>, thread_id: &str) -> Result<Thread
     let worktree_path = thread
         .worktree_path
         .clone()
-        .filter(|path| thread.source_type != protocol::SourceType::MainCheckout && path != &project.path)
+        .filter(|path| {
+            thread.source_type != protocol::SourceType::MainCheckout && path != &project.path
+        })
         .ok_or_else(|| {
             format!(
                 "checkpoint operations require a dedicated worktree for thread {}",

@@ -2067,20 +2067,18 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         injection_completed,
         thread_id,
         should_start_title_gen,
-        input_tx,
     ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
-        let mut messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
 
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
         let thread_id = session.thread_id.clone();
         let history_path = session.history_path.clone();
-        let input_tx = session.input_tx.clone();
         let attached_channels = session
             .attached_channels
             .iter()
@@ -2105,7 +2103,6 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.injection_completed,
             thread_id,
             outbound.should_start_title_gen,
-            input_tx,
         )
     };
 

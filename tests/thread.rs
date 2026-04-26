@@ -774,7 +774,10 @@ async fn thread_create_without_sandbox_rejects_non_current_branch() {
         .await;
 
     let lower = error.to_lowercase();
-    assert!(lower.contains("sandbox") || lower.contains("worktree"), "{error}");
+    assert!(
+        lower.contains("sandbox") || lower.contains("worktree"),
+        "{error}"
+    );
     assert!(lower.contains("branch"), "{error}");
 
     let listed = harness
@@ -947,8 +950,14 @@ async fn thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree() {
 
     let lower = error.to_lowercase();
     assert!(lower.contains("branch"), "{error}");
-    assert!(lower.contains("base") || lower.contains("checkout"), "{error}");
-    assert!(Path::new(&worktree_path).is_dir(), "worktree should remain after rejection");
+    assert!(
+        lower.contains("base") || lower.contains("checkout"),
+        "{error}"
+    );
+    assert!(
+        Path::new(&worktree_path).is_dir(),
+        "worktree should remain after rejection"
+    );
 
     let listed = harness
         .rpc("thread.list", json!({ "project_id": project_id.clone() }))
