@@ -282,10 +282,22 @@ async fn thread_context(state: &Arc<AppState>, thread_id: &str) -> Result<Thread
         .project_by_id(&thread.project_id)
         .ok_or_else(|| format!("project not found: {}", thread.project_id))?
         .clone();
+    let worktree_path = thread
+        .worktree_path
+        .clone()
+        .filter(|path| {
+            thread.source_type != protocol::SourceType::MainCheckout && path != &project.path
+        })
+        .ok_or_else(|| {
+            format!(
+                "checkpoint operations require a dedicated worktree for thread {}",
+                thread.id
+            )
+        })?;
     Ok(ThreadContext {
         thread_id: thread.id,
         project_path: project.path,
-        worktree_path: thread.worktree_path,
+        worktree_path,
     })
 }
 

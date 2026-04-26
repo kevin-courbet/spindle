@@ -44,7 +44,8 @@ async fn create_thread(
             json!({
                 "project_id": project_id,
                 "name": common::unique_name("git-thread"),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await

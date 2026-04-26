@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::agent_registry;
 
@@ -45,7 +45,15 @@ impl TitleService {
             inner: Mutex::new(None),
         }
     }
+}
 
+impl Default for TitleService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TitleService {
     pub async fn generate_title(&self, user_text: &str) -> Result<String, String> {
         let mut guard = self.inner.lock().await;
 

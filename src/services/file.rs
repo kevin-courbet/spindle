@@ -340,7 +340,10 @@ async fn resolve_thread_worktree_root(
         let thread = store
             .thread_by_id(thread_id)
             .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-        thread.worktree_path.clone()
+        let project = store
+            .project_by_id(&thread.project_id)
+            .ok_or_else(|| format!("project not found: {}", thread.project_id))?;
+        thread.checkout_path(&project.path).to_string()
     };
 
     run_blocking("file.resolve_thread_worktree", move || {
@@ -921,7 +924,7 @@ async fn allowed_roots(state: Arc<AppState>) -> Result<Vec<PathBuf>, String> {
                     .data
                     .threads
                     .iter()
-                    .map(|thread| PathBuf::from(&thread.worktree_path)),
+                    .filter_map(|thread| thread.worktree_path.as_ref().map(PathBuf::from)),
             )
             .collect()
     };

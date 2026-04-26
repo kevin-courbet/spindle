@@ -206,7 +206,10 @@ async fn resolve_thread_worktree(state: Arc<AppState>, thread_id: &str) -> Resul
     let thread = store
         .thread_by_id(thread_id)
         .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-    Ok(thread.worktree_path.clone())
+    let project = store
+        .project_by_id(&thread.project_id)
+        .ok_or_else(|| format!("project not found: {}", thread.project_id))?;
+    Ok(thread.checkout_path(&project.path).to_string())
 }
 
 fn ensure_worktree_exists(worktree_path: &str) -> Result<(), String> {

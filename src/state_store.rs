@@ -36,7 +36,8 @@ pub struct Thread {
     pub project_id: String,
     pub name: String,
     pub branch: String,
-    pub worktree_path: String,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
     pub status: protocol::ThreadStatus,
     pub source_type: protocol::SourceType,
     pub created_at: DateTime<Utc>,
@@ -105,7 +106,7 @@ impl Thread {
         project_id: String,
         name: String,
         branch: String,
-        worktree_path: String,
+        worktree_path: Option<String>,
         status: protocol::ThreadStatus,
         source_type: protocol::SourceType,
         created_at: DateTime<Utc>,
@@ -142,6 +143,10 @@ impl Thread {
             chat_sessions: Vec::new(),
             display_name: self.display_name.clone(),
         }
+    }
+
+    pub fn checkout_path<'a>(&'a self, project_path: &'a str) -> &'a str {
+        self.worktree_path.as_deref().unwrap_or(project_path)
     }
 }
 
@@ -217,7 +222,12 @@ impl StateStore {
             .collect();
 
         for thread in &mut self.data.threads {
-            let worktree_exists = Path::new(&thread.worktree_path).exists();
+            let project_path = projects
+                .get(&thread.project_id)
+                .map(|project| project.path.as_str())
+                .unwrap_or("");
+            let checkout_path = thread.checkout_path(project_path);
+            let worktree_exists = Path::new(checkout_path).exists();
             let tmux_exists = sessions.contains(&thread.tmux_session);
 
             if tmux_exists && !worktree_exists {
@@ -242,9 +252,12 @@ impl StateStore {
                         .get(&thread.project_id)
                         .map(|p| p.path.as_str())
                         .unwrap_or("");
-                    if let Err(err) =
-                        remove_worktree(project_path, &thread.worktree_path, &thread.source_type)
-                            .await
+                    if let Err(err) = remove_worktree(
+                        project_path,
+                        thread.worktree_path.as_deref(),
+                        &thread.source_type,
+                    )
+                    .await
                     {
                         // git worktree remove can fail if the directory is orphaned
                         // (not registered as a worktree). Fall back to plain removal.
@@ -253,14 +266,16 @@ impl StateStore {
                             error = %err,
                             "reconcile: git worktree remove failed, trying plain removal"
                         );
-                        if let Err(rm_err) = fs::remove_dir_all(&thread.worktree_path) {
-                            warn!(
-                                thread_id = %thread.id,
-                                error = %rm_err,
-                                "reconcile: plain removal also failed for closing thread"
-                            );
-                            thread.status = protocol::ThreadStatus::Failed;
-                            continue;
+                        if let Some(worktree_path) = thread.worktree_path.as_deref() {
+                            if let Err(rm_err) = fs::remove_dir_all(worktree_path) {
+                                warn!(
+                                    thread_id = %thread.id,
+                                    error = %rm_err,
+                                    "reconcile: plain removal also failed for closing thread"
+                                );
+                                thread.status = protocol::ThreadStatus::Failed;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -274,7 +289,8 @@ impl StateStore {
                     continue;
                 };
 
-                let config = match load_threadmill_config(&thread.worktree_path, &project.path) {
+                let checkout_path = thread.checkout_path(&project.path);
+                let config = match load_threadmill_config(checkout_path, &project.path) {
                     Ok(config) => config,
                     Err(_) => {
                         thread.status = protocol::ThreadStatus::Failed;
@@ -291,7 +307,7 @@ impl StateStore {
                 };
 
                 let env = thread_env(project, thread, port_base);
-                if tmux::create_session(&thread.tmux_session, &thread.worktree_path, &env)
+                if tmux::create_session(&thread.tmux_session, checkout_path, &env)
                     .await
                     .is_err()
                 {
@@ -387,7 +403,10 @@ pub fn thread_env(project: &Project, thread: &Thread, port_base: u16) -> Vec<(St
         ("THREADMILL_BRANCH".to_string(), thread.branch.clone()),
         (
             "THREADMILL_WORKTREE".to_string(),
-            thread.worktree_path.clone(),
+            thread
+                .worktree_path
+                .clone()
+                .unwrap_or_else(|| project.path.clone()),
         ),
         ("THREADMILL_MAIN".to_string(), project.path.clone()),
         (

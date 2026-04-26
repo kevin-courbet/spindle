@@ -101,6 +101,30 @@ async fn cleanup_thread_project(
         .await;
 }
 
+async fn add_project_with_config(
+    harness: &mut common::TestHarness,
+    threadmill_config: &str,
+) -> (common::TestProject, String) {
+    let project = common::create_git_project(Some(threadmill_config), true)
+        .await
+        .expect("create test git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add project");
+
+    let project_id = added["id"]
+        .as_str()
+        .expect("project id in add response")
+        .to_string();
+    (project, project_id)
+}
+
 #[tokio::test]
 async fn thread_create_emits_progress_and_lists_thread() {
     if !common::tmux_available().await {
@@ -325,7 +349,7 @@ async fn thread_hide_marks_thread_hidden() {
     }
 
     let mut harness = setup_test_server().await;
-    let (_project, project_id) = add_project(&mut harness).await;
+    let (project, project_id) = add_project(&mut harness).await;
     let thread_id = create_thread(&mut harness, &project_id).await;
 
     wait_for_thread_ready(&mut harness, &thread_id).await;
@@ -345,8 +369,59 @@ async fn thread_hide_marks_thread_hidden() {
         .find(|thread| thread["id"] == thread_id)
         .expect("thread remains listed");
     assert_eq!(thread["status"], "hidden");
+    assert!(project.repo_path.exists());
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn thread_close_base_checkout_runs_teardown_without_removing_project_root() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping thread_close_base_checkout_runs_teardown_without_removing_project_root: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_project_with_config(
+        &mut harness,
+        r#"teardown:
+  - "touch teardown-ran.txt"
+"#,
+    )
+    .await;
+
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("base-close"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create base-checkout thread");
+    assert!(created["worktree_path"].is_null());
+
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": thread_id.clone(), "mode": "close" }),
+        )
+        .await
+        .expect("close base-checkout thread");
+
+    assert!(project.repo_path.exists());
+    assert!(project.repo_path.join("teardown-ran.txt").exists());
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
 }
 
 #[tokio::test]
@@ -514,7 +589,8 @@ async fn thread_cancel_inflight_creation_marks_failed_and_cleans_worktree() {
             json!({
                 "project_id": project_id,
                 "name": common::unique_name("cancel-thread"),
-                "source_type": "new_feature"
+                "source_type": "new_feature",
+                "sandbox": true
             }),
         )
         .await
@@ -623,7 +699,8 @@ async fn thread_create_from_pr_url_resolves_branch() {
                 "project_id": project_id,
                 "name": name,
                 "source_type": "pull_request",
-                "pr_url": "https://example.com/acme/repo/pull/42/head:feature/integration-test"
+                "pr_url": "https://example.com/acme/repo/pull/42/head:feature/integration-test",
+                "sandbox": true
             }),
         )
         .await;
@@ -666,4 +743,234 @@ async fn thread_create_from_pr_url_resolves_branch() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn thread_create_without_sandbox_rejects_non_current_branch() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping thread_create_without_sandbox_rejects_non_current_branch: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_project(&mut harness).await;
+    let branch = project
+        .feature_branch
+        .clone()
+        .expect("feature branch exists in test repository");
+
+    let error = harness
+        .rpc_expect_error(
+            "thread.create",
+            json!({
+                "project_id": project_id.clone(),
+                "name": common::unique_name("base-thread-mismatch"),
+                "source_type": "existing_branch",
+                "branch": branch
+            }),
+        )
+        .await;
+
+    let lower = error.to_lowercase();
+    assert!(
+        lower.contains("sandbox") || lower.contains("worktree"),
+        "{error}"
+    );
+    assert!(lower.contains("branch"), "{error}");
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
+        .await
+        .expect("list threads");
+    assert!(
+        listed
+            .as_array()
+            .expect("thread.list returns array")
+            .is_empty(),
+        "rejected create should not persist thread"
+    );
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
+}
+
+#[tokio::test]
+async fn thread_create_without_sandbox_returns_null_worktree_path_and_can_close() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping thread_create_without_sandbox_returns_null_worktree_path_and_can_close: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_project(&mut harness).await;
+
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("base-thread"),
+                "source_type": "new_feature"
+            }),
+        )
+        .await
+        .expect("create non-sandboxed thread");
+    assert!(created["worktree_path"].is_null());
+
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    harness
+        .rpc(
+            "thread.close",
+            json!({ "thread_id": thread_id.clone(), "mode": "close" }),
+        )
+        .await
+        .expect("close base-checkout thread");
+
+    assert!(project.repo_path.exists());
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
+        .await
+        .expect("list threads");
+    let thread = listed
+        .as_array()
+        .expect("thread.list returns array")
+        .iter()
+        .find(|entry| entry["id"] == thread_id)
+        .expect("closed thread listed");
+    assert_eq!(thread["status"], "closed");
+
+    let _ = harness
+        .rpc("project.remove", json!({ "project_id": project_id }))
+        .await;
+}
+
+#[tokio::test]
+async fn thread_promote_and_demote_update_worktree_path_over_rpc() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping thread_promote_and_demote_update_worktree_path_over_rpc: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (_project, project_id) = add_project(&mut harness).await;
+
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id,
+                "name": common::unique_name("promote-thread"),
+                "source_type": "existing_branch",
+                "branch": "main"
+            }),
+        )
+        .await
+        .expect("create base-checkout thread");
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let promoted = harness
+        .rpc(
+            "thread.promoteToWorktree",
+            json!({ "thread_id": thread_id.clone() }),
+        )
+        .await
+        .expect("promote thread to worktree");
+    let promoted_path = promoted["worktree_path"]
+        .as_str()
+        .expect("promoted worktree path")
+        .to_string();
+    assert!(Path::new(&promoted_path).is_dir());
+
+    let demoted = harness
+        .rpc(
+            "thread.demoteToBase",
+            json!({ "thread_id": thread_id.clone() }),
+        )
+        .await
+        .expect("demote thread to base checkout");
+    assert!(demoted["worktree_path"].is_null());
+    assert!(!Path::new(&promoted_path).exists());
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = setup_test_server().await;
+    let (project, project_id) = add_project(&mut harness).await;
+    let branch = project
+        .feature_branch
+        .clone()
+        .expect("feature branch exists in test repository");
+
+    let created = harness
+        .rpc(
+            "thread.create",
+            json!({
+                "project_id": project_id.clone(),
+                "name": common::unique_name("demote-mismatch"),
+                "source_type": "existing_branch",
+                "branch": branch,
+                "sandbox": true
+            }),
+        )
+        .await
+        .expect("create sandboxed feature thread");
+    let thread_id = created["id"].as_str().expect("thread id").to_string();
+    let worktree_path = created["worktree_path"]
+        .as_str()
+        .expect("worktree path")
+        .to_string();
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let error = harness
+        .rpc_expect_error(
+            "thread.demoteToBase",
+            json!({ "thread_id": thread_id.clone() }),
+        )
+        .await;
+
+    let lower = error.to_lowercase();
+    assert!(lower.contains("branch"), "{error}");
+    assert!(
+        lower.contains("base") || lower.contains("checkout"),
+        "{error}"
+    );
+    assert!(
+        Path::new(&worktree_path).is_dir(),
+        "worktree should remain after rejection"
+    );
+
+    let listed = harness
+        .rpc("thread.list", json!({ "project_id": project_id.clone() }))
+        .await
+        .expect("list threads");
+    let thread = listed
+        .as_array()
+        .expect("thread.list returns array")
+        .iter()
+        .find(|entry| entry["id"] == thread_id)
+        .expect("thread listed after demote rejection");
+    assert_eq!(thread["status"], "active");
+    assert_eq!(thread["worktree_path"], worktree_path);
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }

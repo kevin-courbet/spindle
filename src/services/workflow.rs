@@ -761,9 +761,11 @@ impl WorkflowService {
             Some(url) => {
                 let worktree = {
                     let store = state.store.lock().await;
-                    store
-                        .thread_by_id(&thread_id)
-                        .map(|thread| thread.worktree_path.clone())
+                    store.thread_by_id(&thread_id).and_then(|thread| {
+                        store
+                            .project_by_id(&thread.project_id)
+                            .map(|project| thread.checkout_path(&project.path).to_string())
+                    })
                 };
                 match worktree {
                     Some(worktree) => {
@@ -1011,11 +1013,13 @@ impl WorkflowService {
             };
             let worktree = {
                 let store = state.store.lock().await;
-                store
+                let thread = store
                     .thread_by_id(&thread_id)
-                    .ok_or_else(|| format!("thread not found: {thread_id}"))?
-                    .worktree_path
-                    .clone()
+                    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+                let project = store
+                    .project_by_id(&thread.project_id)
+                    .ok_or_else(|| format!("project not found: {}", thread.project_id))?;
+                thread.checkout_path(&project.path).to_string()
             };
             auto_select_reviewer_specs(std::path::Path::new(&worktree)).await?
         } else {
@@ -1816,11 +1820,13 @@ impl WorkflowService {
         // Resolve worktree so we can look up the persona file.
         let worktree = {
             let store = state.store.lock().await;
-            store
+            let thread = store
                 .thread_by_id(&params.thread_id)
-                .ok_or_else(|| format!("thread not found: {}", params.thread_id))?
-                .worktree_path
-                .clone()
+                .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
+            let project = store
+                .project_by_id(&thread.project_id)
+                .ok_or_else(|| format!("project not found: {}", thread.project_id))?;
+            thread.checkout_path(&project.path).to_string()
         };
 
         let persona_name = params.persona.unwrap_or_else(|| "sisyphus".to_string());

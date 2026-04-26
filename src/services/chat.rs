@@ -2067,20 +2067,18 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         injection_completed,
         thread_id,
         should_start_title_gen,
-        input_tx,
     ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
-        let mut messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
 
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
         let thread_id = session.thread_id.clone();
         let history_path = session.history_path.clone();
-        let input_tx = session.input_tx.clone();
         let attached_channels = session
             .attached_channels
             .iter()
@@ -2105,7 +2103,6 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.injection_completed,
             thread_id,
             outbound.should_start_title_gen,
-            input_tx,
         )
     };
 
@@ -3500,13 +3497,14 @@ async fn build_agent_env_vars(
         (thread, project)
     };
 
-    let port_base =
-        match crate::services::thread::load_threadmill_config(&thread.worktree_path, &project.path)
-        {
-            Ok(config) => state_store::port_base_with_offset(config.ports.base, thread.port_offset)
-                .unwrap_or(3000),
-            Err(_) => 3000,
-        };
+    let port_base = match crate::services::thread::load_threadmill_config(
+        thread.checkout_path(&project.path),
+        &project.path,
+    ) {
+        Ok(config) => state_store::port_base_with_offset(config.ports.base, thread.port_offset)
+            .unwrap_or(3000),
+        Err(_) => 3000,
+    };
 
     let mut env = state_store::thread_env(&project, &thread, port_base);
     env.push(("THREADMILL_SESSION_ID".to_string(), session_id.to_string()));
@@ -3528,7 +3526,8 @@ async fn resolve_agent_launch(
             .project_by_id(&thread.project_id)
             .ok_or_else(|| format!("project not found: {}", thread.project_id))?
             .clone();
-        (project.path, thread.worktree_path)
+        let worktree_path = thread.checkout_path(&project.path).to_string();
+        (project.path, worktree_path)
     };
 
     let command = project_agent_command(&project_path, agent_name)
@@ -3609,7 +3608,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Active,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4243,7 +4242,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4312,7 +4311,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4375,7 +4374,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),
@@ -4658,7 +4657,7 @@ mod tests {
                     "project-1".to_string(),
                     "thread".to_string(),
                     "main".to_string(),
-                    "/tmp/project".to_string(),
+                    Some("/tmp/project".to_string()),
                     protocol::ThreadStatus::Closed,
                     protocol::SourceType::ExistingBranch,
                     Utc::now(),

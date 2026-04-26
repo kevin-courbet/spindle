@@ -324,6 +324,18 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("thread.hide", message))?;
             to_value("thread.hide", result)
         }
+        RequestDispatch::ThreadPromoteToWorktree(params) => {
+            let thread = ThreadService::promote_to_worktree(state, params)
+                .await
+                .map_err(|message| map_service_error("thread.promoteToWorktree", message))?;
+            to_value("thread.promoteToWorktree", thread)
+        }
+        RequestDispatch::ThreadDemoteToBase(params) => {
+            let thread = ThreadService::demote_to_base(state, params)
+                .await
+                .map_err(|message| map_service_error("thread.demoteToBase", message))?;
+            to_value("thread.demoteToBase", thread)
+        }
         RequestDispatch::TerminalAttach(params) => {
             terminal::attach(params, state, connection_state, outbound_tx)
                 .await
