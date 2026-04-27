@@ -216,6 +216,7 @@ pub async fn serve_listener(listener: TcpListener, mut shutdown_rx: oneshot::Rec
         warn!(error = %err, "failed to start opencode serve at startup");
     }
     let state = Arc::new(AppState::new(store));
+    state.title.clone().prewarm_background();
     if let Err(err) =
         services::chat::ChatService::recover_persisted_sessions(Arc::clone(&state)).await
     {

@@ -30,6 +30,7 @@ use crate::{
         checkpoint::CheckpointService,
         project::{load_project_default_chat_model, project_agent_command},
         terminal::TerminalConnectionState,
+        title::TitleAgentLaunch,
     },
     state_store, AppState,
 };
@@ -60,6 +61,7 @@ struct ChatSessionRuntime {
     thread_id: String,
     display_name: Option<String>,
     parent_session_id: Option<String>,
+    agent_command: Option<String>,
     system_prompt: Option<String>,
     initial_prompt: Option<String>,
     conversation_context: Option<String>,
@@ -164,6 +166,7 @@ impl ChatService {
                 thread_id: params.thread_id.clone(),
                 display_name: params.display_name.clone(),
                 parent_session_id: params.parent_session_id.clone(),
+                agent_command: Some(command.clone()),
                 system_prompt: params.system_prompt.clone(),
                 initial_prompt: params.initial_prompt.clone(),
                 conversation_context: None,
@@ -311,6 +314,12 @@ impl ChatService {
 
         let (_project_path, command, cwd, preferred_model) =
             resolve_agent_launch(&state, &params.thread_id, &effective_agent).await?;
+        {
+            let mut chat = state.chat.lock().await;
+            if let Some(session) = chat.sessions.get_mut(&params.session_id) {
+                session.agent_command = Some(command.clone());
+            }
+        }
         spawn_session_task(
             Arc::clone(&state),
             SessionLaunchContext {
@@ -335,7 +344,7 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatForkParams,
     ) -> Result<protocol::ChatForkResult, String> {
-        let (source_agent_type, source_display_name, history_root) = {
+        let (source_agent_type, source_display_name, source_agent_command, history_root) = {
             let chat = state.chat.lock().await;
             let source = chat
                 .sessions
@@ -350,6 +359,7 @@ impl ChatService {
             (
                 source.summary.agent_type.clone(),
                 source.display_name.clone(),
+                source.agent_command.clone(),
                 chat.history_root_path().to_path_buf(),
             )
         };
@@ -428,6 +438,7 @@ impl ChatService {
                 thread_id: params.thread_id.clone(),
                 display_name: fork_display_name.clone(),
                 parent_session_id: Some(params.source_session_id.clone()),
+                agent_command: source_agent_command,
                 system_prompt: None,
                 initial_prompt: None,
                 conversation_context,
@@ -2067,6 +2078,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         injection_completed,
         thread_id,
         should_start_title_gen,
+        title_agent,
     ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
@@ -2078,6 +2090,13 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
         let thread_id = session.thread_id.clone();
+        let title_agent = session
+            .agent_command
+            .as_ref()
+            .map(|command| TitleAgentLaunch {
+                agent_id: session.summary.agent_type.clone(),
+                command: command.clone(),
+            });
         let history_path = session.history_path.clone();
         let attached_channels = session
             .attached_channels
@@ -2103,6 +2122,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.injection_completed,
             thread_id,
             outbound.should_start_title_gen,
+            title_agent,
         )
     };
 
@@ -2189,7 +2209,11 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             let session_id = session_id.to_owned();
             let thread_id = thread_id.clone();
             tokio::spawn(async move {
-                match state.title.generate_title(&first_prompt).await {
+                match state
+                    .title
+                    .generate_title_with_agent(&first_prompt, title_agent)
+                    .await
+                {
                     Ok(title) => {
                         tracing::info!(%session_id, %title, "title generated");
                         {
@@ -3385,6 +3409,7 @@ fn discover_history_sessions(
                 thread_id: thread_id.clone(),
                 display_name: None,
                 parent_session_id: None,
+                agent_command: None,
                 system_prompt: None,
                 initial_prompt: None,
                 conversation_context: None,
@@ -3644,6 +3669,7 @@ mod tests {
             thread_id: thread_id.to_string(),
             display_name: None,
             parent_session_id: None,
+            agent_command: Some("opencode acp".to_string()),
             system_prompt: None,
             initial_prompt: None,
             conversation_context: None,
@@ -4747,6 +4773,7 @@ mod tests {
                 thread_id: thread_id.to_string(),
                 display_name: Some("Test Session".to_string()),
                 parent_session_id: None,
+                agent_command: Some("opencode acp".to_string()),
                 system_prompt: None,
                 initial_prompt: None,
                 conversation_context: None,

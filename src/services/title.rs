@@ -1,10 +1,10 @@
-use std::process::Stdio;
+use std::{process::Stdio, sync::Arc};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::agent_registry;
 
@@ -26,6 +26,12 @@ const MAX_TITLES_BEFORE_ROTATE: u32 = 50;
 
 pub struct TitleService {
     inner: Mutex<Option<TitleSession>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TitleAgentLaunch {
+    pub agent_id: String,
+    pub command: String,
 }
 
 #[allow(dead_code)]
@@ -54,7 +60,33 @@ impl Default for TitleService {
 }
 
 impl TitleService {
+    pub async fn prewarm(&self) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        *guard = Some(start_title_session(None).await?);
+        Ok(())
+    }
+
+    pub fn prewarm_background(self: Arc<Self>) {
+        tokio::spawn(async move {
+            if let Err(error) = self.prewarm().await {
+                warn!(error = %error, "failed to prewarm title generation session");
+            }
+        });
+    }
+
     pub async fn generate_title(&self, user_text: &str) -> Result<String, String> {
+        self.generate_title_with_agent(user_text, None).await
+    }
+
+    pub async fn generate_title_with_agent(
+        &self,
+        user_text: &str,
+        title_agent: Option<TitleAgentLaunch>,
+    ) -> Result<String, String> {
         let mut guard = self.inner.lock().await;
 
         // Start or rotate session if needed
@@ -62,11 +94,16 @@ impl TitleService {
             || guard
                 .as_ref()
                 .is_some_and(|s| s.titles_generated >= MAX_TITLES_BEFORE_ROTATE)
+            || guard.as_ref().is_some_and(|s| {
+                title_agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.agent_id != s.agent_id)
+            })
         {
             if let Some(mut old) = guard.take() {
                 let _ = old.child.kill().await;
             }
-            *guard = Some(start_title_session().await?);
+            *guard = Some(start_title_session(title_agent).await?);
         }
 
         let session = guard.as_mut().unwrap();
@@ -152,21 +189,29 @@ impl TitleService {
     }
 }
 
-async fn start_title_session() -> Result<TitleSession, String> {
-    let agents = agent_registry::discover_agents();
-    let agent = PREFERRED_AGENTS
-        .iter()
-        .find_map(|id| agents.iter().find(|a| a.id == *id && a.installed))
-        .ok_or("no installed agent available for title generation")?;
+async fn start_title_session(
+    title_agent: Option<TitleAgentLaunch>,
+) -> Result<TitleSession, String> {
+    let (agent_id, command) = if let Some(agent) = title_agent {
+        (agent.agent_id, agent.command)
+    } else {
+        let agents = agent_registry::discover_agents();
+        let agent = PREFERRED_AGENTS
+            .iter()
+            .find_map(|id| agents.iter().find(|a| a.id == *id && a.installed))
+            .ok_or("no installed agent available for title generation")?;
+        let command = match agent.resolved_path.as_deref() {
+            Some(path) if agent.launch_args.is_empty() => path.to_string(),
+            Some(path) => format!("{} {}", path, agent.launch_args.join(" ")),
+            None => agent.command.clone(),
+        };
+        (agent.id.clone(), command)
+    };
 
-    let command = agent.resolved_path.as_deref().unwrap_or(&agent.command);
+    info!(agent = %agent_id, command = %command, "starting title generation agent");
 
-    info!(agent = %agent.id, command = %command, "starting title generation agent");
-
-    let mut cmd = Command::new(command);
-    for arg in &agent.launch_args {
-        cmd.arg(arg);
-    }
+    let mut cmd = Command::new("bash");
+    cmd.args(["-lc", &command]);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -222,7 +267,7 @@ async fn start_title_session() -> Result<TitleSession, String> {
 
     // Pick small model if available
     if let Some(models) = session_resp.pointer("/result/models/availableModels") {
-        if let Some(small) = pick_small_model(models, &agent.id) {
+        if let Some(small) = pick_small_model(models, &agent_id) {
             info!(model = %small, "setting title model");
             send_line(
                 &mut stdin,
@@ -238,7 +283,7 @@ async fn start_title_session() -> Result<TitleSession, String> {
         }
     }
 
-    info!(session_id = %session_id, agent = %agent.id, "title session ready");
+    info!(session_id = %session_id, agent = %agent_id, "title session ready");
 
     Ok(TitleSession {
         child,
@@ -247,7 +292,7 @@ async fn start_title_session() -> Result<TitleSession, String> {
         acp_session_id: session_id,
         request_counter: 10, // start after handshake IDs
         titles_generated: 0,
-        agent_id: agent.id.clone(),
+        agent_id,
     })
 }
 

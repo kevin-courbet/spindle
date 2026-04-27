@@ -112,7 +112,10 @@ fn install_method_from(agent: &BuiltInAgent) -> InstallMethod {
 }
 
 fn which(binary: &str) -> Option<String> {
-    let output = Command::new("which").arg(binary).output().ok()?;
+    let output = Command::new("bash")
+        .args(["-lc", &format!("command -v {binary}")])
+        .output()
+        .ok()?;
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if path.is_empty() {
