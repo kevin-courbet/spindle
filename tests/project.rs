@@ -253,6 +253,39 @@ async fn project_clone_registers_project() {
 }
 
 #[tokio::test]
+async fn project_clone_creates_missing_destination_parent() {
+    let mut harness = setup_test_server().await;
+    let clone_root = std::env::temp_dir().join(common::unique_name("clone-missing-parent"));
+    harness.register_cleanup_path(clone_root.clone());
+
+    let source_project = common::create_git_project(None, false)
+        .await
+        .expect("create source git project");
+    harness.register_cleanup_path(source_project.root_dir.clone());
+
+    let clone_path = clone_root.join("autonomynexus").join("repo");
+    assert!(!clone_path.parent().expect("clone parent").exists());
+
+    let cloned = harness
+        .rpc(
+            "project.clone",
+            json!({
+                "url": source_project.root_dir.join("origin.git").to_string_lossy(),
+                "path": clone_path.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("clone project with missing owner parent");
+
+    let actual_path = std::path::PathBuf::from(cloned["path"].as_str().expect("cloned path"));
+    assert_eq!(
+        std::fs::canonicalize(actual_path).expect("canonical cloned path"),
+        std::fs::canonicalize(&clone_path).expect("canonical requested clone path")
+    );
+    assert!(clone_path.is_dir());
+}
+
+#[tokio::test]
 async fn project_list_returns_presets_from_threadmill_config() {
     let mut harness = setup_test_server().await;
     let config = r#"presets:

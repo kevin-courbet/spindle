@@ -105,12 +105,8 @@ impl ProjectService {
         let parent = destination
             .parent()
             .ok_or_else(|| format!("invalid clone destination: {}", destination.display()))?;
-        if !parent.exists() {
-            return Err(format!(
-                "destination parent does not exist: {}",
-                parent.display()
-            ));
-        }
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create clone parent {}: {err}", parent.display()))?;
 
         let destination_str = destination
             .to_str()
