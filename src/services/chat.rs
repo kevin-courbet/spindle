@@ -30,7 +30,6 @@ use crate::{
         checkpoint::CheckpointService,
         project::{load_project_default_chat_model, project_agent_command},
         terminal::TerminalConnectionState,
-        title::TitleAgentLaunch,
     },
     state_store, AppState,
 };
@@ -829,6 +828,7 @@ impl ChatService {
             replacement_payload,
             prompt_updates,
             mut auto_checkpoints,
+            title_prompt_to_generate,
             history_path,
             consumed_conversation_context,
         ) = {
@@ -854,6 +854,7 @@ impl ChatService {
                 replacement_payload,
                 history_updates: prompt_updates,
                 auto_checkpoints,
+                title_prompt_to_generate,
                 consumed_conversation_context,
             } = apply_inbound_status_updates(&state, session, messages);
             (
@@ -864,12 +865,22 @@ impl ChatService {
                 replacement_payload,
                 prompt_updates,
                 auto_checkpoints,
+                title_prompt_to_generate,
                 history_path,
                 consumed_conversation_context,
             )
         };
 
         emit_status_transitions(&state, transitions).await;
+
+        if let Some(first_prompt) = title_prompt_to_generate {
+            spawn_title_generation(
+                Arc::clone(&state),
+                session_id.clone(),
+                thread_id.clone(),
+                first_prompt,
+            );
+        }
 
         // Capture history cursor BEFORE writing user echoes to the JSONL.
         // Auto-checkpoints need the line count from before the echo so that
@@ -1641,6 +1652,7 @@ struct SessionProcessingOutcome {
     replacement_payload: Option<Vec<u8>>,
     history_updates: Vec<Value>,
     auto_checkpoints: Vec<AutoCheckpointRequest>,
+    title_prompt_to_generate: Option<String>,
     /// Whether the per-session conversation context was consumed during this batch.
     consumed_conversation_context: bool,
 }
@@ -1656,6 +1668,7 @@ fn apply_inbound_status_updates(
     let mut payload_rewritten = false;
     let mut history_updates = Vec::new();
     let mut auto_checkpoints = Vec::new();
+    let mut title_prompt_to_generate = None;
     let mut consumed_conversation_context = false;
 
     for message in &mut messages {
@@ -1677,7 +1690,6 @@ fn apply_inbound_status_updates(
                 session.pending_prompt_ids.insert(id);
             }
 
-            // Capture first user prompt text for title generation
             if session.user_prompt_count == 0 {
                 if let Some(text) = params
                     .and_then(|p| p.get("prompt"))
@@ -1698,6 +1710,12 @@ fn apply_inbound_status_updates(
                     .filter(|t| !t.is_empty())
                 {
                     session.first_prompt_text = Some(text);
+                    if session.summary.parent_session_id.is_none()
+                        && !session.had_conversation_context
+                        && session.summary.title.is_none()
+                    {
+                        title_prompt_to_generate = session.first_prompt_text.clone();
+                    }
                 }
             }
             session.user_prompt_count += 1;
@@ -1741,6 +1759,7 @@ fn apply_inbound_status_updates(
         replacement_payload,
         history_updates,
         auto_checkpoints,
+        title_prompt_to_generate,
         consumed_conversation_context,
     }
 }
@@ -1851,10 +1870,9 @@ fn user_prompt_history_update(session_id_value: Value, text: &str) -> Value {
 struct OutboundResult {
     transitions: Vec<StatusTransition>,
     injection_completed: bool,
-    should_start_title_gen: bool,
 }
 
-/// Returns status transitions, injection completion flag, and whether to start title generation.
+/// Returns status transitions and whether the handshake-time injection completed.
 fn apply_outbound_status_updates(
     state: &Arc<AppState>,
     session: &mut ChatSessionRuntime,
@@ -1863,7 +1881,6 @@ fn apply_outbound_status_updates(
     let mut result = OutboundResult {
         transitions: Vec::new(),
         injection_completed: false,
-        should_start_title_gen: false,
     };
 
     for message in messages {
@@ -1901,18 +1918,6 @@ fn apply_outbound_status_updates(
         }
 
         reset_status_tracking(session, &mut result.transitions);
-
-        // Detect first user turn completion → trigger title generation.
-        // Only for genuine new sessions (not reverted/loaded with context).
-        if !result.injection_completed
-            && session.user_prompt_count > 0
-            && session.first_prompt_text.is_some()
-            && session.summary.parent_session_id.is_none()
-            && !session.had_conversation_context
-            && session.summary.title.is_none()
-        {
-            result.should_start_title_gen = true;
-        }
     }
 
     result
@@ -2070,16 +2075,7 @@ fn rewrite_session_id(payload: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
 }
 
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
-    let (
-        targets,
-        history_path,
-        updates,
-        transitions,
-        injection_completed,
-        thread_id,
-        should_start_title_gen,
-        title_agent,
-    ) = {
+    let (targets, history_path, updates, transitions, injection_completed, thread_id) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
@@ -2090,13 +2086,6 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
         let thread_id = session.thread_id.clone();
-        let title_agent = session
-            .agent_command
-            .as_ref()
-            .map(|command| TitleAgentLaunch {
-                agent_id: session.summary.agent_type.clone(),
-                command: command.clone(),
-            });
         let history_path = session.history_path.clone();
         let attached_channels = session
             .attached_channels
@@ -2121,8 +2110,6 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.transitions,
             outbound.injection_completed,
             thread_id,
-            outbound.should_start_title_gen,
-            title_agent,
         )
     };
 
@@ -2194,52 +2181,43 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
     if !dead_channels.is_empty() {
         detach_channels(Arc::clone(&state), dead_channels).await;
     }
+}
 
-    // --- Title generation via dedicated TitleService ---
-    if should_start_title_gen {
-        let first_prompt = {
-            let chat = state.chat.lock().await;
-            chat.sessions
-                .get(session_id)
-                .and_then(|s| s.first_prompt_text.clone())
-                .unwrap_or_default()
-        };
-        if !first_prompt.is_empty() {
-            let state = Arc::clone(&state);
-            let session_id = session_id.to_owned();
-            let thread_id = thread_id.clone();
-            tokio::spawn(async move {
-                match state
-                    .title
-                    .generate_title_with_agent(&first_prompt, title_agent)
-                    .await
+fn spawn_title_generation(
+    state: Arc<AppState>,
+    session_id: String,
+    thread_id: String,
+    first_prompt: String,
+) {
+    if first_prompt.trim().is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        match state.title.generate_title(&first_prompt).await {
+            Ok(title) => {
+                tracing::info!(%session_id, %title, "title generated");
                 {
-                    Ok(title) => {
-                        tracing::info!(%session_id, %title, "title generated");
-                        {
-                            let mut chat = state.chat.lock().await;
-                            if let Some(session) = chat.sessions.get_mut(&session_id) {
-                                session.summary.title = Some(title.clone());
-                            }
-                        }
-                        {
-                            let mut store = state.store.lock().await;
-                            if let Some(thread) =
-                                store.data.threads.iter_mut().find(|t| t.id == thread_id)
-                            {
-                                thread.display_name = Some(title);
-                            }
-                            store.save().ok();
-                        }
-                        emit_state_delta_updated(&state, &thread_id, &session_id).await;
-                    }
-                    Err(err) => {
-                        tracing::warn!(%session_id, error = %err, "title generation failed");
+                    let mut chat = state.chat.lock().await;
+                    if let Some(session) = chat.sessions.get_mut(&session_id) {
+                        session.summary.title = Some(title.clone());
                     }
                 }
-            });
+                {
+                    let mut store = state.store.lock().await;
+                    if let Some(thread) = store.data.threads.iter_mut().find(|t| t.id == thread_id)
+                    {
+                        thread.display_name = Some(title);
+                    }
+                    store.save().ok();
+                }
+                emit_state_delta_updated(&state, &thread_id, &session_id).await;
+            }
+            Err(err) => {
+                tracing::warn!(%session_id, error = %err, "title generation failed");
+            }
         }
-    }
+    });
 }
 
 async fn emit_worker_update_to_parent(state: &Arc<AppState>, worker_session_id: &str) {
@@ -3738,6 +3716,84 @@ mod tests {
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].old_status, protocol::AgentStatus::Idle);
         assert_eq!(transitions[0].new_status, protocol::AgentStatus::Busy);
+
+        cancel_stall_timer(&mut session);
+    }
+
+    #[tokio::test]
+    async fn first_inbound_user_prompt_starts_title_generation_immediately() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+
+        let SessionProcessingOutcome {
+            title_prompt_to_generate,
+            ..
+        } = apply_inbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "text", "text": "Write me a poem"}]
+                }
+            })],
+        );
+
+        assert_eq!(title_prompt_to_generate.as_deref(), Some("Write me a poem"));
+        assert_eq!(
+            session.first_prompt_text.as_deref(),
+            Some("Write me a poem")
+        );
+
+        let SessionProcessingOutcome {
+            title_prompt_to_generate,
+            ..
+        } = apply_inbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "text", "text": "Second prompt"}]
+                }
+            })],
+        );
+
+        assert_eq!(title_prompt_to_generate, None);
+
+        cancel_stall_timer(&mut session);
+    }
+
+    #[tokio::test]
+    async fn inbound_prompt_with_restored_context_skips_title_generation() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.had_conversation_context = true;
+
+        let SessionProcessingOutcome {
+            title_prompt_to_generate,
+            ..
+        } = apply_inbound_status_updates(
+            &state,
+            &mut session,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session-1",
+                    "prompt": [{"type": "text", "text": "Continue from here"}]
+                }
+            })],
+        );
+
+        assert_eq!(title_prompt_to_generate, None);
 
         cancel_stall_timer(&mut session);
     }
