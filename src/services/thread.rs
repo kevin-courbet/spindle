@@ -112,20 +112,15 @@ impl ThreadService {
         state: Arc<AppState>,
         params: protocol::ThreadCreateParams,
     ) -> Result<protocol::Thread, String> {
-        let (project, thread_name, branch, worktree_path) = {
+        let (project, mut thread_name, mut branch, mut worktree_path) = {
             let store = state.store.lock().await;
             let project = store
                 .project_by_id(&params.project_id)
                 .ok_or_else(|| format!("project not found: {}", params.project_id))?
                 .clone();
 
-            let thread_name = sanitize_name(&params.name);
-            if active_thread_name_exists(&store, &project.id, &thread_name) {
-                return Err(format!(
-                    "thread name already exists for project {}: {}",
-                    project.id, thread_name
-                ));
-            }
+            let requested_name = sanitize_name(&params.name);
+            let thread_name = allocate_thread_name(&store, &project.id, &requested_name)?;
 
             let branch = resolve_branch(&params, &thread_name)?;
             let worktree_path =
@@ -140,17 +135,17 @@ impl ThreadService {
         let (thread, protocol_thread) = {
             let mut store = state.store.lock().await;
             if active_thread_name_exists(&store, &project.id, &thread_name) {
-                return Err(format!(
-                    "thread name already exists for project {}: {}",
-                    project.id, thread_name
-                ));
+                thread_name = allocate_thread_name(&store, &project.id, &thread_name)?;
+                branch = resolve_branch(&params, &thread_name)?;
+                worktree_path = planned_worktree_path(
+                    &project,
+                    &thread_name,
+                    &params.source_type,
+                    params.sandbox,
+                );
             }
 
-            let tmux_session = format!(
-                "tm_{}_{}",
-                short_id(&project.id),
-                sanitize_name(&params.name)
-            );
+            let tmux_session = format!("tm_{}_{}", short_id(&project.id), thread_name);
             let checkout_path = thread_checkout_path(worktree_path.as_deref(), &project.path);
             let config = load_threadmill_config(checkout_path, &project.path)?;
             let port_offset = store.allocate_port_offset(&project.id, config.ports.offset)?;
@@ -963,6 +958,43 @@ fn active_thread_name_exists(
     })
 }
 
+fn allocate_thread_name(
+    store: &crate::state_store::StateStore,
+    project_id: &str,
+    requested_name: &str,
+) -> Result<String, String> {
+    if !active_thread_name_exists(store, project_id, requested_name) {
+        return Ok(requested_name.to_string());
+    }
+
+    let Some(mut suffix) = new_thread_placeholder_suffix(requested_name) else {
+        return Err(format!(
+            "thread name already exists for project {}: {}",
+            project_id, requested_name
+        ));
+    };
+
+    loop {
+        suffix += 1;
+        let candidate = format!("new-thread-{suffix}");
+        if !active_thread_name_exists(store, project_id, &candidate) {
+            return Ok(candidate);
+        }
+    }
+}
+
+fn new_thread_placeholder_suffix(value: &str) -> Option<u64> {
+    if value == "new-thread" {
+        return Some(1);
+    }
+
+    let suffix = value.strip_prefix("new-thread-")?;
+    if suffix.is_empty() || !suffix.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
 fn requires_shared_checkout_branch_alignment(params: &protocol::ThreadCreateParams) -> bool {
     !params.sandbox
         && (params.branch.is_some()
@@ -1659,6 +1691,63 @@ mod tests {
         restore_workspace_root(previous_workspace_root);
         let _ = fs::remove_dir_all(project.root_dir);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn create_auto_allocates_next_new_thread_placeholder_name() {
+        let _guard = env_lock().lock().await;
+        let project = create_git_project().await;
+        let project_id = "project-1".to_string();
+        let state = Arc::new(
+            app_state_with_thread(
+                &project_id,
+                &project,
+                crate::state_store::Thread::new(
+                    "existing-thread".to_string(),
+                    project_id.clone(),
+                    "new-thread-3".to_string(),
+                    "new-thread-3".to_string(),
+                    Some(
+                        project
+                            .root_dir
+                            .join("new-thread-3")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    protocol::ThreadStatus::Active,
+                    protocol::SourceType::NewFeature,
+                    Utc::now(),
+                    "tm_existing_thread".to_string(),
+                    0,
+                ),
+            )
+            .await,
+        );
+
+        let created = ThreadService::create(
+            Arc::clone(&state),
+            protocol::ThreadCreateParams {
+                project_id: project_id.clone(),
+                name: "new-thread-3".to_string(),
+                source_type: protocol::SourceType::NewFeature,
+                branch: None,
+                pr_url: None,
+                sandbox: true,
+            },
+        )
+        .await
+        .expect("create auto-named thread with colliding placeholder");
+
+        abort_create_task(&state, &created.id).await;
+
+        assert_eq!(created.name, "new-thread-4");
+        assert_eq!(created.branch, "new-thread-4");
+        assert!(created
+            .worktree_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("new-thread-4")));
+
+        let _ = fs::remove_dir_all(project.root_dir);
     }
 
     #[tokio::test]
