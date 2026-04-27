@@ -671,6 +671,21 @@ async fn detect_default_branch(path: &str) -> Result<String, String> {
         }
     }
 
+    let symbolic_head = Command::new("git")
+        .args(["-C", path, "symbolic-ref", "--short", "HEAD"])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run git symbolic-ref --short HEAD: {err}"))?;
+
+    if symbolic_head.status.success() {
+        let value = String::from_utf8_lossy(&symbolic_head.stdout)
+            .trim()
+            .to_string();
+        if !value.is_empty() && value != "HEAD" {
+            return Ok(value);
+        }
+    }
+
     let head = Command::new("git")
         .args(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()

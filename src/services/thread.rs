@@ -1151,25 +1151,33 @@ async fn create_worktree(
 
     match thread.source_type {
         protocol::SourceType::NewFeature => {
-            let base = format!("origin/{default_branch}");
-            let args = [
-                "worktree",
-                "add",
-                worktree_path,
-                "-b",
-                &thread.branch,
-                &base,
-            ];
-            if git(project_path, &args).await.is_err() {
-                let fallback = [
+            if has_head_commit(project_path).await? {
+                let base = format!("origin/{default_branch}");
+                let args = [
                     "worktree",
                     "add",
                     worktree_path,
                     "-b",
                     &thread.branch,
-                    default_branch,
+                    &base,
                 ];
-                git(project_path, &fallback).await?;
+                if git(project_path, &args).await.is_err() {
+                    let fallback = [
+                        "worktree",
+                        "add",
+                        worktree_path,
+                        "-b",
+                        &thread.branch,
+                        default_branch,
+                    ];
+                    git(project_path, &fallback).await?;
+                }
+            } else {
+                git(
+                    project_path,
+                    &["worktree", "add", "-b", &thread.branch, worktree_path],
+                )
+                .await?;
             }
         }
         protocol::SourceType::ExistingBranch | protocol::SourceType::PullRequest => {
@@ -1522,6 +1530,18 @@ async fn has_origin_remote(project_path: &str) -> Result<bool, String> {
     ))
 }
 
+async fn has_head_commit(project_path: &str) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run git rev-parse --verify HEAD: {err}"))?;
+
+    Ok(output.status.success())
+}
+
 async fn git(project_path: &str, args: &[&str]) -> Result<(), String> {
     let output = Command::new("git")
         .arg("-C")
@@ -1701,6 +1721,37 @@ mod tests {
         restore_workspace_root(previous_workspace_root);
         let _ = fs::remove_dir_all(project.root_dir);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn create_worktree_from_unborn_repository_creates_orphan_branch() {
+        let _guard = env_lock().lock().await;
+        let project = create_unborn_git_project().await;
+        let worktree_path = project.root_dir.join("feature-worktree");
+        let thread = crate::state_store::Thread::new(
+            "thread-1".to_string(),
+            "project-1".to_string(),
+            "feature-worktree".to_string(),
+            "feature-worktree".to_string(),
+            Some(worktree_path.to_string_lossy().to_string()),
+            protocol::ThreadStatus::Creating,
+            protocol::SourceType::NewFeature,
+            Utc::now(),
+            "tm_feature_worktree".to_string(),
+            0,
+        );
+
+        create_worktree(&project.repo_path.to_string_lossy(), "main", &thread)
+            .await
+            .expect("create worktree from unborn repository");
+
+        assert!(worktree_path.is_dir());
+        let branch = git_raw(&["symbolic-ref", "--short", "HEAD"], Some(&worktree_path))
+            .await
+            .expect("read worktree branch");
+        assert_eq!(branch.trim(), "feature-worktree");
+
+        let _ = fs::remove_dir_all(project.root_dir);
     }
 
     #[tokio::test]
@@ -2035,6 +2086,24 @@ mod tests {
         git(&repo_path, &["push", "-u", "origin", "main"])
             .await
             .expect("push main");
+
+        TestProjectRepo {
+            root_dir,
+            repo_path,
+        }
+    }
+
+    async fn create_unborn_git_project() -> TestProjectRepo {
+        let root_dir = unique_temp_path("spindle-thread-service");
+        let repo_path = root_dir.join("repo");
+        fs::create_dir_all(&repo_path).expect("create repo dir");
+
+        git_raw(&["init", repo_path.to_str().unwrap()], None)
+            .await
+            .expect("init repo");
+        git(&repo_path, &["checkout", "-b", "main"])
+            .await
+            .expect("create main branch");
 
         TestProjectRepo {
             root_dir,

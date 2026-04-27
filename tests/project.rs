@@ -146,6 +146,25 @@ async fn project_add_non_git_directory_registers_workspace() {
 }
 
 #[tokio::test]
+async fn project_add_unborn_git_repository_uses_symbolic_head_branch() {
+    let mut harness = setup_test_server().await;
+    let project = common::create_unborn_git_project_without_remote("main")
+        .await
+        .expect("create unborn git project");
+    harness.register_cleanup_path(project.root_dir.clone());
+
+    let added = harness
+        .rpc(
+            "project.add",
+            json!({ "path": project.repo_path.to_string_lossy() }),
+        )
+        .await
+        .expect("add unborn git project");
+
+    assert_eq!(added["default_branch"], json!("main"));
+}
+
+#[tokio::test]
 async fn project_add_accepts_bare_repository() {
     let mut harness = setup_test_server().await;
     let project = common::create_git_project(None, true)

@@ -581,6 +581,25 @@ pub async fn create_git_project_without_remote(
     })
 }
 
+pub async fn create_unborn_git_project_without_remote(branch: &str) -> Result<TestProject, String> {
+    let root_dir = unique_temp_path("spindle-project");
+    fs::create_dir_all(&root_dir)
+        .map_err(|err| format!("failed to create {}: {err}", root_dir.display()))?;
+
+    let repo_path = root_dir.join("repo");
+    fs::create_dir_all(&repo_path)
+        .map_err(|err| format!("failed to create {}: {err}", repo_path.display()))?;
+
+    run_cmd("git", &["init", &repo_path.to_string_lossy()], None).await?;
+    run_git(&repo_path, &["checkout", "-b", branch]).await?;
+
+    Ok(TestProject {
+        root_dir,
+        repo_path,
+        feature_branch: None,
+    })
+}
+
 pub fn unique_name(prefix: &str) -> String {
     format!("{}-{}", prefix, Uuid::new_v4().simple())
 }
