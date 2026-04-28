@@ -343,16 +343,21 @@ impl ChatService {
         state: Arc<AppState>,
         params: protocol::ChatForkParams,
     ) -> Result<protocol::ChatForkResult, String> {
+        let source_thread_id = params.thread_id.clone();
+        let target_thread_id = params
+            .target_thread_id
+            .clone()
+            .unwrap_or_else(|| source_thread_id.clone());
         let (source_agent_type, source_display_name, source_agent_command, history_root) = {
             let chat = state.chat.lock().await;
             let source = chat
                 .sessions
                 .get(&params.source_session_id)
                 .ok_or_else(|| format!("source session not found: {}", params.source_session_id))?;
-            if source.thread_id != params.thread_id {
+            if source.thread_id != source_thread_id {
                 return Err(format!(
                     "source session {} does not belong to thread {}",
-                    params.source_session_id, params.thread_id
+                    params.source_session_id, source_thread_id
                 ));
             }
             (
@@ -365,7 +370,7 @@ impl ChatService {
 
         // Validate cursor against source JSONL
         let source_path =
-            history_path_for_session(&history_root, &params.thread_id, &params.source_session_id);
+            history_path_for_session(&history_root, &source_thread_id, &params.source_session_id);
         if source_path.exists() {
             let line_count = count_lines(&source_path)?;
             if params.message_cursor > line_count {
@@ -379,7 +384,7 @@ impl ChatService {
         // Copy source JSONL up to cursor into new session file
         let fork_session_id = Uuid::new_v4().to_string();
         let fork_path =
-            history_path_for_session(&history_root, &params.thread_id, &fork_session_id);
+            history_path_for_session(&history_root, &target_thread_id, &fork_session_id);
 
         if source_path.exists() && params.message_cursor > 0 {
             if let Some(parent) = fork_path.parent() {
@@ -434,7 +439,7 @@ impl ChatService {
                     display_name: fork_display_name.clone(),
                     parent_session_id: Some(params.source_session_id.clone()),
                 },
-                thread_id: params.thread_id.clone(),
+                thread_id: target_thread_id.clone(),
                 display_name: fork_display_name.clone(),
                 parent_session_id: Some(params.source_session_id.clone()),
                 agent_command: source_agent_command,
@@ -470,19 +475,19 @@ impl ChatService {
             };
             chat.sessions.insert(fork_session_id.clone(), runtime);
             chat.sessions_by_thread
-                .entry(params.thread_id.clone())
+                .entry(target_thread_id.clone())
                 .or_default()
                 .push(fork_session_id.clone());
         }
 
         state.emit_chat_session_created(protocol::ChatSessionCreatedEvent {
-            thread_id: params.thread_id.clone(),
+            thread_id: target_thread_id.clone(),
             session_id: fork_session_id.clone(),
             agent_type: source_agent_type.clone(),
             display_name: fork_display_name.clone(),
             parent_session_id: Some(params.source_session_id.clone()),
         });
-        emit_state_delta_added(&state, &params.thread_id, &fork_session_id).await;
+        emit_state_delta_added(&state, &target_thread_id, &fork_session_id).await;
 
         Ok(protocol::ChatForkResult {
             session_id: fork_session_id,
@@ -4872,6 +4877,7 @@ mod tests {
             Arc::clone(&state),
             protocol::ChatForkParams {
                 thread_id: thread_id.to_string(),
+                target_thread_id: None,
                 source_session_id: source_session_id.to_string(),
                 message_cursor: 2,
             },
@@ -4920,6 +4926,7 @@ mod tests {
             Arc::clone(&state),
             protocol::ChatForkParams {
                 thread_id: thread_id.to_string(),
+                target_thread_id: None,
                 source_session_id: source_session_id.to_string(),
                 message_cursor: 99,
             },
@@ -4933,6 +4940,7 @@ mod tests {
             Arc::clone(&state),
             protocol::ChatForkParams {
                 thread_id: thread_id.to_string(),
+                target_thread_id: None,
                 source_session_id: source_session_id.to_string(),
                 message_cursor: 1,
             },
@@ -4940,5 +4948,35 @@ mod tests {
         .await
         .expect("second fork should succeed");
         assert!(result2.display_name.as_ref().unwrap().contains("fork #2"));
+
+        let target_thread_id = "thread-2";
+        let result3 = ChatService::fork(
+            Arc::clone(&state),
+            protocol::ChatForkParams {
+                thread_id: thread_id.to_string(),
+                target_thread_id: Some(target_thread_id.to_string()),
+                source_session_id: source_session_id.to_string(),
+                message_cursor: 2,
+            },
+        )
+        .await
+        .expect("cross-thread fork should succeed");
+
+        let target_fork_history =
+            history_path_for_session(&history_root, target_thread_id, &result3.session_id);
+        assert!(
+            target_fork_history.exists(),
+            "cross-thread fork history should be written under target thread"
+        );
+        {
+            let chat = state.chat.lock().await;
+            let target_fork_session = chat.sessions.get(&result3.session_id).unwrap();
+            assert_eq!(target_fork_session.thread_id, target_thread_id);
+            assert!(chat
+                .sessions_by_thread
+                .get(target_thread_id)
+                .unwrap()
+                .contains(&result3.session_id));
+        }
     }
 }

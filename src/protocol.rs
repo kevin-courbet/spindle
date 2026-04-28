@@ -1628,6 +1628,8 @@ pub type ChatLoadResult = ChatStartResult;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatForkParams {
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_thread_id: Option<String>,
     pub source_session_id: String,
     pub message_cursor: u64,
 }
