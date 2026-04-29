@@ -123,6 +123,15 @@ pub async fn dispatch_request(
             to_value("system.stats", stats)
         }
         RequestDispatch::StateSnapshot(_) => {
+            if let Err(message) =
+                crate::services::external_sessions::ExternalSessionScanner::scan_now(Arc::clone(
+                    &state,
+                ))
+                .await
+            {
+                tracing::warn!(error = %message, "external session scan failed before state snapshot");
+            }
+
             let (projects, mut threads) = {
                 let store = state.store.lock().await;
                 (

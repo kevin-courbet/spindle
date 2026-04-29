@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -41,6 +41,8 @@ pub struct AppState {
     pub store: Arc<Mutex<StateStore>>,
     pub workflows: Arc<Mutex<services::workflow::WorkflowStore>>,
     pub chat: Arc<Mutex<services::chat::ChatState>>,
+    pub(crate) external_session_scan_lock: Arc<Mutex<()>>,
+    active_connections: Arc<AtomicUsize>,
     pub create_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     pub title: Arc<services::title::TitleService>,
 }
@@ -69,9 +71,23 @@ impl AppState {
             store: Arc::new(Mutex::new(store)),
             workflows: Arc::new(Mutex::new(workflows)),
             chat: Arc::new(Mutex::new(services::chat::ChatState::new(history_root))),
+            external_session_scan_lock: Arc::new(Mutex::new(())),
+            active_connections: Arc::new(AtomicUsize::new(0)),
             create_tasks: Arc::new(Mutex::new(HashMap::new())),
             title: Arc::new(services::title::TitleService::new()),
         }
+    }
+
+    pub(crate) fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::Relaxed)
+    }
+
+    fn increment_active_connections(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_active_connections(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn alloc_channel_id_with<F>(&self, mut is_active: F) -> u16
@@ -228,6 +244,7 @@ pub async fn serve_listener(listener: TcpListener, mut shutdown_rx: oneshot::Rec
         warn!(error = %err, "failed to reconcile workflows");
     }
     services::workflow::WorkflowService::start_event_listener(Arc::clone(&state));
+    services::external_sessions::ExternalSessionScanner::start(Arc::clone(&state));
     let local_addr = match listener.local_addr() {
         Ok(addr) => addr,
         Err(err) => {
@@ -490,6 +507,8 @@ async fn handle_connection(
     let events_task = Arc::new(Mutex::new(None::<JoinHandle<()>>));
 
     info!(%connection_id, %peer_addr, "client connected");
+    state.increment_active_connections();
+    services::external_sessions::ExternalSessionScanner::trigger(Arc::clone(&state));
 
     while let Some(frame_res) = ws_reader.next().await {
         match frame_res {
@@ -585,6 +604,7 @@ async fn handle_connection(
     }
     writer_task.abort();
     let _ = writer_task.await;
+    state.decrement_active_connections();
     info!(%connection_id, "client disconnected");
     Ok(())
 }

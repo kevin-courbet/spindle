@@ -1,6 +1,7 @@
 pub mod agent_registry;
 pub mod chat;
 pub mod checkpoint;
+pub mod external_sessions;
 pub mod file;
 pub mod git;
 pub mod issues;

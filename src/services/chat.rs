@@ -132,6 +132,85 @@ struct PersistedChatSessionMetadata {
 }
 
 impl ChatService {
+    pub(crate) async fn register_imported_session(
+        state: Arc<AppState>,
+        thread_id: String,
+        session_id: String,
+        summary: protocol::ChatSessionSummary,
+        acp_session_id: Option<String>,
+        history_path: PathBuf,
+    ) {
+        {
+            let mut chat = state.chat.lock().await;
+            if chat.sessions.contains_key(&session_id) {
+                if let Some(existing) = chat.sessions.get_mut(&session_id) {
+                    existing.summary = summary;
+                    existing.thread_id = thread_id.clone();
+                    existing.acp_session_id = acp_session_id;
+                    existing.ended_emitted = true;
+                    existing.history_path = history_path;
+                }
+                if !chat
+                    .sessions_by_thread
+                    .get(&thread_id)
+                    .is_some_and(|sessions| sessions.iter().any(|id| id == &session_id))
+                {
+                    chat.sessions_by_thread
+                        .entry(thread_id.clone())
+                        .or_default()
+                        .push(session_id.clone());
+                }
+                drop(chat);
+                emit_state_delta_updated(&state, &thread_id, &session_id).await;
+                return;
+            }
+
+            let runtime = ChatSessionRuntime {
+                summary,
+                thread_id: thread_id.clone(),
+                display_name: None,
+                parent_session_id: None,
+                agent_command: None,
+                system_prompt: None,
+                initial_prompt: None,
+                conversation_context: None,
+                acp_session_id,
+                attached_channels: HashSet::new(),
+                input_tx: None,
+                stop_tx: None,
+                status_notify: Arc::new(Notify::new()),
+                ended_emitted: true,
+                history_path,
+                input_buffer: Vec::new(),
+                output_buffer: Vec::new(),
+                active_tools: HashSet::new(),
+                total_tool_count: 0,
+                latest_tool_name: None,
+                latest_tool_title: None,
+                started_at: None,
+                pending_prompt_ids: HashSet::new(),
+                checkpoint_seq: 0,
+                last_update_time: None,
+                stall_generation: 0,
+                stall_task: None,
+                modes: None,
+                models: None,
+                config_options: None,
+                injection_prompt_id: None,
+                user_prompt_count: 0,
+                first_prompt_text: None,
+                had_conversation_context: false,
+            };
+            chat.sessions.insert(session_id.clone(), runtime);
+            chat.sessions_by_thread
+                .entry(thread_id.clone())
+                .or_default()
+                .push(session_id.clone());
+        }
+
+        emit_state_delta_added(&state, &thread_id, &session_id).await;
+    }
+
     pub async fn start(
         state: Arc<AppState>,
         params: protocol::ChatStartParams,
@@ -2652,7 +2731,7 @@ fn clear_restored_session_marker(
     }
 }
 
-fn persist_session_metadata(
+pub(crate) fn persist_session_metadata(
     history_root: &Path,
     thread_id: &str,
     session_id: &str,
