@@ -78,6 +78,16 @@ enum ThreadCommand {
         #[arg(long)]
         pretty: bool,
     },
+    MoveToWorktree {
+        thread_id: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    MoveToLocalCheckout {
+        thread_id: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
     Info {
         #[arg(long)]
         pretty: bool,
@@ -541,6 +551,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 });
                 if let Some(branch) = branch {
                     params["branch"] = json!(branch);
+                    params["sandbox"] = json!(true);
                 }
                 let result =
                     rpc_request(&ws_url, auth_token.as_deref(), "thread.create", params).await?;
@@ -552,6 +563,34 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     auth_token.as_deref(),
                     "thread.close",
                     json!({ "thread_id": thread_id, "mode": "close" }),
+                )
+                .await?;
+                print_json(&result, pretty)
+            }
+            ThreadCommand::MoveToWorktree { thread_id, pretty } => {
+                let thread_id = match thread_id {
+                    Some(id) => id,
+                    None => resolve_current_thread_id(&ws_url, auth_token.as_deref()).await?,
+                };
+                let result = rpc_request(
+                    &ws_url,
+                    auth_token.as_deref(),
+                    "thread.promoteToWorktree",
+                    json!({ "thread_id": thread_id }),
+                )
+                .await?;
+                print_json(&result, pretty)
+            }
+            ThreadCommand::MoveToLocalCheckout { thread_id, pretty } => {
+                let thread_id = match thread_id {
+                    Some(id) => id,
+                    None => resolve_current_thread_id(&ws_url, auth_token.as_deref()).await?,
+                };
+                let result = rpc_request(
+                    &ws_url,
+                    auth_token.as_deref(),
+                    "thread.demoteToBase",
+                    json!({ "thread_id": thread_id }),
                 )
                 .await?;
                 print_json(&result, pretty)
@@ -2050,6 +2089,24 @@ fn mcp_tool_catalog() -> Vec<McpTool> {
             description: "List active threads. Useful for agents that need to reference other threads by name or id.",
             input_schema: json!({"type": "object"}),
             dispatch: McpDispatch::Direct("thread.list"),
+        },
+        McpTool {
+            name: "thread_move_to_worktree",
+            description: "Move the current thread from Local checkout into its branch worktree. Use when the user asks to start this work in a worktree.",
+            input_schema: json!({"type": "object"}),
+            dispatch: McpDispatch::WithCurrentThread {
+                method: "thread.promoteToWorktree",
+                inject_key: "thread_id",
+            },
+        },
+        McpTool {
+            name: "thread_move_to_local_checkout",
+            description: "Move the current default-branch thread back to Local checkout. Feature branches should stay in worktrees.",
+            input_schema: json!({"type": "object"}),
+            dispatch: McpDispatch::WithCurrentThread {
+                method: "thread.demoteToBase",
+                inject_key: "thread_id",
+            },
         },
         McpTool {
             name: "chat_list",

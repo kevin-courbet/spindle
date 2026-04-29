@@ -122,14 +122,17 @@ impl ThreadService {
             let requested_name = sanitize_name(&params.name);
             let thread_name = allocate_thread_name(&store, &project.id, &requested_name)?;
 
-            let branch = resolve_branch(&params, &thread_name)?;
+            let mut branch = resolve_branch(&params, &thread_name)?;
             let worktree_path =
                 planned_worktree_path(&project, &thread_name, &params.source_type, params.sandbox);
+            if worktree_path.is_none() {
+                branch = project.default_branch.clone();
+            }
             (project, thread_name, branch, worktree_path)
         };
 
-        if worktree_path.is_none() && requires_shared_checkout_branch_alignment(&params) {
-            ensure_shared_checkout_branch_for_create(&project.path, &branch).await?;
+        if worktree_path.is_none() {
+            ensure_shared_checkout_branch_for_create(&project.path, &project.default_branch).await?;
         }
 
         let (thread, protocol_thread) = {
@@ -143,6 +146,9 @@ impl ThreadService {
                     &params.source_type,
                     params.sandbox,
                 );
+                if worktree_path.is_none() {
+                    branch = project.default_branch.clone();
+                }
             }
 
             let tmux_session = format!("tm_{}_{}", short_id(&project.id), thread_name);
@@ -547,6 +553,9 @@ impl ThreadService {
             )?;
         let mut promoted_thread = thread.clone();
         promoted_thread.worktree_path = Some(worktree_path.clone());
+        if promoted_thread.branch == project.default_branch {
+            promoted_thread.branch = promoted_thread.name.clone();
+        }
 
         create_worktree(&project.path, &project.default_branch, &promoted_thread).await?;
 
@@ -554,6 +563,15 @@ impl ThreadService {
         for relative in &config.copy_from_main {
             copy_from_main(&project.path, &worktree_path, relative)?;
         }
+        let port_base = port_base_with_offset(config.ports.base, promoted_thread.port_offset)?;
+        run_hooks(
+            &config.setup,
+            &worktree_path,
+            &project.path,
+            &promoted_thread,
+            port_base,
+        )
+        .await?;
 
         let (promoted_thread, save_error) = {
             let mut store = state.store.lock().await;
@@ -561,6 +579,7 @@ impl ThreadService {
                 .thread_by_id_mut(&params.thread_id)
                 .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
             thread.worktree_path = Some(worktree_path.clone());
+            thread.branch = promoted_thread.branch.clone();
             let promoted_thread = thread.clone();
             let save_error = store.save().err();
             (promoted_thread, save_error)
@@ -626,7 +645,8 @@ impl ThreadService {
             .clone()
             .ok_or_else(|| format!("thread {} already uses base checkout", thread.id))?;
         ensure_demotable_worktree(&project, &thread, &worktree_path).await?;
-        ensure_shared_checkout_branch_for_demotion(&project.path, &thread).await?;
+        ensure_shared_checkout_branch_for_demotion(&project.path, &project.default_branch, &thread)
+            .await?;
         let base_config = load_threadmill_config(&project.path, &project.path)?;
 
         if Path::new(&worktree_path).is_dir() {
@@ -707,6 +727,9 @@ impl ThreadService {
         if thread.status != protocol::ThreadStatus::Active {
             return Ok(());
         }
+
+        ChatService::stop_all_for_thread(Arc::clone(&state), &thread.id, "workspace_changed", false)
+            .await?;
 
         let checkout_path = thread.checkout_path(&project.path);
         let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
@@ -997,15 +1020,6 @@ fn new_thread_placeholder_suffix(value: &str) -> Option<u64> {
     suffix.parse().ok()
 }
 
-fn requires_shared_checkout_branch_alignment(params: &protocol::ThreadCreateParams) -> bool {
-    !params.sandbox
-        && (params.branch.is_some()
-            || matches!(
-                params.source_type,
-                protocol::SourceType::ExistingBranch | protocol::SourceType::PullRequest
-            ))
-}
-
 async fn ensure_shared_checkout_branch_for_create(
     project_path: &str,
     expected_branch: &str,
@@ -1023,16 +1037,24 @@ async fn ensure_shared_checkout_branch_for_create(
 
 async fn ensure_shared_checkout_branch_for_demotion(
     project_path: &str,
+    default_branch: &str,
     thread: &Thread,
 ) -> Result<(), String> {
+    if thread.branch != default_branch {
+        return Err(format!(
+            "cannot demote thread {} to base checkout: project root must stay on {} but thread branch is {}; keep dedicated worktree",
+            thread.id, default_branch, thread.branch
+        ));
+    }
+
     let current_branch = current_branch_name(project_path).await?;
-    if current_branch == thread.branch {
+    if current_branch == default_branch {
         return Ok(());
     }
 
     Err(format!(
-        "cannot demote thread {} to base checkout: project root is on {} but thread branch is {}; keep dedicated worktree or use matching shared checkout",
-        thread.id, current_branch, thread.branch
+        "cannot demote thread {} to base checkout: project root is on {} but should be on {}; check out {} in the project root before using base checkout",
+        thread.id, current_branch, default_branch, default_branch
     ))
 }
 
