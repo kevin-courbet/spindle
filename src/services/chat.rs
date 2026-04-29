@@ -1181,7 +1181,15 @@ async fn run_session_task(
     // project context discovery (OpenCode reads AGENTS.md, Claude reads CLAUDE.md, etc.).
     // We only inject platform-level awareness (Threadmill env vars, threadmill-cli,
     // worker orchestration) which no agent can discover on its own.
-    if is_new_session {
+    let (had_conversation_context, is_fork_session) = {
+        let chat = state.chat.lock().await;
+        let session = chat.sessions.get(&session_id);
+        (
+            session.is_some_and(|session| session.had_conversation_context),
+            session.is_some_and(|session| session.parent_session_id.is_some()),
+        )
+    };
+    if should_send_initial_context_injection(is_new_session, had_conversation_context, is_fork_session) {
         let (system_prompt, initial_prompt) = {
             let chat = state.chat.lock().await;
             let session = chat.sessions.get(&session_id);
@@ -1261,7 +1269,7 @@ async fn run_session_task(
             );
         }
     } else {
-        tracing::debug!(session_id = %session_id, "session/load — skipping context injection (already in conversation history)");
+        tracing::debug!(session_id = %session_id, "session load/restored context — skipping context injection");
         // Loaded sessions don't inject — signal immediately
         state.emit_event(
             "chat.injection_complete",
@@ -3487,6 +3495,14 @@ fn build_injection_prompt(
     }
 }
 
+fn should_send_initial_context_injection(
+    is_new_session: bool,
+    had_conversation_context: bool,
+    is_fork_session: bool,
+) -> bool {
+    is_new_session && !(had_conversation_context && is_fork_session)
+}
+
 async fn build_agent_env_vars(
     state: &Arc<AppState>,
     thread_id: &str,
@@ -3687,6 +3703,14 @@ mod tests {
 
     fn make_test_session() -> ChatSessionRuntime {
         make_test_session_with_ids("thread-1", "session-1", "acp-session-1")
+    }
+
+    #[test]
+    fn fork_sessions_skip_initial_context_injection() {
+        assert!(should_send_initial_context_injection(true, false, false));
+        assert!(should_send_initial_context_injection(true, true, false));
+        assert!(!should_send_initial_context_injection(true, true, true));
+        assert!(!should_send_initial_context_injection(false, false, false));
     }
 
     #[tokio::test]

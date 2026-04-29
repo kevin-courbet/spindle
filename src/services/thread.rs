@@ -150,7 +150,8 @@ impl ThreadService {
             let config = load_threadmill_config(checkout_path, &project.path)?;
             let port_offset = store.allocate_port_offset(&project.id, config.ports.offset)?;
 
-            let thread = Thread::new(
+            let display_name = requested_display_name(&params.name, &thread_name);
+            let mut thread = Thread::new(
                 Uuid::new_v4().to_string(),
                 project.id.clone(),
                 thread_name,
@@ -162,6 +163,7 @@ impl ThreadService {
                 tmux_session,
                 port_offset,
             );
+            thread.display_name = display_name;
 
             let protocol_thread = thread.to_protocol();
             store.data.threads.push(thread.clone());
@@ -1612,6 +1614,15 @@ fn resolve_branch(
     Ok(thread_name.to_string())
 }
 
+fn requested_display_name(requested_name: &str, thread_name: &str) -> Option<String> {
+    let trimmed = requested_name.trim();
+    if trimmed.is_empty() || trimmed == thread_name {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn extract_branch_from_pr_url(pr_url: &str) -> Result<String, String> {
     // URL format: https://example.com/owner/repo/pull/123/head:<branch>
     if let Some(pos) = pr_url.rfind("head:") {
@@ -1665,7 +1676,7 @@ mod tests {
             Arc::clone(&state),
             protocol::ThreadCreateParams {
                 project_id: project_id.clone(),
-                name: "plain-thread".to_string(),
+                name: "Plain Thread".to_string(),
                 source_type: protocol::SourceType::NewFeature,
                 branch: None,
                 pr_url: None,
@@ -1677,6 +1688,8 @@ mod tests {
 
         abort_create_task(&state, &created.id).await;
 
+        assert_eq!(created.name, "plain-thread");
+        assert_eq!(created.display_name.as_deref(), Some("Plain Thread"));
         assert_eq!(created.worktree_path, None);
         assert!(!expected_thread_worktree_path(
             &workspace_root,
