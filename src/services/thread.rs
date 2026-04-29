@@ -570,6 +570,7 @@ impl ThreadService {
         let mut switched_thread = thread.clone();
         if switched_thread.branch == project.default_branch {
             switched_thread.branch = worktree_name.clone();
+            switched_thread.source_type = protocol::SourceType::NewFeature;
         }
         let worktree_path =
             planned_worktree_path(&project, &worktree_name, &thread.source_type, true).ok_or_else(
@@ -600,6 +601,7 @@ impl ThreadService {
                 .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
             thread.worktree_path = Some(worktree_path.clone());
             thread.branch = switched_thread.branch.clone();
+            thread.source_type = switched_thread.source_type.clone();
             let switched_thread = thread.clone();
             let save_error = store.save().err();
             (switched_thread, save_error)

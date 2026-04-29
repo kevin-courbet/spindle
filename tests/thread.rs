@@ -906,10 +906,10 @@ async fn thread_switch_work_environment_updates_worktree_path_over_rpc() {
 }
 
 #[tokio::test]
-async fn thread_switch_to_local_checkout_rejects_branch_mismatch_and_keeps_worktree() {
+async fn thread_switch_to_local_checkout_adopts_project_root_branch() {
     if !common::tmux_available().await {
         eprintln!(
-            "skipping thread_switch_to_local_checkout_rejects_branch_mismatch_and_keeps_worktree: tmux unavailable"
+            "skipping thread_switch_to_local_checkout_adopts_project_root_branch: tmux unavailable"
         );
         return;
     }
@@ -926,7 +926,7 @@ async fn thread_switch_to_local_checkout_rejects_branch_mismatch_and_keeps_workt
             "thread.create",
             json!({
                 "project_id": project_id.clone(),
-                "name": common::unique_name("local-checkout-mismatch"),
+                "name": common::unique_name("local-checkout-switch"),
                 "source_type": "existing_branch",
                 "branch": branch,
                 "sandbox": true
@@ -941,22 +941,19 @@ async fn thread_switch_to_local_checkout_rejects_branch_mismatch_and_keeps_workt
         .to_string();
     wait_for_thread_ready(&mut harness, &thread_id).await;
 
-    let error = harness
-        .rpc_expect_error(
+    let switched = harness
+        .rpc(
             "thread.switchToLocalCheckout",
             json!({ "thread_id": thread_id.clone() }),
         )
-        .await;
+        .await
+        .expect("switch thread to local checkout");
 
-    let lower = error.to_lowercase();
-    assert!(lower.contains("branch"), "{error}");
+    assert_eq!(switched["branch"], "main");
+    assert!(switched["worktree_path"].is_null());
     assert!(
-        lower.contains("base") || lower.contains("checkout"),
-        "{error}"
-    );
-    assert!(
-        Path::new(&worktree_path).is_dir(),
-        "worktree should remain after rejection"
+        !Path::new(&worktree_path).exists(),
+        "worktree should be removed after local checkout switch"
     );
 
     let listed = harness
@@ -968,9 +965,10 @@ async fn thread_switch_to_local_checkout_rejects_branch_mismatch_and_keeps_workt
         .expect("thread.list returns array")
         .iter()
         .find(|entry| entry["id"] == thread_id)
-        .expect("thread listed after local checkout switch rejection");
+        .expect("thread listed after local checkout switch");
     assert_eq!(thread["status"], "active");
-    assert_eq!(thread["worktree_path"], worktree_path);
+    assert_eq!(thread["branch"], "main");
+    assert!(thread["worktree_path"].is_null());
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
