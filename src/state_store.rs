@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::{
     config, protocol,
-    services::{project, thread::load_threadmill_config, thread::remove_worktree},
+    services::{project, thread::remove_worktree, thread_config::load_threadmill_config},
     tmux,
 };
 

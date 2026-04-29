@@ -10,6 +10,7 @@ pub mod preset;
 pub mod project;
 pub mod terminal;
 pub mod thread;
+pub mod thread_config;
 pub mod title;
 pub mod workflow;
 
