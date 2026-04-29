@@ -126,6 +126,12 @@ impl ThreadService {
             let worktree_path =
                 planned_worktree_path(&project, &thread_name, &params.source_type, params.sandbox);
             if worktree_path.is_none() {
+                if params.branch.is_some() && branch != project.default_branch {
+                    return Err(format!(
+                        "sandbox=false cannot create branch {} from shared checkout {}; use sandbox/worktree mode",
+                        branch, project.default_branch
+                    ));
+                }
                 branch = project.default_branch.clone();
             }
             (project, thread_name, branch, worktree_path)
@@ -147,6 +153,12 @@ impl ThreadService {
                     params.sandbox,
                 );
                 if worktree_path.is_none() {
+                    if params.branch.is_some() && branch != project.default_branch {
+                        return Err(format!(
+                            "sandbox=false cannot create branch {} from shared checkout {}; use sandbox/worktree mode",
+                            branch, project.default_branch
+                        ));
+                    }
                     branch = project.default_branch.clone();
                 }
             }
@@ -553,9 +565,6 @@ impl ThreadService {
             )?;
         let mut promoted_thread = thread.clone();
         promoted_thread.worktree_path = Some(worktree_path.clone());
-        if promoted_thread.branch == project.default_branch {
-            promoted_thread.branch = promoted_thread.name.clone();
-        }
 
         create_worktree(&project.path, &project.default_branch, &promoted_thread).await?;
 

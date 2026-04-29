@@ -460,12 +460,14 @@ impl ChatService {
             }
         }
 
-        // Copy source JSONL up to cursor into new session file
+        // Copy source JSONL before the selected cursor. Forking from a message
+        // replaces that message in the next turn, so the selected line itself is excluded.
         let fork_session_id = Uuid::new_v4().to_string();
         let fork_path =
             history_path_for_session(&history_root, &target_thread_id, &fork_session_id);
 
-        if source_path.exists() && params.message_cursor > 0 {
+        let copy_line_count = params.message_cursor.saturating_sub(1);
+        if source_path.exists() && copy_line_count > 0 {
             if let Some(parent) = fork_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("failed to create fork history dir: {e}"))?;
@@ -476,7 +478,7 @@ impl ChatService {
             let mut dst_file = fs::File::create(&fork_path)
                 .map_err(|e| format!("failed to create fork history: {e}"))?;
             for (i, line) in reader.lines().enumerate() {
-                if i as u64 >= params.message_cursor {
+                if i as u64 >= copy_line_count {
                     break;
                 }
                 let line = line.map_err(|e| format!("failed to read source history line: {e}"))?;
@@ -4975,14 +4977,14 @@ mod tests {
                 .push(source_session_id.to_string());
         }
 
-        // Fork at cursor=2 (first user+assistant turn)
+        // Fork from cursor=3 (second user prompt) and exclude the selected prompt.
         let result = ChatService::fork(
             Arc::clone(&state),
             protocol::ChatForkParams {
                 thread_id: thread_id.to_string(),
                 target_thread_id: None,
                 source_session_id: source_session_id.to_string(),
-                message_cursor: 2,
+                message_cursor: 3,
             },
         )
         .await
@@ -4993,18 +4995,16 @@ mod tests {
         assert!(result.display_name.as_ref().unwrap().contains("fork #1"));
         assert!(!result.session_id.is_empty());
 
-        // Verify forked JSONL has exactly 2 lines
+        // Verify forked JSONL has exactly 2 lines and excludes the selected line.
         let fork_history = history_path_for_session(&history_root, thread_id, &result.session_id);
         assert!(fork_history.exists(), "fork history file should exist");
-        let fork_line_count = fs::read_to_string(&fork_history)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .count();
+        let fork_history_contents = fs::read_to_string(&fork_history).unwrap();
+        let fork_line_count = fork_history_contents.lines().filter(|l| !l.is_empty()).count();
         assert_eq!(
             fork_line_count, 2,
-            "fork should have exactly 2 lines (cursor=2)"
+            "fork should have exactly 2 lines before selected cursor=3"
         );
+        assert!(!fork_history_contents.contains("do something"));
 
         // Verify session registered in state
         {
@@ -5059,7 +5059,7 @@ mod tests {
                 thread_id: thread_id.to_string(),
                 target_thread_id: Some(target_thread_id.to_string()),
                 source_session_id: source_session_id.to_string(),
-                message_cursor: 2,
+                message_cursor: 3,
             },
         )
         .await
