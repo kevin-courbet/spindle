@@ -15,8 +15,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{mpsc, oneshot, Mutex, Notify},
-    task::JoinHandle,
+    sync::{mpsc, oneshot, Mutex},
     time::{timeout, Duration},
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -44,6 +43,10 @@ const CHAT_PROMPT_METHOD: &str = "session/prompt";
 const CHAT_CANCEL_METHOD: &str = "session/cancel";
 const CHAT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+mod runtime;
+
+use runtime::ChatSessionRuntime;
+
 pub struct ChatService;
 
 #[derive(Default)]
@@ -53,48 +56,6 @@ pub struct ChatState {
     channel_to_session: HashMap<u16, String>,
     channel_outbound: HashMap<u16, mpsc::UnboundedSender<Message>>,
     history_root: PathBuf,
-}
-
-struct ChatSessionRuntime {
-    summary: protocol::ChatSessionSummary,
-    thread_id: String,
-    display_name: Option<String>,
-    parent_session_id: Option<String>,
-    agent_command: Option<String>,
-    system_prompt: Option<String>,
-    initial_prompt: Option<String>,
-    conversation_context: Option<String>,
-    acp_session_id: Option<String>,
-    attached_channels: HashSet<u16>,
-    input_tx: Option<mpsc::Sender<Vec<u8>>>,
-    stop_tx: Option<oneshot::Sender<()>>,
-    status_notify: Arc<Notify>,
-    ended_emitted: bool,
-    history_path: PathBuf,
-    input_buffer: Vec<u8>,
-    output_buffer: Vec<u8>,
-    active_tools: HashSet<String>,
-    total_tool_count: usize,
-    latest_tool_name: Option<String>,
-    latest_tool_title: Option<String>,
-    started_at: Option<chrono::DateTime<Utc>>,
-    pending_prompt_ids: HashSet<String>,
-    checkpoint_seq: u64,
-    last_update_time: Option<chrono::DateTime<Utc>>,
-    stall_generation: u64,
-    stall_task: Option<JoinHandle<()>>,
-    modes: Option<Value>,
-    models: Option<Value>,
-    config_options: Option<Value>,
-    /// Tracks the injection prompt request ID so we can detect when the injection turn completes.
-    /// Set when injection is sent, cleared when the response arrives in apply_outbound_status_updates.
-    injection_prompt_id: Option<String>,
-    /// Number of user-originated prompts routed through this session.
-    user_prompt_count: u32,
-    /// Text of the first user prompt, captured for title generation.
-    first_prompt_text: Option<String>,
-    /// True if session was created with conversation_context (revert/fork). Suppresses title gen.
-    had_conversation_context: bool,
 }
 
 impl ChatState {
@@ -165,42 +126,9 @@ impl ChatService {
                 return;
             }
 
-            let runtime = ChatSessionRuntime {
-                summary,
-                thread_id: thread_id.clone(),
-                display_name: None,
-                parent_session_id: None,
-                agent_command: None,
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context: None,
-                acp_session_id,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: true,
-                history_path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: None,
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
-            };
+            let mut runtime = ChatSessionRuntime::new(summary, thread_id.clone(), history_path);
+            runtime.acp_session_id = acp_session_id;
+            runtime.ended_emitted = true;
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
                 .entry(thread_id.clone())
@@ -228,53 +156,26 @@ impl ChatService {
             let mut chat = state.chat.lock().await;
             let history_path =
                 history_path_for_session(&chat.history_root, &params.thread_id, &session_id);
-            let runtime = ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: session_id.clone(),
-                    agent_type: params.agent_name.clone(),
-                    status: protocol::ChatSessionStatus::Starting,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at,
-                    display_name: params.display_name.clone(),
-                    parent_session_id: params.parent_session_id.clone(),
-                },
-                thread_id: params.thread_id.clone(),
+            let summary = protocol::ChatSessionSummary {
+                session_id: session_id.clone(),
+                agent_type: params.agent_name.clone(),
+                status: protocol::ChatSessionStatus::Starting,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at,
                 display_name: params.display_name.clone(),
                 parent_session_id: params.parent_session_id.clone(),
-                agent_command: Some(command.clone()),
-                system_prompt: params.system_prompt.clone(),
-                initial_prompt: params.initial_prompt.clone(),
-                conversation_context: None,
-                acp_session_id: None,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: false,
-                history_path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: Some(Utc::now()),
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
             };
+            let mut runtime =
+                ChatSessionRuntime::new(summary, params.thread_id.clone(), history_path);
+            runtime.display_name = params.display_name.clone();
+            runtime.parent_session_id = params.parent_session_id.clone();
+            runtime.agent_command = Some(command.clone());
+            runtime.system_prompt = params.system_prompt.clone();
+            runtime.initial_prompt = params.initial_prompt.clone();
+            runtime.started_at = Some(Utc::now());
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
                 .entry(params.thread_id.clone())
@@ -511,53 +412,24 @@ impl ChatService {
         let created_at = Utc::now().to_rfc3339();
         {
             let mut chat = state.chat.lock().await;
-            let runtime = ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: fork_session_id.clone(),
-                    agent_type: source_agent_type.clone(),
-                    status: protocol::ChatSessionStatus::Ended,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at,
-                    display_name: fork_display_name.clone(),
-                    parent_session_id: Some(params.source_session_id.clone()),
-                },
-                thread_id: target_thread_id.clone(),
+            let summary = protocol::ChatSessionSummary {
+                session_id: fork_session_id.clone(),
+                agent_type: source_agent_type.clone(),
+                status: protocol::ChatSessionStatus::Ended,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at,
                 display_name: fork_display_name.clone(),
                 parent_session_id: Some(params.source_session_id.clone()),
-                agent_command: source_agent_command,
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context,
-                acp_session_id: None,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: false,
-                history_path: fork_path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: None,
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: true,
             };
+            let mut runtime = ChatSessionRuntime::new(summary, target_thread_id.clone(), fork_path);
+            runtime.display_name = fork_display_name.clone();
+            runtime.parent_session_id = Some(params.source_session_id.clone());
+            runtime.agent_command = source_agent_command;
+            runtime.conversation_context = conversation_context;
+            runtime.had_conversation_context = true;
             chat.sessions.insert(fork_session_id.clone(), runtime);
             chat.sessions_by_thread
                 .entry(target_thread_id.clone())
@@ -3473,53 +3345,22 @@ fn discover_history_sessions(
                     }
                 };
 
-            recovered.push(ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: stem.to_string(),
-                    agent_type: "unknown".to_string(),
-                    status: protocol::ChatSessionStatus::Ended,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at,
-                    display_name: None,
-                    parent_session_id: None,
-                },
-                thread_id: thread_id.clone(),
+            let summary = protocol::ChatSessionSummary {
+                session_id: stem.to_string(),
+                agent_type: "unknown".to_string(),
+                status: protocol::ChatSessionStatus::Ended,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at,
                 display_name: None,
                 parent_session_id: None,
-                agent_command: None,
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context: None,
-                acp_session_id,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: true,
-                history_path: path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: None,
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
-            });
+            };
+            let mut runtime = ChatSessionRuntime::new(summary, thread_id.clone(), path);
+            runtime.acp_session_id = acp_session_id;
+            runtime.ended_emitted = true;
+            recovered.push(runtime);
         }
     }
 
@@ -3741,53 +3582,27 @@ mod tests {
         session_id: &str,
         acp_session_id: &str,
     ) -> ChatSessionRuntime {
-        ChatSessionRuntime {
-            summary: protocol::ChatSessionSummary {
-                session_id: session_id.to_string(),
-                agent_type: "opencode".to_string(),
-                status: protocol::ChatSessionStatus::Ready,
-                agent_status: protocol::AgentStatus::Idle,
-                worker_count: 0,
-                title: None,
-                model_id: None,
-                created_at: Utc::now().to_rfc3339(),
-                display_name: None,
-                parent_session_id: None,
-            },
-            thread_id: thread_id.to_string(),
+        let summary = protocol::ChatSessionSummary {
+            session_id: session_id.to_string(),
+            agent_type: "opencode".to_string(),
+            status: protocol::ChatSessionStatus::Ready,
+            agent_status: protocol::AgentStatus::Idle,
+            worker_count: 0,
+            title: None,
+            model_id: None,
+            created_at: Utc::now().to_rfc3339(),
             display_name: None,
             parent_session_id: None,
-            agent_command: Some("opencode acp".to_string()),
-            system_prompt: None,
-            initial_prompt: None,
-            conversation_context: None,
-            acp_session_id: Some(acp_session_id.to_string()),
-            attached_channels: HashSet::new(),
-            input_tx: None,
-            stop_tx: None,
-            status_notify: Arc::new(Notify::new()),
-            ended_emitted: false,
-            history_path: PathBuf::from("/tmp/history.jsonl"),
-            input_buffer: Vec::new(),
-            output_buffer: Vec::new(),
-            active_tools: HashSet::new(),
-            total_tool_count: 0,
-            latest_tool_name: None,
-            latest_tool_title: None,
-            started_at: Some(Utc::now()),
-            pending_prompt_ids: HashSet::new(),
-            checkpoint_seq: 0,
-            modes: None,
-            models: None,
-            config_options: None,
-            last_update_time: None,
-            injection_prompt_id: None,
-            stall_generation: 0,
-            stall_task: None,
-            user_prompt_count: 0,
-            first_prompt_text: None,
-            had_conversation_context: false,
-        }
+        };
+        let mut session = ChatSessionRuntime::new(
+            summary,
+            thread_id.to_string(),
+            PathBuf::from("/tmp/history.jsonl"),
+        );
+        session.agent_command = Some("opencode acp".to_string());
+        session.acp_session_id = Some(acp_session_id.to_string());
+        session.started_at = Some(Utc::now());
+        session
     }
 
     fn make_test_session() -> ChatSessionRuntime {
@@ -4931,53 +4746,24 @@ mod tests {
         // Register source session in chat state
         {
             let mut chat = state.chat.lock().await;
-            let runtime = ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: source_session_id.to_string(),
-                    agent_type: "opencode".to_string(),
-                    status: protocol::ChatSessionStatus::Ready,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at: Utc::now().to_rfc3339(),
-                    display_name: Some("Test Session".to_string()),
-                    parent_session_id: None,
-                },
-                thread_id: thread_id.to_string(),
+            let summary = protocol::ChatSessionSummary {
+                session_id: source_session_id.to_string(),
+                agent_type: "opencode".to_string(),
+                status: protocol::ChatSessionStatus::Ready,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at: Utc::now().to_rfc3339(),
                 display_name: Some("Test Session".to_string()),
                 parent_session_id: None,
-                agent_command: Some("opencode acp".to_string()),
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context: None,
-                acp_session_id: Some("acp-1".to_string()),
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: false,
-                history_path: source_history.clone(),
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: Some(Utc::now()),
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
             };
+            let mut runtime =
+                ChatSessionRuntime::new(summary, thread_id.to_string(), source_history.clone());
+            runtime.display_name = Some("Test Session".to_string());
+            runtime.agent_command = Some("opencode acp".to_string());
+            runtime.acp_session_id = Some("acp-1".to_string());
+            runtime.started_at = Some(Utc::now());
             chat.sessions.insert(source_session_id.to_string(), runtime);
             chat.sessions_by_thread
                 .entry(thread_id.to_string())
