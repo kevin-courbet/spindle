@@ -138,7 +138,8 @@ impl ThreadService {
         };
 
         if worktree_path.is_none() {
-            ensure_shared_checkout_branch_for_create(&project.path, &project.default_branch).await?;
+            ensure_shared_checkout_branch_for_create(&project.path, &project.default_branch)
+                .await?;
         }
 
         let (thread, protocol_thread) = {
@@ -526,7 +527,7 @@ impl ThreadService {
         Ok(updated_thread.to_protocol())
     }
 
-    pub async fn promote_to_worktree(
+    pub async fn switch_to_worktree(
         state: Arc<AppState>,
         params: protocol::ThreadWorktreeMutationParams,
     ) -> Result<protocol::Thread, String> {
@@ -548,7 +549,7 @@ impl ThreadService {
             protocol::ThreadStatus::Closed | protocol::ThreadStatus::Failed
         ) {
             return Err(format!(
-                "thread {} cannot be promoted from status {:?}",
+                "thread {} cannot switch to worktree from status {:?}",
                 thread.id, thread.status
             ));
         }
@@ -559,46 +560,56 @@ impl ThreadService {
             ));
         }
 
+        let worktree_name = params
+            .worktree_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(sanitize_name)
+            .unwrap_or_else(|| thread.name.clone());
+        let mut switched_thread = thread.clone();
+        if switched_thread.branch == project.default_branch {
+            switched_thread.branch = worktree_name.clone();
+        }
         let worktree_path =
-            planned_worktree_path(&project, &thread.name, &thread.source_type, true).ok_or_else(
-                || format!("thread {} cannot resolve promoted worktree path", thread.id),
+            planned_worktree_path(&project, &worktree_name, &thread.source_type, true).ok_or_else(
+                || format!("thread {} cannot resolve target worktree path", thread.id),
             )?;
-        let mut promoted_thread = thread.clone();
-        promoted_thread.worktree_path = Some(worktree_path.clone());
+        switched_thread.worktree_path = Some(worktree_path.clone());
 
-        create_worktree(&project.path, &project.default_branch, &promoted_thread).await?;
+        create_worktree(&project.path, &project.default_branch, &switched_thread).await?;
 
         let config = load_threadmill_config(&worktree_path, &project.path)?;
         for relative in &config.copy_from_main {
             copy_from_main(&project.path, &worktree_path, relative)?;
         }
-        let port_base = port_base_with_offset(config.ports.base, promoted_thread.port_offset)?;
+        let port_base = port_base_with_offset(config.ports.base, switched_thread.port_offset)?;
         run_hooks(
             &config.setup,
             &worktree_path,
             &project.path,
-            &promoted_thread,
+            &switched_thread,
             port_base,
         )
         .await?;
 
-        let (promoted_thread, save_error) = {
+        let (switched_thread, save_error) = {
             let mut store = state.store.lock().await;
             let thread = store
                 .thread_by_id_mut(&params.thread_id)
                 .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
             thread.worktree_path = Some(worktree_path.clone());
-            thread.branch = promoted_thread.branch.clone();
-            let promoted_thread = thread.clone();
+            thread.branch = switched_thread.branch.clone();
+            let switched_thread = thread.clone();
             let save_error = store.save().err();
-            (promoted_thread, save_error)
+            (switched_thread, save_error)
         };
-        emit_thread_upsert(&state, &promoted_thread);
+        emit_thread_upsert(&state, &switched_thread);
 
         if let Err(err) = Self::restart_tmux_session_if_active(
             Arc::clone(&state),
             &project,
-            &promoted_thread,
+            &switched_thread,
             &config,
         )
         .await
@@ -610,19 +621,19 @@ impl ThreadService {
             )
             .await;
             return Err(format!(
-                "thread promoted to dedicated worktree but failed to restart session: {err}"
+                "thread switched to dedicated worktree but failed to restart session: {err}"
             ));
         }
         if let Some(err) = save_error {
             return Err(format!(
-                "thread promoted to dedicated worktree but failed to persist state: {err}"
+                "thread switched to dedicated worktree but failed to persist state: {err}"
             ));
         }
 
-        Ok(promoted_thread.to_protocol())
+        Ok(switched_thread.to_protocol())
     }
 
-    pub async fn demote_to_base(
+    pub async fn switch_to_local_checkout(
         state: Arc<AppState>,
         params: protocol::ThreadWorktreeMutationParams,
     ) -> Result<protocol::Thread, String> {
@@ -644,7 +655,7 @@ impl ThreadService {
             protocol::ThreadStatus::Closed | protocol::ThreadStatus::Failed
         ) {
             return Err(format!(
-                "thread {} cannot be demoted from status {:?}",
+                "thread {} cannot switch to local checkout from status {:?}",
                 thread.id, thread.status
             ));
         }
@@ -653,9 +664,14 @@ impl ThreadService {
             .worktree_path
             .clone()
             .ok_or_else(|| format!("thread {} already uses base checkout", thread.id))?;
-        ensure_demotable_worktree(&project, &thread, &worktree_path).await?;
-        ensure_shared_checkout_branch_for_demotion(&project.path, &project.default_branch, &thread)
-            .await?;
+        ensure_local_checkout_switchable_worktree(&project, &thread, &worktree_path).await?;
+        let local_branch = current_branch_name(&project.path).await?;
+        if local_branch.is_empty() {
+            return Err(format!(
+                "cannot switch thread {} to local checkout: project root is not on a branch",
+                thread.id
+            ));
+        }
         let base_config = load_threadmill_config(&project.path, &project.path)?;
 
         if Path::new(&worktree_path).is_dir() {
@@ -669,22 +685,23 @@ impl ThreadService {
 
         remove_worktree(&project.path, Some(&worktree_path), &thread.source_type).await?;
 
-        let (demoted_thread, save_error) = {
+        let (switched_thread, save_error) = {
             let mut store = state.store.lock().await;
             let thread = store
                 .thread_by_id_mut(&params.thread_id)
                 .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
             thread.worktree_path = None;
-            let demoted_thread = thread.clone();
+            thread.branch = local_branch;
+            let switched_thread = thread.clone();
             let save_error = store.save().err();
-            (demoted_thread, save_error)
+            (switched_thread, save_error)
         };
-        emit_thread_upsert(&state, &demoted_thread);
+        emit_thread_upsert(&state, &switched_thread);
 
         if let Err(err) = Self::restart_tmux_session_if_active(
             Arc::clone(&state),
             &project,
-            &demoted_thread,
+            &switched_thread,
             &base_config,
         )
         .await
@@ -696,16 +713,91 @@ impl ThreadService {
             )
             .await;
             return Err(format!(
-                "thread demoted to base checkout but failed to restart session: {err}"
+                "thread switched to local checkout but failed to restart session: {err}"
             ));
         }
         if let Some(err) = save_error {
             return Err(format!(
-                "thread demoted to base checkout but failed to persist state: {err}"
+                "thread switched to local checkout but failed to persist state: {err}"
             ));
         }
 
-        Ok(demoted_thread.to_protocol())
+        Ok(switched_thread.to_protocol())
+    }
+
+    pub async fn switch_branch(
+        state: Arc<AppState>,
+        params: protocol::ThreadSwitchBranchParams,
+    ) -> Result<protocol::Thread, String> {
+        let branch = params.branch.trim();
+        if branch.is_empty() {
+            return Err("branch must not be empty".to_string());
+        }
+
+        let (thread, project) = {
+            let store = state.store.lock().await;
+            let thread = store
+                .thread_by_id(&params.thread_id)
+                .ok_or_else(|| format!("thread not found: {}", params.thread_id))?
+                .clone();
+            let project = store
+                .project_by_id(&thread.project_id)
+                .ok_or_else(|| format!("project not found: {}", thread.project_id))?
+                .clone();
+            (thread, project)
+        };
+
+        if matches!(
+            thread.status,
+            protocol::ThreadStatus::Closed | protocol::ThreadStatus::Failed
+        ) {
+            return Err(format!(
+                "thread {} cannot switch branch from status {:?}",
+                thread.id, thread.status
+            ));
+        }
+
+        let checkout_path = thread.checkout_path(&project.path).to_string();
+        checkout_branch(&checkout_path, branch).await?;
+        let config = load_threadmill_config(&checkout_path, &project.path)?;
+
+        let (updated_thread, save_error) = {
+            let mut store = state.store.lock().await;
+            let thread = store
+                .thread_by_id_mut(&params.thread_id)
+                .ok_or_else(|| format!("thread not found: {}", params.thread_id))?;
+            thread.branch = branch.to_string();
+            let updated_thread = thread.clone();
+            let save_error = store.save().err();
+            (updated_thread, save_error)
+        };
+        emit_thread_upsert(&state, &updated_thread);
+
+        if let Err(err) = Self::restart_tmux_session_if_active(
+            Arc::clone(&state),
+            &project,
+            &updated_thread,
+            &config,
+        )
+        .await
+        {
+            Self::mark_thread_failed_after_worktree_mutation(
+                Arc::clone(&state),
+                &params.thread_id,
+                &err,
+            )
+            .await;
+            return Err(format!(
+                "thread switched to branch {branch} but failed to restart session: {err}"
+            ));
+        }
+        if let Some(err) = save_error {
+            return Err(format!(
+                "thread switched to branch {branch} but failed to persist state: {err}"
+            ));
+        }
+
+        Ok(updated_thread.to_protocol())
     }
 
     async fn mark_thread_failed_after_worktree_mutation(
@@ -737,8 +829,13 @@ impl ThreadService {
             return Ok(());
         }
 
-        ChatService::stop_all_for_thread(Arc::clone(&state), &thread.id, "workspace_changed", false)
-            .await?;
+        ChatService::stop_all_for_thread(
+            Arc::clone(&state),
+            &thread.id,
+            "workspace_changed",
+            false,
+        )
+        .await?;
 
         let checkout_path = thread.checkout_path(&project.path);
         let port_base = port_base_with_offset(config.ports.base, thread.port_offset)?;
@@ -1044,29 +1141,6 @@ async fn ensure_shared_checkout_branch_for_create(
     ))
 }
 
-async fn ensure_shared_checkout_branch_for_demotion(
-    project_path: &str,
-    default_branch: &str,
-    thread: &Thread,
-) -> Result<(), String> {
-    if thread.branch != default_branch {
-        return Err(format!(
-            "cannot demote thread {} to base checkout: project root must stay on {} but thread branch is {}; keep dedicated worktree",
-            thread.id, default_branch, thread.branch
-        ));
-    }
-
-    let current_branch = current_branch_name(project_path).await?;
-    if current_branch == default_branch {
-        return Ok(());
-    }
-
-    Err(format!(
-        "cannot demote thread {} to base checkout: project root is on {} but should be on {}; check out {} in the project root before using base checkout",
-        thread.id, current_branch, default_branch, default_branch
-    ))
-}
-
 fn emit_thread_upsert(state: &Arc<AppState>, thread: &Thread) {
     state.emit_state_delta(vec![protocol::StateDeltaOperationPayload::ThreadCreated {
         thread: thread.to_protocol(),
@@ -1217,25 +1291,37 @@ async fn create_worktree(
     match thread.source_type {
         protocol::SourceType::NewFeature => {
             if has_head_commit(project_path).await? {
-                let base = format!("origin/{default_branch}");
-                let args = [
-                    "worktree",
-                    "add",
-                    worktree_path,
-                    "-b",
-                    &thread.branch,
-                    &base,
-                ];
-                if git(project_path, &args).await.is_err() {
-                    let fallback = [
+                let local_ref = format!("refs/heads/{}", thread.branch);
+                let has_local = git(project_path, &["show-ref", "--verify", &local_ref])
+                    .await
+                    .is_ok();
+                if has_local {
+                    git(
+                        project_path,
+                        &["worktree", "add", worktree_path, &thread.branch],
+                    )
+                    .await?;
+                } else {
+                    let base = format!("origin/{default_branch}");
+                    let args = [
                         "worktree",
                         "add",
                         worktree_path,
                         "-b",
                         &thread.branch,
-                        default_branch,
+                        &base,
                     ];
-                    git(project_path, &fallback).await?;
+                    if git(project_path, &args).await.is_err() {
+                        let fallback = [
+                            "worktree",
+                            "add",
+                            worktree_path,
+                            "-b",
+                            &thread.branch,
+                            default_branch,
+                        ];
+                        git(project_path, &fallback).await?;
+                    }
                 }
             } else {
                 git(
@@ -1307,18 +1393,18 @@ pub async fn remove_worktree(
     .await
 }
 
-async fn ensure_demotable_worktree(
+async fn ensure_local_checkout_switchable_worktree(
     project: &crate::state_store::Project,
     thread: &Thread,
     worktree_path: &str,
 ) -> Result<(), String> {
     if thread.source_type == protocol::SourceType::MainCheckout {
-        return Err("cannot demote main checkout thread".to_string());
+        return Err("cannot switch main checkout thread to local checkout".to_string());
     }
     let project_path = project.path.as_str();
     if project_path == worktree_path {
         return Err(format!(
-            "cannot demote shared project path: {}",
+            "cannot switch shared project path to local checkout: {}",
             worktree_path
         ));
     }
@@ -1372,7 +1458,7 @@ async fn ensure_demotable_worktree(
             (false, false) => unreachable!(),
         };
         return Err(format!(
-            "worktree has {reason}; cannot demote because git worktree remove --force would delete them: {}",
+            "worktree has {reason}; cannot switch to local checkout because git worktree remove --force would delete them: {}",
             worktree_path,
         ));
     }
@@ -1438,6 +1524,34 @@ async fn current_branch_name(worktree_path: &str) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn checkout_branch(worktree_path: &str, branch: &str) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["checkout", branch])
+        .output()
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to switch {} to branch {}: {err}",
+                worktree_path, branch
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if let Some(message) = branch_already_checked_out_message(branch, &stderr) {
+            return Err(message);
+        }
+        return Err(format!(
+            "git [\"checkout\", \"{}\"] failed: {}",
+            branch, stderr
+        ));
+    }
+
+    Ok(())
 }
 
 async fn worktree_dirtiness(worktree_path: &str) -> Result<WorktreeDirtiness, String> {
@@ -1617,14 +1731,46 @@ async fn git(project_path: &str, args: &[&str]) -> Result<(), String> {
         .map_err(|err| format!("failed to run git {:?}: {err}", args))?;
 
     if !output.status.success() {
-        return Err(format!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if let Some(branch) = git_target_branch(args) {
+            if let Some(message) = branch_already_checked_out_message(branch, &stderr) {
+                return Err(message);
+            }
+        }
+        return Err(format!("git {:?} failed: {}", args, stderr));
     }
 
     Ok(())
+}
+
+fn git_target_branch<'a>(args: &'a [&str]) -> Option<&'a str> {
+    if args.len() >= 2 && args[0] == "checkout" {
+        return args.last().copied();
+    }
+    if args.len() >= 4 && args[0] == "worktree" && args[1] == "add" {
+        if let Some(index) = args.iter().position(|arg| *arg == "-b") {
+            return args.get(index + 1).copied();
+        }
+        return args.last().copied();
+    }
+    None
+}
+
+fn branch_already_checked_out_message(branch: &str, stderr: &str) -> Option<String> {
+    if !stderr.contains("is already checked out at")
+        && !stderr.contains("is already used by worktree at")
+    {
+        return None;
+    }
+
+    let location = stderr
+        .rsplit_once(" at ")
+        .map(|(_, path)| path.trim().trim_matches('\''))
+        .filter(|path| !path.is_empty())
+        .unwrap_or("another worktree");
+    Some(format!(
+        "Branch '{branch}' is already checked out in another worktree: {location}. Choose that existing thread/worktree, or use a different worktree name/branch."
+    ))
 }
 
 fn resolve_branch(
@@ -1795,7 +1941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_to_worktree_persists_and_emits_thread_delta() {
+    async fn switch_to_worktree_persists_and_emits_thread_delta() {
         let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
@@ -1812,13 +1958,13 @@ mod tests {
                 crate::state_store::Thread::new(
                     thread_id.clone(),
                     project_id.clone(),
-                    "promote-me".to_string(),
-                    "promote-me".to_string(),
+                    "switch-worktree".to_string(),
+                    "switch-worktree".to_string(),
                     None,
                     protocol::ThreadStatus::Hidden,
                     protocol::SourceType::NewFeature,
                     Utc::now(),
-                    "tm_promote_me".to_string(),
+                    "tm_switch_worktree".to_string(),
                     0,
                 ),
             )
@@ -1826,30 +1972,83 @@ mod tests {
         );
         let mut events = state.subscribe_events();
 
-        let promoted = ThreadService::promote_to_worktree(
+        let switched = ThreadService::switch_to_worktree(
             Arc::clone(&state),
             protocol::ThreadWorktreeMutationParams {
                 thread_id: thread_id.clone(),
+                worktree_name: None,
             },
         )
         .await
-        .expect("promote thread to worktree");
+        .expect("switch thread to worktree");
 
-        let promoted_path = promoted
+        let switched_path = switched
             .worktree_path
             .clone()
-            .expect("promoted thread worktree path");
-        assert!(Path::new(&promoted_path).is_dir());
+            .expect("switched thread worktree path");
+        assert!(Path::new(&switched_path).is_dir());
 
         let persisted = fs::read_to_string(state_path(&state).await).expect("read persisted state");
-        assert!(persisted.contains(&format!("\"worktree_path\": \"{}\"", promoted_path)));
+        assert!(persisted.contains(&format!("\"worktree_path\": \"{}\"", switched_path)));
 
         let event = next_state_delta_event(&mut events).await;
         assert_eq!(event.method, "state.delta");
         let operation = &event.params["operations"][0];
         assert_eq!(operation["type"], "thread.created");
         assert_eq!(operation["thread"]["id"], thread_id);
-        assert_eq!(operation["thread"]["worktree_path"], promoted_path);
+        assert_eq!(operation["thread"]["worktree_path"], switched_path);
+
+        restore_workspace_root(previous_workspace_root);
+        let _ = fs::remove_dir_all(project.root_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn switch_to_worktree_uses_custom_name_for_default_branch_thread() {
+        let _guard = env_lock().lock().await;
+        let workspace_root = unique_temp_path("spindle-workspace-root");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");
+        unsafe { env::set_var("SPINDLE_WORKSPACE_ROOT", &workspace_root) };
+
+        let project = create_git_project().await;
+        let project_id = "project-1".to_string();
+        let thread_id = "thread-1".to_string();
+        let state = Arc::new(
+            app_state_with_thread(
+                &project_id,
+                &project,
+                crate::state_store::Thread::new(
+                    thread_id.clone(),
+                    project_id.clone(),
+                    "new-thread".to_string(),
+                    "main".to_string(),
+                    None,
+                    protocol::ThreadStatus::Hidden,
+                    protocol::SourceType::NewFeature,
+                    Utc::now(),
+                    "tm_new_thread".to_string(),
+                    0,
+                ),
+            )
+            .await,
+        );
+
+        let switched = ThreadService::switch_to_worktree(
+            Arc::clone(&state),
+            protocol::ThreadWorktreeMutationParams {
+                thread_id: thread_id.clone(),
+                worktree_name: Some("smooth-acorn-4429".to_string()),
+            },
+        )
+        .await
+        .expect("switch default branch thread to named worktree");
+
+        assert_eq!(switched.branch, "smooth-acorn-4429");
+        assert!(switched
+            .worktree_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("smooth-acorn-4429")));
 
         restore_workspace_root(previous_workspace_root);
         let _ = fs::remove_dir_all(project.root_dir);
@@ -1888,7 +2087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demote_to_base_persists_null_path_and_removes_worktree() {
+    async fn switch_to_local_checkout_persists_null_path_and_removes_worktree() {
         let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
@@ -1898,8 +2097,11 @@ mod tests {
         let project = create_git_project().await;
         let project_id = "project-1".to_string();
         let thread_id = "thread-1".to_string();
-        let worktree_path =
-            expected_thread_worktree_path(&workspace_root, &project.repo_path, "demote-me");
+        let worktree_path = expected_thread_worktree_path(
+            &workspace_root,
+            &project.repo_path,
+            "local-checkout-switch",
+        );
         git(
             &project.repo_path,
             &[
@@ -1911,7 +2113,7 @@ mod tests {
             ],
         )
         .await
-        .expect("create worktree for demotion test");
+        .expect("create worktree for local checkout switch test");
 
         let state = Arc::new(
             app_state_with_thread(
@@ -1920,13 +2122,13 @@ mod tests {
                 crate::state_store::Thread::new(
                     thread_id.clone(),
                     project_id.clone(),
-                    "demote-me".to_string(),
+                    "local-checkout-switch".to_string(),
                     "main".to_string(),
                     Some(worktree_path.to_string_lossy().to_string()),
                     protocol::ThreadStatus::Hidden,
                     protocol::SourceType::NewFeature,
                     Utc::now(),
-                    "tm_demote_me".to_string(),
+                    "tm_local_checkout_switch".to_string(),
                     0,
                 ),
             )
@@ -1934,16 +2136,17 @@ mod tests {
         );
         let mut events = state.subscribe_events();
 
-        let demoted = ThreadService::demote_to_base(
+        let switched = ThreadService::switch_to_local_checkout(
             Arc::clone(&state),
             protocol::ThreadWorktreeMutationParams {
                 thread_id: thread_id.clone(),
+                worktree_name: None,
             },
         )
         .await
-        .expect("demote thread to base checkout");
+        .expect("switch thread to local checkout");
 
-        assert_eq!(demoted.worktree_path, None);
+        assert_eq!(switched.worktree_path, None);
         assert!(!worktree_path.exists());
 
         let persisted = fs::read_to_string(state_path(&state).await).expect("read persisted state");
@@ -1961,7 +2164,252 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demote_to_base_rejects_shared_project_path() {
+    async fn switch_to_local_checkout_adopts_project_root_branch() {
+        let _guard = env_lock().lock().await;
+        let workspace_root = unique_temp_path("spindle-workspace-root");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");
+        unsafe { env::set_var("SPINDLE_WORKSPACE_ROOT", &workspace_root) };
+
+        let project = create_git_project().await;
+        let project_id = "project-1".to_string();
+        let thread_id = "thread-1".to_string();
+        let worktree_path =
+            expected_thread_worktree_path(&workspace_root, &project.repo_path, "feature-thread");
+        git(
+            &project.repo_path,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "-b",
+                "feature-thread",
+                "main",
+            ],
+        )
+        .await
+        .expect("create feature worktree");
+
+        let state = Arc::new(
+            app_state_with_thread(
+                &project_id,
+                &project,
+                crate::state_store::Thread::new(
+                    thread_id.clone(),
+                    project_id.clone(),
+                    "feature-thread".to_string(),
+                    "feature-thread".to_string(),
+                    Some(worktree_path.to_string_lossy().to_string()),
+                    protocol::ThreadStatus::Hidden,
+                    protocol::SourceType::NewFeature,
+                    Utc::now(),
+                    "tm_feature_thread".to_string(),
+                    0,
+                ),
+            )
+            .await,
+        );
+
+        let switched = ThreadService::switch_to_local_checkout(
+            Arc::clone(&state),
+            protocol::ThreadWorktreeMutationParams {
+                thread_id: thread_id.clone(),
+                worktree_name: None,
+            },
+        )
+        .await
+        .expect("switch thread to local checkout");
+
+        assert_eq!(switched.worktree_path, None);
+        assert_eq!(switched.branch, "main");
+
+        restore_workspace_root(previous_workspace_root);
+        let _ = fs::remove_dir_all(project.root_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn switch_branch_updates_local_checkout_thread() {
+        let project = create_git_project().await;
+        git(&project.repo_path, &["branch", "feature-local"])
+            .await
+            .expect("create feature branch");
+        let project_id = "project-1".to_string();
+        let thread_id = "thread-1".to_string();
+        let state = Arc::new(
+            app_state_with_thread(
+                &project_id,
+                &project,
+                crate::state_store::Thread::new(
+                    thread_id.clone(),
+                    project_id.clone(),
+                    "local-thread".to_string(),
+                    "main".to_string(),
+                    None,
+                    protocol::ThreadStatus::Hidden,
+                    protocol::SourceType::NewFeature,
+                    Utc::now(),
+                    "tm_local_thread".to_string(),
+                    0,
+                ),
+            )
+            .await,
+        );
+
+        let switched = ThreadService::switch_branch(
+            Arc::clone(&state),
+            protocol::ThreadSwitchBranchParams {
+                thread_id: thread_id.clone(),
+                branch: "feature-local".to_string(),
+            },
+        )
+        .await
+        .expect("switch local checkout branch");
+
+        let current_branch = git_raw(&["branch", "--show-current"], Some(&project.repo_path))
+            .await
+            .expect("read current branch");
+        assert_eq!(current_branch.trim(), "feature-local");
+        assert_eq!(switched.worktree_path, None);
+        assert_eq!(switched.branch, "feature-local");
+
+        let _ = fs::remove_dir_all(project.root_dir);
+    }
+
+    #[tokio::test]
+    async fn switch_branch_updates_dedicated_worktree_thread() {
+        let _guard = env_lock().lock().await;
+        let workspace_root = unique_temp_path("spindle-workspace-root");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let previous_workspace_root = env::var_os("SPINDLE_WORKSPACE_ROOT");
+        unsafe { env::set_var("SPINDLE_WORKSPACE_ROOT", &workspace_root) };
+
+        let project = create_git_project().await;
+        git(&project.repo_path, &["branch", "feature-target"])
+            .await
+            .expect("create target branch");
+        let project_id = "project-1".to_string();
+        let thread_id = "thread-1".to_string();
+        let worktree_path =
+            expected_thread_worktree_path(&workspace_root, &project.repo_path, "feature-thread");
+        git(
+            &project.repo_path,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "-b",
+                "feature-thread",
+                "main",
+            ],
+        )
+        .await
+        .expect("create feature worktree");
+        let state = Arc::new(
+            app_state_with_thread(
+                &project_id,
+                &project,
+                crate::state_store::Thread::new(
+                    thread_id.clone(),
+                    project_id.clone(),
+                    "feature-thread".to_string(),
+                    "feature-thread".to_string(),
+                    Some(worktree_path.to_string_lossy().to_string()),
+                    protocol::ThreadStatus::Hidden,
+                    protocol::SourceType::NewFeature,
+                    Utc::now(),
+                    "tm_feature_thread".to_string(),
+                    0,
+                ),
+            )
+            .await,
+        );
+
+        let switched = ThreadService::switch_branch(
+            Arc::clone(&state),
+            protocol::ThreadSwitchBranchParams {
+                thread_id: thread_id.clone(),
+                branch: "feature-target".to_string(),
+            },
+        )
+        .await
+        .expect("switch worktree branch");
+
+        let worktree_branch = git_raw(&["branch", "--show-current"], Some(&worktree_path))
+            .await
+            .expect("read worktree branch");
+        let project_branch = git_raw(&["branch", "--show-current"], Some(&project.repo_path))
+            .await
+            .expect("read project branch");
+        assert_eq!(worktree_branch.trim(), "feature-target");
+        assert_eq!(project_branch.trim(), "main");
+        assert_eq!(switched.branch, "feature-target");
+        assert_eq!(switched.worktree_path.as_deref(), worktree_path.to_str());
+
+        restore_workspace_root(previous_workspace_root);
+        let _ = fs::remove_dir_all(project.root_dir);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn switch_branch_reports_branch_checked_out_elsewhere_without_raw_git_command() {
+        let project = create_git_project().await;
+        let other_worktree = project.root_dir.join("busy-worktree");
+        git(
+            &project.repo_path,
+            &[
+                "worktree",
+                "add",
+                other_worktree.to_str().unwrap(),
+                "-b",
+                "busy-branch",
+                "main",
+            ],
+        )
+        .await
+        .expect("create other worktree");
+        let project_id = "project-1".to_string();
+        let state = Arc::new(
+            app_state_with_thread(
+                &project_id,
+                &project,
+                crate::state_store::Thread::new(
+                    "thread-1".to_string(),
+                    project_id.clone(),
+                    "local-thread".to_string(),
+                    "main".to_string(),
+                    None,
+                    protocol::ThreadStatus::Hidden,
+                    protocol::SourceType::NewFeature,
+                    Utc::now(),
+                    "tm_local_thread".to_string(),
+                    0,
+                ),
+            )
+            .await,
+        );
+
+        let error = ThreadService::switch_branch(
+            Arc::clone(&state),
+            protocol::ThreadSwitchBranchParams {
+                thread_id: "thread-1".to_string(),
+                branch: "busy-branch".to_string(),
+            },
+        )
+        .await
+        .expect_err("branch checked out elsewhere should be explained");
+
+        assert!(
+            error.contains("already checked out in another worktree"),
+            "{error}"
+        );
+        assert!(!error.contains("git ["), "{error}");
+
+        let _ = fs::remove_dir_all(project.root_dir);
+    }
+
+    #[tokio::test]
+    async fn switch_to_local_checkout_rejects_shared_project_path() {
         let project = create_git_project().await;
         let project_id = "project-1".to_string();
         let state = Arc::new(
@@ -1984,10 +2432,11 @@ mod tests {
             .await,
         );
 
-        let error = ThreadService::demote_to_base(
+        let error = ThreadService::switch_to_local_checkout(
             Arc::clone(&state),
             protocol::ThreadWorktreeMutationParams {
                 thread_id: "thread-1".to_string(),
+                worktree_name: None,
             },
         )
         .await
@@ -2002,7 +2451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demote_to_base_rejects_registered_worktree_owned_by_another_thread() {
+    async fn switch_to_local_checkout_rejects_registered_worktree_owned_by_another_thread() {
         let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
@@ -2047,10 +2496,11 @@ mod tests {
             .await,
         );
 
-        let error = ThreadService::demote_to_base(
+        let error = ThreadService::switch_to_local_checkout(
             Arc::clone(&state),
             protocol::ThreadWorktreeMutationParams {
                 thread_id: "thread-1".to_string(),
+                worktree_name: None,
             },
         )
         .await
@@ -2068,7 +2518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demote_to_base_rejects_ignored_files_in_worktree() {
+    async fn switch_to_local_checkout_rejects_ignored_files_in_worktree() {
         let _guard = env_lock().lock().await;
         let workspace_root = unique_temp_path("spindle-workspace-root");
         fs::create_dir_all(&workspace_root).expect("create workspace root");
@@ -2123,14 +2573,15 @@ mod tests {
             .await,
         );
 
-        let error = ThreadService::demote_to_base(
+        let error = ThreadService::switch_to_local_checkout(
             Arc::clone(&state),
             protocol::ThreadWorktreeMutationParams {
                 thread_id: "thread-1".to_string(),
+                worktree_name: None,
             },
         )
         .await
-        .expect_err("ignored files should block demotion");
+        .expect_err("ignored files should block local checkout switch");
 
         assert!(error.contains("ignored"), "{error}");
         assert!(worktree_path.exists());

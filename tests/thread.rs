@@ -853,10 +853,10 @@ async fn thread_create_without_sandbox_returns_null_worktree_path_and_can_close(
 }
 
 #[tokio::test]
-async fn thread_promote_and_demote_update_worktree_path_over_rpc() {
+async fn thread_switch_work_environment_updates_worktree_path_over_rpc() {
     if !common::tmux_available().await {
         eprintln!(
-            "skipping thread_promote_and_demote_update_worktree_path_over_rpc: tmux unavailable"
+            "skipping thread_switch_work_environment_updates_worktree_path_over_rpc: tmux unavailable"
         );
         return;
     }
@@ -869,7 +869,7 @@ async fn thread_promote_and_demote_update_worktree_path_over_rpc() {
             "thread.create",
             json!({
                 "project_id": project_id,
-                "name": common::unique_name("promote-thread"),
+                "name": common::unique_name("switch-thread"),
                 "source_type": "existing_branch",
                 "branch": "main"
             }),
@@ -879,37 +879,37 @@ async fn thread_promote_and_demote_update_worktree_path_over_rpc() {
     let thread_id = created["id"].as_str().expect("thread id").to_string();
     wait_for_thread_ready(&mut harness, &thread_id).await;
 
-    let promoted = harness
+    let switched_to_worktree = harness
         .rpc(
-            "thread.promoteToWorktree",
+            "thread.switchToWorktree",
             json!({ "thread_id": thread_id.clone() }),
         )
         .await
-        .expect("promote thread to worktree");
-    let promoted_path = promoted["worktree_path"]
+        .expect("switch thread to worktree");
+    let worktree_path = switched_to_worktree["worktree_path"]
         .as_str()
-        .expect("promoted worktree path")
+        .expect("switched worktree path")
         .to_string();
-    assert!(Path::new(&promoted_path).is_dir());
+    assert!(Path::new(&worktree_path).is_dir());
 
-    let demoted = harness
+    let switched_to_local_checkout = harness
         .rpc(
-            "thread.demoteToBase",
+            "thread.switchToLocalCheckout",
             json!({ "thread_id": thread_id.clone() }),
         )
         .await
-        .expect("demote thread to base checkout");
-    assert!(demoted["worktree_path"].is_null());
-    assert!(!Path::new(&promoted_path).exists());
+        .expect("switch thread to local checkout");
+    assert!(switched_to_local_checkout["worktree_path"].is_null());
+    assert!(!Path::new(&worktree_path).exists());
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
 
 #[tokio::test]
-async fn thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree() {
+async fn thread_switch_to_local_checkout_rejects_branch_mismatch_and_keeps_worktree() {
     if !common::tmux_available().await {
         eprintln!(
-            "skipping thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree: tmux unavailable"
+            "skipping thread_switch_to_local_checkout_rejects_branch_mismatch_and_keeps_worktree: tmux unavailable"
         );
         return;
     }
@@ -926,7 +926,7 @@ async fn thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree() {
             "thread.create",
             json!({
                 "project_id": project_id.clone(),
-                "name": common::unique_name("demote-mismatch"),
+                "name": common::unique_name("local-checkout-mismatch"),
                 "source_type": "existing_branch",
                 "branch": branch,
                 "sandbox": true
@@ -943,7 +943,7 @@ async fn thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree() {
 
     let error = harness
         .rpc_expect_error(
-            "thread.demoteToBase",
+            "thread.switchToLocalCheckout",
             json!({ "thread_id": thread_id.clone() }),
         )
         .await;
@@ -968,7 +968,7 @@ async fn thread_demote_to_base_rejects_branch_mismatch_and_keeps_worktree() {
         .expect("thread.list returns array")
         .iter()
         .find(|entry| entry["id"] == thread_id)
-        .expect("thread listed after demote rejection");
+        .expect("thread listed after local checkout switch rejection");
     assert_eq!(thread["status"], "active");
     assert_eq!(thread["worktree_path"], worktree_path);
 

@@ -317,8 +317,12 @@ impl ChatService {
             let chat = state.chat.lock().await;
             chat.history_root_path().to_path_buf()
         };
-        let force_new_session =
-            restored_session_marker_exists(&history_root, &params.thread_id, &params.session_id)?;
+        let force_new_session = params.force_new_session
+            || restored_session_marker_exists(
+                &history_root,
+                &params.thread_id,
+                &params.session_id,
+            )?;
 
         let (agent_type, load_session_id, stop_tx, history_path) = {
             let mut chat = state.chat.lock().await;
@@ -1270,7 +1274,11 @@ async fn run_session_task(
             session.is_some_and(|session| session.parent_session_id.is_some()),
         )
     };
-    if should_send_initial_context_injection(is_new_session, had_conversation_context, is_fork_session) {
+    if should_send_initial_context_injection(
+        is_new_session,
+        had_conversation_context,
+        is_fork_session,
+    ) {
         let (system_prompt, initial_prompt) = {
             let chat = state.chat.lock().await;
             let session = chat.sessions.get(&session_id);
@@ -4999,7 +5007,10 @@ mod tests {
         let fork_history = history_path_for_session(&history_root, thread_id, &result.session_id);
         assert!(fork_history.exists(), "fork history file should exist");
         let fork_history_contents = fs::read_to_string(&fork_history).unwrap();
-        let fork_line_count = fork_history_contents.lines().filter(|l| !l.is_empty()).count();
+        let fork_line_count = fork_history_contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
         assert_eq!(
             fork_line_count, 2,
             "fork should have exactly 2 lines before selected cursor=3"

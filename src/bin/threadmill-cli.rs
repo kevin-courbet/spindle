@@ -81,9 +81,17 @@ enum ThreadCommand {
     MoveToWorktree {
         thread_id: Option<String>,
         #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
         pretty: bool,
     },
     MoveToLocalCheckout {
+        thread_id: Option<String>,
+        #[arg(long)]
+        pretty: bool,
+    },
+    SwitchBranch {
+        branch: String,
         thread_id: Option<String>,
         #[arg(long)]
         pretty: bool,
@@ -567,16 +575,24 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 .await?;
                 print_json(&result, pretty)
             }
-            ThreadCommand::MoveToWorktree { thread_id, pretty } => {
+            ThreadCommand::MoveToWorktree {
+                thread_id,
+                name,
+                pretty,
+            } => {
                 let thread_id = match thread_id {
                     Some(id) => id,
                     None => resolve_current_thread_id(&ws_url, auth_token.as_deref()).await?,
                 };
+                let mut params = json!({ "thread_id": thread_id });
+                if let Some(name) = name {
+                    params["worktree_name"] = json!(name);
+                }
                 let result = rpc_request(
                     &ws_url,
                     auth_token.as_deref(),
-                    "thread.promoteToWorktree",
-                    json!({ "thread_id": thread_id }),
+                    "thread.switchToWorktree",
+                    params,
                 )
                 .await?;
                 print_json(&result, pretty)
@@ -589,8 +605,26 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 let result = rpc_request(
                     &ws_url,
                     auth_token.as_deref(),
-                    "thread.demoteToBase",
+                    "thread.switchToLocalCheckout",
                     json!({ "thread_id": thread_id }),
+                )
+                .await?;
+                print_json(&result, pretty)
+            }
+            ThreadCommand::SwitchBranch {
+                branch,
+                thread_id,
+                pretty,
+            } => {
+                let thread_id = match thread_id {
+                    Some(id) => id,
+                    None => resolve_current_thread_id(&ws_url, auth_token.as_deref()).await?,
+                };
+                let result = rpc_request(
+                    &ws_url,
+                    auth_token.as_deref(),
+                    "thread.switchBranch",
+                    json!({ "thread_id": thread_id, "branch": branch }),
                 )
                 .await?;
                 print_json(&result, pretty)
@@ -2092,19 +2126,35 @@ fn mcp_tool_catalog() -> Vec<McpTool> {
         },
         McpTool {
             name: "thread_move_to_worktree",
-            description: "Move the current thread from Local checkout into its branch worktree. Use when the user asks to start this work in a worktree.",
-            input_schema: json!({"type": "object"}),
+            description: "Move the current thread from Local checkout into its branch worktree. Optional worktree_name names the new worktree and branch when starting from Local checkout on the default branch.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {"worktree_name": {"type": "string"}}
+            }),
             dispatch: McpDispatch::WithCurrentThread {
-                method: "thread.promoteToWorktree",
+                method: "thread.switchToWorktree",
                 inject_key: "thread_id",
             },
         },
         McpTool {
             name: "thread_move_to_local_checkout",
-            description: "Move the current default-branch thread back to Local checkout. Feature branches should stay in worktrees.",
+            description: "Move the current thread back to Local checkout, adopting whichever branch is checked out in the project root.",
             input_schema: json!({"type": "object"}),
             dispatch: McpDispatch::WithCurrentThread {
-                method: "thread.demoteToBase",
+                method: "thread.switchToLocalCheckout",
+                inject_key: "thread_id",
+            },
+        },
+        McpTool {
+            name: "thread_switch_branch",
+            description: "Switch the current thread's active checkout to the requested branch. Local checkout threads switch the project root; worktree threads switch their dedicated worktree.",
+            input_schema: json!({
+                "type": "object",
+                "required": ["branch"],
+                "properties": {"branch": {"type": "string"}}
+            }),
+            dispatch: McpDispatch::WithCurrentThread {
+                method: "thread.switchBranch",
                 inject_key: "thread_id",
             },
         },

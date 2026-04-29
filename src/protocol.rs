@@ -831,6 +831,14 @@ pub struct ThreadHideParams {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadWorktreeMutationParams {
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadSwitchBranchParams {
+    pub thread_id: String,
+    pub branch: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -906,6 +914,8 @@ pub struct ChatLoadParams {
     pub session_id: String,
     #[serde(default)]
     pub agent_name: Option<String>,
+    #[serde(default)]
+    pub force_new_session: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1752,8 +1762,9 @@ pub const METHOD_THREAD_CANCEL: &str = "thread.cancel";
 pub const METHOD_THREAD_REOPEN: &str = "thread.reopen";
 pub const METHOD_THREAD_HIDE: &str = "thread.hide";
 pub const METHOD_THREAD_LIST: &str = "thread.list";
-pub const METHOD_THREAD_PROMOTE_TO_WORKTREE: &str = "thread.promoteToWorktree";
-pub const METHOD_THREAD_DEMOTE_TO_BASE: &str = "thread.demoteToBase";
+pub const METHOD_THREAD_SWITCH_TO_WORKTREE: &str = "thread.switchToWorktree";
+pub const METHOD_THREAD_SWITCH_TO_LOCAL_CHECKOUT: &str = "thread.switchToLocalCheckout";
+pub const METHOD_THREAD_SWITCH_BRANCH: &str = "thread.switchBranch";
 pub const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
 pub const METHOD_TERMINAL_DETACH: &str = "terminal.detach";
 pub const METHOD_TERMINAL_RESIZE: &str = "terminal.resize";
@@ -1889,10 +1900,12 @@ pub enum RequestDispatch {
     ThreadHide(ThreadHideParams),
     #[serde(rename = "thread.list")]
     ThreadList(ThreadListParams),
-    #[serde(rename = "thread.promoteToWorktree")]
-    ThreadPromoteToWorktree(ThreadWorktreeMutationParams),
-    #[serde(rename = "thread.demoteToBase")]
-    ThreadDemoteToBase(ThreadWorktreeMutationParams),
+    #[serde(rename = "thread.switchToWorktree")]
+    ThreadSwitchToWorktree(ThreadWorktreeMutationParams),
+    #[serde(rename = "thread.switchToLocalCheckout")]
+    ThreadSwitchToLocalCheckout(ThreadWorktreeMutationParams),
+    #[serde(rename = "thread.switchBranch")]
+    ThreadSwitchBranch(ThreadSwitchBranchParams),
     #[serde(rename = "terminal.attach")]
     TerminalAttach(TerminalAttachParams),
     #[serde(rename = "terminal.detach")]
@@ -2068,16 +2081,19 @@ pub fn parse_request_dispatch(
         METHOD_THREAD_LIST => serde_json::from_value::<ThreadListParams>(params)
             .map(RequestDispatch::ThreadList)
             .map_err(|err| format!("invalid thread.list params: {err}")),
-        METHOD_THREAD_PROMOTE_TO_WORKTREE => {
+        METHOD_THREAD_SWITCH_TO_WORKTREE => {
             serde_json::from_value::<ThreadWorktreeMutationParams>(params)
-                .map(RequestDispatch::ThreadPromoteToWorktree)
-                .map_err(|err| format!("invalid thread.promoteToWorktree params: {err}"))
+                .map(RequestDispatch::ThreadSwitchToWorktree)
+                .map_err(|err| format!("invalid thread.switchToWorktree params: {err}"))
         }
-        METHOD_THREAD_DEMOTE_TO_BASE => {
+        METHOD_THREAD_SWITCH_TO_LOCAL_CHECKOUT => {
             serde_json::from_value::<ThreadWorktreeMutationParams>(params)
-                .map(RequestDispatch::ThreadDemoteToBase)
-                .map_err(|err| format!("invalid thread.demoteToBase params: {err}"))
+                .map(RequestDispatch::ThreadSwitchToLocalCheckout)
+                .map_err(|err| format!("invalid thread.switchToLocalCheckout params: {err}"))
         }
+        METHOD_THREAD_SWITCH_BRANCH => serde_json::from_value::<ThreadSwitchBranchParams>(params)
+            .map(RequestDispatch::ThreadSwitchBranch)
+            .map_err(|err| format!("invalid thread.switchBranch params: {err}")),
         METHOD_TERMINAL_ATTACH => serde_json::from_value::<TerminalAttachParams>(params)
             .map(RequestDispatch::TerminalAttach)
             .map_err(|err| format!("invalid terminal.attach params: {err}")),
@@ -2312,26 +2328,40 @@ mod tests {
     }
 
     #[test]
-    fn promote_and_demote_thread_requests_parse_exact_method_names() {
-        let promote = parse_request_dispatch(
-            METHOD_THREAD_PROMOTE_TO_WORKTREE,
+    fn thread_workspace_requests_parse_exact_method_names() {
+        let to_worktree = parse_request_dispatch(
+            METHOD_THREAD_SWITCH_TO_WORKTREE,
+            json!({ "thread_id": "thread-1", "worktree_name": "custom-worktree" }),
+        )
+        .expect("parse switch-to-worktree request");
+        let to_local = parse_request_dispatch(
+            METHOD_THREAD_SWITCH_TO_LOCAL_CHECKOUT,
             json!({ "thread_id": "thread-1" }),
         )
-        .expect("parse promote request");
-        let demote = parse_request_dispatch(
-            METHOD_THREAD_DEMOTE_TO_BASE,
-            json!({ "thread_id": "thread-1" }),
+        .expect("parse switch-to-local-checkout request");
+        let switch = parse_request_dispatch(
+            METHOD_THREAD_SWITCH_BRANCH,
+            json!({ "thread_id": "thread-1", "branch": "feature" }),
         )
-        .expect("parse demote request");
+        .expect("parse switch request");
 
-        let RequestDispatch::ThreadPromoteToWorktree(promote_params) = promote else {
-            panic!("expected thread.promoteToWorktree dispatch");
+        let RequestDispatch::ThreadSwitchToWorktree(to_worktree_params) = to_worktree else {
+            panic!("expected thread.switchToWorktree dispatch");
         };
-        let RequestDispatch::ThreadDemoteToBase(demote_params) = demote else {
-            panic!("expected thread.demoteToBase dispatch");
+        let RequestDispatch::ThreadSwitchToLocalCheckout(to_local_params) = to_local else {
+            panic!("expected thread.switchToLocalCheckout dispatch");
+        };
+        let RequestDispatch::ThreadSwitchBranch(switch_params) = switch else {
+            panic!("expected thread.switchBranch dispatch");
         };
 
-        assert_eq!(promote_params.thread_id, "thread-1");
-        assert_eq!(demote_params.thread_id, "thread-1");
+        assert_eq!(to_worktree_params.thread_id, "thread-1");
+        assert_eq!(
+            to_worktree_params.worktree_name.as_deref(),
+            Some("custom-worktree")
+        );
+        assert_eq!(to_local_params.thread_id, "thread-1");
+        assert_eq!(switch_params.thread_id, "thread-1");
+        assert_eq!(switch_params.branch, "feature");
     }
 }

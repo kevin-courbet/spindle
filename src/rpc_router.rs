@@ -333,17 +333,23 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("thread.hide", message))?;
             to_value("thread.hide", result)
         }
-        RequestDispatch::ThreadPromoteToWorktree(params) => {
-            let thread = ThreadService::promote_to_worktree(state, params)
+        RequestDispatch::ThreadSwitchToWorktree(params) => {
+            let thread = ThreadService::switch_to_worktree(state, params)
                 .await
-                .map_err(|message| map_service_error("thread.promoteToWorktree", message))?;
-            to_value("thread.promoteToWorktree", thread)
+                .map_err(|message| map_service_error("thread.switchToWorktree", message))?;
+            to_value("thread.switchToWorktree", thread)
         }
-        RequestDispatch::ThreadDemoteToBase(params) => {
-            let thread = ThreadService::demote_to_base(state, params)
+        RequestDispatch::ThreadSwitchToLocalCheckout(params) => {
+            let thread = ThreadService::switch_to_local_checkout(state, params)
                 .await
-                .map_err(|message| map_service_error("thread.demoteToBase", message))?;
-            to_value("thread.demoteToBase", thread)
+                .map_err(|message| map_service_error("thread.switchToLocalCheckout", message))?;
+            to_value("thread.switchToLocalCheckout", thread)
+        }
+        RequestDispatch::ThreadSwitchBranch(params) => {
+            let thread = ThreadService::switch_branch(state, params)
+                .await
+                .map_err(|message| map_service_error("thread.switchBranch", message))?;
+            to_value("thread.switchBranch", thread)
         }
         RequestDispatch::TerminalAttach(params) => {
             terminal::attach(params, state, connection_state, outbound_tx)
