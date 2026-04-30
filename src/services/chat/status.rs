@@ -358,6 +358,21 @@ pub(super) fn user_prompt_history_update(session_id_value: Value, text: &str) ->
     })
 }
 
+pub(super) fn history_user_message_text(value: &Value) -> Option<&str> {
+    let update = value.get("update")?;
+    let kind = update
+        .get("sessionUpdate")
+        .or_else(|| update.get("kind"))
+        .and_then(Value::as_str)?;
+    if kind != "user_message_chunk" {
+        return None;
+    }
+    update
+        .get("content")
+        .and_then(|content| content.get("text").or(Some(content)))
+        .and_then(Value::as_str)
+}
+
 pub(super) struct OutboundResult {
     pub(super) transitions: Vec<StatusTransition>,
     pub(super) injection_completed: bool,

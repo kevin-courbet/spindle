@@ -860,8 +860,19 @@ impl ChatService {
         }
 
         if !prompt_updates.is_empty() {
-            if let Err(error) = append_updates_to_history(&history_path, &prompt_updates) {
-                warn!(channel_id, error = %error, "failed to persist user prompt to chat history");
+            match append_updates_to_history(&history_path, &prompt_updates) {
+                Ok(()) => {
+                    record_pending_user_echoes(&state, &session_id, &prompt_updates).await;
+                    emit_session_update_notifications(
+                        Arc::clone(&state),
+                        &session_id,
+                        &prompt_updates,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    warn!(channel_id, error = %error, "failed to persist user prompt to chat history");
+                }
             }
         }
 
@@ -1088,13 +1099,23 @@ fn collect_session_update_params(messages: &[Value]) -> Vec<Value> {
 }
 
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
-    let (targets, history_path, updates, transitions, injection_completed, thread_id) = {
+    let (
+        targets,
+        history_path,
+        updates,
+        transitions,
+        injection_completed,
+        thread_id,
+        outbound_payload_override,
+    ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
-        let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let raw_messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let (messages, outbound_payload_override) =
+            filter_duplicate_user_echoes(session, raw_messages);
 
         let updates = collect_session_update_params(&messages);
         let outbound = apply_outbound_status_updates(&state, session, messages);
@@ -1123,6 +1144,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.transitions,
             outbound.injection_completed,
             thread_id,
+            outbound_payload_override,
         )
     };
 
@@ -1157,7 +1179,10 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
     }
 
     // Rewrite ACP session ID to Spindle session ID in outbound payload
-    let base_payload = payload;
+    let base_payload = outbound_payload_override.as_deref().unwrap_or(payload);
+    if base_payload.is_empty() {
+        return;
+    }
     let rewritten_payload = {
         let chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get(session_id) {
@@ -1193,6 +1218,140 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
 
     if !dead_channels.is_empty() {
         detach_channels(Arc::clone(&state), dead_channels).await;
+    }
+}
+
+async fn record_pending_user_echoes(state: &Arc<AppState>, session_id: &str, updates: &[Value]) {
+    let pending = updates
+        .iter()
+        .filter_map(history_user_message_text)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return;
+    }
+
+    let mut chat = state.chat.lock().await;
+    if let Some(session) = chat.sessions.get_mut(session_id) {
+        session.pending_user_echoes.extend(pending);
+    }
+}
+
+async fn emit_session_update_notifications(
+    state: Arc<AppState>,
+    session_id: &str,
+    updates: &[Value],
+) {
+    if updates.is_empty() {
+        return;
+    }
+
+    let targets = {
+        let chat = state.chat.lock().await;
+        let Some(session) = chat.sessions.get(session_id) else {
+            return;
+        };
+        session
+            .attached_channels
+            .iter()
+            .filter_map(|channel_id| {
+                chat.channel_outbound
+                    .get(channel_id)
+                    .cloned()
+                    .map(|outbound| (*channel_id, outbound))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut dead_channels = Vec::new();
+    for update in updates {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": CHAT_UPDATE_METHOD,
+            "params": update,
+        });
+        let Ok(payload) = serde_json::to_vec(&notification) else {
+            continue;
+        };
+        for (channel_id, outbound) in &targets {
+            let mut frame = Vec::with_capacity(payload.len() + 2);
+            frame.extend_from_slice(&channel_id.to_be_bytes());
+            frame.extend_from_slice(&payload);
+            if outbound.send(Message::Binary(frame.into())).is_err() {
+                dead_channels.push(*channel_id);
+            }
+        }
+    }
+
+    if !dead_channels.is_empty() {
+        dead_channels.sort_unstable();
+        dead_channels.dedup();
+        detach_channels(state, dead_channels).await;
+    }
+}
+
+fn filter_duplicate_user_echoes(
+    session: &mut ChatSessionRuntime,
+    messages: Vec<Value>,
+) -> (Vec<Value>, Option<Vec<u8>>) {
+    let original_count = messages.len();
+    let mut filtered = Vec::with_capacity(original_count);
+    for message in messages {
+        if is_duplicate_user_echo(session, &message) {
+            continue;
+        }
+        clear_pending_user_echoes_after_agent_turn(session, &message);
+        filtered.push(message);
+    }
+    let payload_override = if filtered.len() == original_count {
+        None
+    } else {
+        Some(serialize_json_messages(&filtered).unwrap_or_default())
+    };
+
+    (filtered, payload_override)
+}
+
+fn is_duplicate_user_echo(session: &mut ChatSessionRuntime, message: &Value) -> bool {
+    if message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method != CHAT_UPDATE_METHOD)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+
+    let Some(text) = message.get("params").and_then(history_user_message_text) else {
+        return false;
+    };
+
+    if session
+        .pending_user_echoes
+        .front()
+        .is_some_and(|pending| pending == text)
+    {
+        session.pending_user_echoes.pop_front();
+        return true;
+    }
+
+    false
+}
+
+fn update_kind_from_message(message: &Value) -> Option<&str> {
+    let update = message.get("params")?.get("update")?;
+    update
+        .get("sessionUpdate")
+        .or_else(|| update.get("kind"))
+        .and_then(Value::as_str)
+}
+
+fn clear_pending_user_echoes_after_agent_turn(session: &mut ChatSessionRuntime, message: &Value) {
+    match update_kind_from_message(message) {
+        Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call") => {
+            session.pending_user_echoes.clear();
+        }
+        _ => {}
     }
 }
 
@@ -2028,6 +2187,150 @@ mod tests {
 
         cancel_registered_stall_timer(&state, &session_id).await;
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn handle_binary_frame_emits_synthetic_user_echo_for_prompt_cursor() {
+        let thread_id = unique_test_id("thread");
+        let session_id = unique_test_id("session");
+        let acp_session_id = unique_test_id("acp-session");
+        let state = make_test_state_with_thread(&thread_id);
+        let (temp_root, history_path) = write_history_file(&[]);
+        let mut session = make_test_session_with_ids(&thread_id, &session_id, &acp_session_id);
+        session.history_path = history_path.clone();
+        session.attached_channels.insert(8);
+
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 8, session).await;
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(8, outbound_tx);
+        }
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "plain prompt"}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let handled = ChatService::handle_binary_frame(Arc::clone(&state), 8, payload)
+            .await
+            .expect("handle binary frame");
+
+        assert!(handled);
+        let _forwarded = input_rx.recv().await.expect("forwarded payload");
+
+        let outbound = timeout(Duration::from_millis(50), outbound_rx.recv())
+            .await
+            .expect("synthetic echo should be emitted")
+            .expect("outbound frame");
+        let Message::Binary(frame) = outbound else {
+            panic!("expected binary outbound frame");
+        };
+        assert_eq!(&frame[..2], &8_u16.to_be_bytes());
+        let notification: Value = serde_json::from_slice(&frame[2..]).expect("parse notification");
+        assert_eq!(notification["method"], "session/update");
+        assert_eq!(notification["params"]["sessionId"], session_id);
+        assert_eq!(
+            notification["params"]["update"],
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "plain prompt" }
+            })
+        );
+
+        let persisted = fs::read_to_string(&history_path).expect("read persisted history");
+        assert_eq!(persisted.lines().count(), 1);
+
+        cancel_registered_stall_timer(&state, &session_id).await;
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn filter_duplicate_user_echoes_suppresses_agent_echo_after_spindle_echo() {
+        let mut session = make_test_session();
+        session
+            .pending_user_echoes
+            .push_back("plain prompt".to_string());
+
+        let (filtered, payload_override) = filter_duplicate_user_echoes(
+            &mut session,
+            vec![
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": { "type": "text", "text": "plain prompt" }
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "kind": "agent_message_chunk",
+                            "content": { "type": "text", "text": "reply" }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        assert!(session.pending_user_echoes.is_empty());
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0]["params"]["update"],
+            json!({
+                "kind": "agent_message_chunk",
+                "content": { "type": "text", "text": "reply" }
+            })
+        );
+        let payload = payload_override.expect("payload should be rewritten");
+        let payload_text = String::from_utf8(payload).expect("payload utf8");
+        assert!(!payload_text.contains("plain prompt"));
+        assert!(payload_text.contains("reply"));
+    }
+
+    #[test]
+    fn filter_duplicate_user_echoes_clears_pending_echoes_when_agent_replies() {
+        let mut session = make_test_session();
+        session
+            .pending_user_echoes
+            .push_back("claude prompt".to_string());
+
+        let (filtered, payload_override) = filter_duplicate_user_echoes(
+            &mut session,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "kind": "agent_message_chunk",
+                        "content": { "type": "text", "text": "reply" }
+                    }
+                }
+            })],
+        );
+
+        assert!(session.pending_user_echoes.is_empty());
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(payload_override, None);
     }
 
     #[tokio::test]

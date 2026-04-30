@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -49,6 +53,8 @@ pub(super) struct ChatSessionRuntime {
     pub(super) first_prompt_text: Option<String>,
     /// True if session was created with conversation_context (revert/fork). Suppresses title gen.
     pub(super) had_conversation_context: bool,
+    /// User prompts persisted by Spindle; matching agent echoes are suppressed to avoid duplicate JSONL.
+    pub(super) pending_user_echoes: VecDeque<String>,
 }
 
 impl ChatSessionRuntime {
@@ -92,6 +98,7 @@ impl ChatSessionRuntime {
             user_prompt_count: 0,
             first_prompt_text: None,
             had_conversation_context: false,
+            pending_user_echoes: VecDeque::new(),
         }
     }
 }

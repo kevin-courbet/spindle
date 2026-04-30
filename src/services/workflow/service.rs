@@ -19,7 +19,9 @@ use crate::{protocol, services::chat::ChatService, AppState};
 use super::reviewer_selection::{
     auto_select_reviewer_specs, parse_agent_persona_file, resolve_persona_path,
 };
-use super::store::{PersistedWorkflow, WorkflowStore, WorkflowStoreData};
+#[cfg(test)]
+use super::store::WorkflowStoreData;
+use super::store::{PersistedWorkflow, WorkflowStore};
 
 pub struct WorkflowService;
 
