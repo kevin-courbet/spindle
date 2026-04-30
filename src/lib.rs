@@ -480,6 +480,14 @@ impl RpcError {
             details: None,
         })
     }
+
+    pub fn retryable_internal(message: impl Into<String>) -> Self {
+        Self::new(-32001, message).with_data(protocol::RpcErrorData {
+            kind: Some("rpc.internal".to_string()),
+            retryable: Some(true),
+            details: None,
+        })
+    }
 }
 
 #[derive(Deserialize)]

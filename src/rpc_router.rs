@@ -663,6 +663,9 @@ fn map_chat_blocked_request_error(
         crate::services::chat::ChatBlockedRequestAnswerError::Invalid(message) => {
             RpcError::invalid_params(message)
         }
+        crate::services::chat::ChatBlockedRequestAnswerError::Delivery(message) => {
+            RpcError::retryable_internal(message)
+        }
     }
 }
 
@@ -778,5 +781,17 @@ mod tests {
         assert_eq!(details["thread_id"], "thread-1");
         assert_eq!(details["session_id"], "session-1");
         assert_eq!(details["request_id"], "old-request");
+    }
+
+    #[test]
+    fn blocked_request_delivery_failure_maps_to_retryable_internal_error() {
+        let error = map_chat_blocked_request_error(ChatBlockedRequestAnswerError::Delivery(
+            "failed to queue blocked request answer for permission-3".to_string(),
+        ));
+
+        assert_eq!(error.code, -32001);
+        let data = error.data.expect("internal error data");
+        assert_eq!(data.kind.as_deref(), Some("rpc.internal"));
+        assert_eq!(data.retryable, Some(true));
     }
 }

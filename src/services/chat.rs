@@ -112,13 +112,16 @@ struct PendingBlockedRequestRuntime {
 pub enum ChatBlockedRequestAnswerError {
     NotFound(String),
     Invalid(String),
+    Delivery(String),
     AlreadyResolved(protocol::BlockedRequestAlreadyResolvedError),
 }
 
 impl std::fmt::Display for ChatBlockedRequestAnswerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound(message) | Self::Invalid(message) => write!(f, "{message}"),
+            Self::NotFound(message) | Self::Invalid(message) | Self::Delivery(message) => {
+                write!(f, "{message}")
+            }
             Self::AlreadyResolved(error) => write!(
                 f,
                 "blocked request already resolved: {}/{}/{}",
@@ -745,13 +748,13 @@ impl ChatService {
                 build_blocked_request_answer_result(&pending.request, &params, answered_at)?;
             let response = agent_response_for_blocked_request(&pending, &result)?;
             let input_tx = session.input_tx.as_ref().ok_or_else(|| {
-                ChatBlockedRequestAnswerError::Invalid(format!(
+                ChatBlockedRequestAnswerError::Delivery(format!(
                     "chat session {} is not running",
                     session.summary.session_id
                 ))
             })?;
             input_tx.try_send(response).map_err(|err| {
-                ChatBlockedRequestAnswerError::Invalid(format!(
+                ChatBlockedRequestAnswerError::Delivery(format!(
                     "failed to queue blocked request answer for {}: {err}",
                     result.request_id
                 ))
@@ -2217,16 +2220,28 @@ fn blocked_permission_from_params(
 
     let tool_call = params.and_then(|params| params.get("toolCall"));
     Some(protocol::BlockedPermissionRequest {
-        tool_call_id: tool_call
-            .and_then(|tool_call| tool_call.get("id"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        tool_call_id: tool_call.and_then(permission_tool_call_id),
         tool_name: tool_call
             .and_then(|tool_call| tool_call.get("name"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         options,
     })
+}
+
+fn permission_tool_call_id(tool_call: &Value) -> Option<String> {
+    string_field(tool_call, "toolCallId")
+        .or_else(|| string_field(tool_call, "tool_call_id"))
+        .or_else(|| string_field(tool_call, "id"))
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn permission_title(params: Option<&Value>, fallback_message: &str) -> String {
@@ -2330,23 +2345,35 @@ fn agent_response_for_blocked_request(
     result: &protocol::BlockedRequestAnswerResult,
 ) -> Result<Vec<u8>, ChatBlockedRequestAnswerError> {
     let result_value = match pending.request.kind {
-        protocol::BlockedRequestKind::Permission => json!({
-            "outcome": {
-                "outcome": "selected",
-                "optionId": result.option_id.clone().unwrap_or_default(),
-            }
-        }),
-        protocol::BlockedRequestKind::Question => json!({
-            "action": result
-                .action
-                .as_ref()
-                .map(|action| match action {
+        protocol::BlockedRequestKind::Permission => {
+            let option_id = result.option_id.as_ref().ok_or_else(|| {
+                ChatBlockedRequestAnswerError::Invalid(
+                    "invariant violation: permission blocked request answer missing option_id"
+                        .to_string(),
+                )
+            })?;
+            json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": option_id,
+                }
+            })
+        }
+        protocol::BlockedRequestKind::Question => {
+            let action = result.action.as_ref().ok_or_else(|| {
+                ChatBlockedRequestAnswerError::Invalid(
+                    "invariant violation: question blocked request answer missing action"
+                        .to_string(),
+                )
+            })?;
+            json!({
+                "action": match action {
                     protocol::BlockedRequestAnswerAction::Accept => "accept",
                     protocol::BlockedRequestAnswerAction::Decline => "decline",
                     protocol::BlockedRequestAnswerAction::Cancel => "cancel",
-                })
-                .unwrap_or("cancel"),
-        }),
+                },
+            })
+        }
     };
     let mut payload = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
@@ -2598,7 +2625,11 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
                 pass_through_messages.push(message);
             }
         }
-        let replacement_payload: Option<Vec<u8>> = None;
+        let replacement_payload = if blocked_requests.is_empty() {
+            None
+        } else {
+            Some(serialize_json_messages(&pass_through_messages))
+        };
 
         let updates = collect_session_update_params(&pass_through_messages);
         let outbound = apply_outbound_status_updates(&state, session, pass_through_messages);
@@ -4318,6 +4349,47 @@ mod tests {
         make_test_session_with_ids("thread-1", "session-1", "acp-session-1")
     }
 
+    fn make_pending_blocked_request(
+        kind: protocol::BlockedRequestKind,
+    ) -> PendingBlockedRequestRuntime {
+        let (question, permission) = match kind {
+            protocol::BlockedRequestKind::Question => (
+                Some(protocol::BlockedQuestionRequest {
+                    prompt: "Continue?".to_string(),
+                    actions: vec![protocol::BlockedRequestAnswerAction::Accept],
+                }),
+                None,
+            ),
+            protocol::BlockedRequestKind::Permission => (
+                None,
+                Some(protocol::BlockedPermissionRequest {
+                    tool_call_id: Some("tool-1".to_string()),
+                    tool_name: Some("shell".to_string()),
+                    options: vec![protocol::BlockedPermissionOption {
+                        id: "run".to_string(),
+                        label: "Run".to_string(),
+                        kind: Some("allow".to_string()),
+                    }],
+                }),
+            ),
+        };
+        PendingBlockedRequestRuntime {
+            request: protocol::BlockedRequest {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "blocked-1".to_string(),
+                kind,
+                title: "Blocked".to_string(),
+                message: "Blocked request".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                question,
+                permission,
+                raw_request: None,
+            },
+            acp_request_id: json!("blocked-1"),
+        }
+    }
+
     #[test]
     fn fork_sessions_skip_initial_context_injection() {
         assert!(should_send_initial_context_injection(true, false, false));
@@ -5207,7 +5279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_permission_request_creates_pending_blocked_request_and_relays_frame() {
+    async fn outbound_permission_request_creates_pending_blocked_request_and_filters_frame() {
         let state = make_test_state();
         let mut session = make_test_session();
         session.attached_channels.insert(77);
@@ -5242,15 +5314,10 @@ mod tests {
         )
         .await;
 
-        let relayed = outbound_rx.try_recv().expect("legacy ACP request frame");
-        let Message::Binary(frame) = relayed else {
-            panic!("expected binary relay frame");
-        };
-        assert_eq!(&frame[..2], &77u16.to_be_bytes());
-        let relayed_message: Value =
-            serde_json::from_slice(&frame[2..]).expect("parse relayed ACP frame");
-        assert_eq!(relayed_message["method"], "request_permission");
-        assert_eq!(relayed_message["id"], 55);
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "captured blocked request must not be relayed to legacy clients"
+        );
         let event = events.try_recv().expect("blocked request added event");
         assert_eq!(event.method, "chat.blocked_request.added");
         assert_eq!(event.params["request"]["request_id"], "55");
@@ -5296,6 +5363,28 @@ mod tests {
         .expect("chat.attach");
         assert_eq!(attached.pending_blocked_requests.len(), 1);
         assert_eq!(attached.pending_blocked_requests[0].request_id, "55");
+    }
+
+    #[test]
+    fn blocked_permission_uses_acp_tool_call_id() {
+        let params = json!({
+            "message": "Allow file edit?",
+            "options": [
+                {"optionId": "allow", "name": "Allow", "kind": "allow"},
+                {"optionId": "deny", "name": "Deny", "kind": "deny"}
+            ],
+            "toolCall": {
+                "toolCallId": "tool-call-1",
+                "title": "Edit file",
+                "kind": "edit",
+                "rawInput": {"file_path": "Sources/App.swift"}
+            }
+        });
+
+        let permission =
+            blocked_permission_from_params(Some(&params)).expect("valid permission payload");
+
+        assert_eq!(permission.tool_call_id.as_deref(), Some("tool-call-1"));
     }
 
     #[tokio::test]
@@ -5564,15 +5653,10 @@ mod tests {
         )
         .await;
 
-        let relayed = outbound_rx.try_recv().expect("legacy ACP question frame");
-        let Message::Binary(frame) = relayed else {
-            panic!("expected binary relay frame");
-        };
-        assert_eq!(&frame[..2], &77u16.to_be_bytes());
-        let relayed_message: Value =
-            serde_json::from_slice(&frame[2..]).expect("parse relayed ACP question frame");
-        assert_eq!(relayed_message["method"], "request_question");
-        assert_eq!(relayed_message["id"], "question-1");
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "captured blocked question must not be relayed to legacy clients"
+        );
 
         let result = ChatService::answer_blocked_request(
             Arc::clone(&state),
@@ -5595,6 +5679,46 @@ mod tests {
         let response: Value = serde_json::from_slice(&forwarded).expect("parse agent response");
         assert_eq!(response["id"], "question-1");
         assert_eq!(response["result"]["action"], "decline");
+    }
+
+    #[test]
+    fn permission_agent_response_requires_answer_option_id() {
+        let pending = make_pending_blocked_request(protocol::BlockedRequestKind::Permission);
+        let result = protocol::BlockedRequestAnswerResult {
+            thread_id: "thread-1".to_string(),
+            session_id: "session-1".to_string(),
+            request_id: "blocked-1".to_string(),
+            action: None,
+            option_id: None,
+            answered_at: Utc::now().to_rfc3339(),
+        };
+
+        let error = agent_response_for_blocked_request(&pending, &result)
+            .expect_err("missing permission option_id must fail");
+
+        assert!(
+            matches!(error, ChatBlockedRequestAnswerError::Invalid(message) if message == "invariant violation: permission blocked request answer missing option_id")
+        );
+    }
+
+    #[test]
+    fn question_agent_response_requires_answer_action() {
+        let pending = make_pending_blocked_request(protocol::BlockedRequestKind::Question);
+        let result = protocol::BlockedRequestAnswerResult {
+            thread_id: "thread-1".to_string(),
+            session_id: "session-1".to_string(),
+            request_id: "blocked-1".to_string(),
+            action: None,
+            option_id: None,
+            answered_at: Utc::now().to_rfc3339(),
+        };
+
+        let error = agent_response_for_blocked_request(&pending, &result)
+            .expect_err("missing question action must fail");
+
+        assert!(
+            matches!(error, ChatBlockedRequestAnswerError::Invalid(message) if message == "invariant violation: question blocked request answer missing action")
+        );
     }
 
     #[tokio::test]
@@ -5690,10 +5814,63 @@ mod tests {
         .await
         .expect_err("full input queue must fail");
 
-        assert!(matches!(error, ChatBlockedRequestAnswerError::Invalid(_)));
+        assert!(matches!(error, ChatBlockedRequestAnswerError::Delivery(_)));
         assert!(
             events.try_recv().is_err(),
             "failed send must not emit removal"
+        );
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert_eq!(status.pending_blocked_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stopped_session_delivery_failure_keeps_blocked_request_pending() {
+        let state = make_test_state();
+        register_test_session(&state, 77, make_test_session()).await;
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-4",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+        let mut events = state.subscribe_events();
+
+        let error = ChatService::answer_blocked_request(
+            Arc::clone(&state),
+            protocol::ChatAnswerBlockedRequestParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "permission-4".to_string(),
+                action: None,
+                option_id: Some("run".to_string()),
+            },
+        )
+        .await
+        .expect_err("stopped session must fail as delivery error");
+
+        assert!(matches!(error, ChatBlockedRequestAnswerError::Delivery(_)));
+        assert!(
+            events.try_recv().is_err(),
+            "stopped session must not emit removal"
         );
         let status = ChatService::status(
             Arc::clone(&state),
