@@ -1965,7 +1965,7 @@ fn apply_inbound_status_updates(
     }
 
     if payload_rewritten {
-        replacement_payload = serialize_json_messages(&messages);
+        replacement_payload = Some(serialize_json_messages(&messages));
     }
 
     SessionProcessingOutcome {
@@ -2062,13 +2062,14 @@ fn prepend_prompt_text_block(message: &mut Value, prompt_text: &str) -> bool {
     true
 }
 
-fn serialize_json_messages(messages: &[Value]) -> Option<Vec<u8>> {
+fn serialize_json_messages(messages: &[Value]) -> Vec<u8> {
     let mut payload = Vec::new();
     for message in messages {
-        serde_json::to_writer(&mut payload, message).ok()?;
+        serde_json::to_writer(&mut payload, message)
+            .expect("serializing serde_json::Value into Vec<u8> cannot fail");
         payload.push(b'\n');
     }
-    Some(payload)
+    payload
 }
 
 fn user_prompt_history_update(session_id_value: Value, text: &str) -> Value {
@@ -2103,7 +2104,7 @@ fn blocked_request_from_message(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let permission = blocked_permission_from_params(params);
+        let permission = blocked_permission_from_params(params)?;
         let title = permission_title(params, &message_text);
         return Some(PendingBlockedRequestRuntime {
             acp_request_id,
@@ -2134,7 +2135,8 @@ fn blocked_request_from_message(
                     .or_else(|| params.get("message"))
             })
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())?
             .to_string();
         let title = params
             .and_then(|params| params.get("title"))
@@ -2169,7 +2171,9 @@ fn blocked_request_from_message(
     None
 }
 
-fn blocked_permission_from_params(params: Option<&Value>) -> protocol::BlockedPermissionRequest {
+fn blocked_permission_from_params(
+    params: Option<&Value>,
+) -> Option<protocol::BlockedPermissionRequest> {
     let options = params
         .and_then(|params| params.get("options"))
         .and_then(Value::as_array)
@@ -2181,15 +2185,21 @@ fn blocked_permission_from_params(params: Option<&Value>) -> protocol::BlockedPe
                         .get("optionId")
                         .or_else(|| option.get("option_id"))
                         .or_else(|| option.get("id"))
-                        .and_then(Value::as_str)?;
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())?;
                     let label = option
                         .get("name")
                         .or_else(|| option.get("label"))
                         .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
                         .unwrap_or(id);
                     let kind = option
                         .get("kind")
                         .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|kind| !kind.is_empty())
                         .map(ToOwned::to_owned);
                     Some(protocol::BlockedPermissionOption {
                         id: id.to_string(),
@@ -2201,8 +2211,12 @@ fn blocked_permission_from_params(params: Option<&Value>) -> protocol::BlockedPe
         })
         .unwrap_or_default();
 
+    if options.is_empty() {
+        return None;
+    }
+
     let tool_call = params.and_then(|params| params.get("toolCall"));
-    protocol::BlockedPermissionRequest {
+    Some(protocol::BlockedPermissionRequest {
         tool_call_id: tool_call
             .and_then(|tool_call| tool_call.get("id"))
             .and_then(Value::as_str)
@@ -2212,7 +2226,7 @@ fn blocked_permission_from_params(params: Option<&Value>) -> protocol::BlockedPe
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         options,
-    }
+    })
 }
 
 fn permission_title(params: Option<&Value>, fallback_message: &str) -> String {
@@ -2584,11 +2598,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
                 pass_through_messages.push(message);
             }
         }
-        let replacement_payload = if blocked_requests.is_empty() {
-            None
-        } else {
-            serialize_json_messages(&pass_through_messages).or_else(|| Some(Vec::new()))
-        };
+        let replacement_payload: Option<Vec<u8>> = None;
 
         let updates = collect_session_update_params(&pass_through_messages);
         let outbound = apply_outbound_status_updates(&state, session, pass_through_messages);
@@ -2624,11 +2634,15 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
 
     emit_status_transitions(&state, transitions).await;
 
+    let has_blocked_requests = !blocked_requests.is_empty();
     for request in blocked_requests {
         state.emit_event(
             "chat.blocked_request.added",
             protocol::BlockedRequestAddedEvent { request },
         );
+    }
+    if has_blocked_requests {
+        emit_state_delta_updated(&state, &thread_id, session_id).await;
     }
 
     if injection_completed {
@@ -3112,14 +3126,6 @@ async fn chat_session_summaries_for_thread(
                 .map(summary_with_blocked_requests)
         })
         .collect::<Vec<_>>();
-    if sessions.is_empty() {
-        sessions = chat
-            .sessions
-            .values()
-            .filter(|session| session.thread_id == thread_id)
-            .map(summary_with_blocked_requests)
-            .collect::<Vec<_>>();
-    }
     sessions.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     sessions
 }
@@ -4142,10 +4148,51 @@ mod tests {
         session: ChatSessionRuntime,
     ) {
         let session_id = session.summary.session_id.clone();
+        let thread_id = session.thread_id.clone();
         let mut chat = state.chat.lock().await;
         chat.channel_to_session
             .insert(channel_id, session_id.clone());
-        chat.sessions.insert(session_id, session);
+        chat.sessions.insert(session_id.clone(), session);
+        let indexed_sessions = chat.sessions_by_thread.entry(thread_id).or_default();
+        if !indexed_sessions
+            .iter()
+            .any(|existing| existing == &session_id)
+        {
+            indexed_sessions.push(session_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_test_session_maintains_thread_index() {
+        let state = make_test_state();
+        register_test_session(&state, 1, make_test_session()).await;
+
+        let chat = state.chat.lock().await;
+        assert_eq!(
+            chat.sessions_by_thread.get("thread-1"),
+            Some(&vec!["session-1".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_list_uses_thread_index_without_scan_fallback() {
+        let state = make_test_state();
+        let session = make_test_session();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.sessions.insert("session-1".to_string(), session);
+        }
+
+        let listed = ChatService::list(
+            Arc::clone(&state),
+            protocol::ChatListParams {
+                thread_id: "thread-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.list");
+
+        assert!(listed.is_empty());
     }
 
     async fn cancel_registered_stall_timer(state: &Arc<AppState>, session_id: &str) {
@@ -5146,8 +5193,21 @@ mod tests {
         cancel_stall_timer(&mut session);
     }
 
+    #[test]
+    fn serialize_json_messages_returns_pass_through_payload_bytes() {
+        let messages = vec![json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"update": {"kind": "agent_message_chunk", "content": "hi"}}
+        })];
+
+        let expected = format!("{}\n", messages[0]).into_bytes();
+
+        assert_eq!(serialize_json_messages(&messages), expected);
+    }
+
     #[tokio::test]
-    async fn outbound_permission_request_creates_pending_blocked_request_and_filters_frame() {
+    async fn outbound_permission_request_creates_pending_blocked_request_and_relays_frame() {
         let state = make_test_state();
         let mut session = make_test_session();
         session.attached_channels.insert(77);
@@ -5182,10 +5242,15 @@ mod tests {
         )
         .await;
 
-        assert!(
-            outbound_rx.try_recv().is_err(),
-            "blocked requests must not be relayed to clients"
-        );
+        let relayed = outbound_rx.try_recv().expect("legacy ACP request frame");
+        let Message::Binary(frame) = relayed else {
+            panic!("expected binary relay frame");
+        };
+        assert_eq!(&frame[..2], &77u16.to_be_bytes());
+        let relayed_message: Value =
+            serde_json::from_slice(&frame[2..]).expect("parse relayed ACP frame");
+        assert_eq!(relayed_message["method"], "request_permission");
+        assert_eq!(relayed_message["id"], 55);
         let event = events.try_recv().expect("blocked request added event");
         assert_eq!(event.method, "chat.blocked_request.added");
         assert_eq!(event.params["request"]["request_id"], "55");
@@ -5231,6 +5296,158 @@ mod tests {
         .expect("chat.attach");
         assert_eq!(attached.pending_blocked_requests.len(), 1);
         assert_eq!(attached.pending_blocked_requests[0].request_id, "55");
+    }
+
+    #[tokio::test]
+    async fn blocked_request_insertion_emits_session_update_state_delta() {
+        let state = make_test_state();
+        register_test_session(&state, 77, make_test_session()).await;
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-1",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let event = events.try_recv().expect("blocked request added event");
+        assert_eq!(event.method, "chat.blocked_request.added");
+
+        let state_delta = events.try_recv().expect("blocked request state delta");
+        assert_eq!(state_delta.method, "state.delta");
+        let operation = state_delta.params["operations"]
+            .as_array()
+            .and_then(|operations| operations.first())
+            .expect("state delta operation");
+        assert_eq!(operation["type"], "chat.session_updated");
+        assert_eq!(operation["thread_id"], "thread-1");
+        assert_eq!(
+            operation["chat_session"]["pending_blocked_requests"][0]["request_id"],
+            "permission-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_permission_request_without_valid_options_stays_on_raw_path() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(77, outbound_tx);
+        }
+        register_test_session(&state, 77, session).await;
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-without-options",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow file edit?",
+                        "options": [
+                            {"name": "Missing option id"},
+                            {"optionId": "", "name": "Blank option id"}
+                        ]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let frame = outbound_rx.try_recv().expect("raw permission frame");
+        let Message::Binary(frame) = frame else {
+            panic!("expected binary chat frame");
+        };
+        assert_eq!(&frame[..2], &77u16.to_be_bytes());
+        let relayed: Value = serde_json::from_slice(&frame[2..]).expect("relayed JSON frame");
+        assert_eq!(relayed["method"], "request_permission");
+        assert_eq!(relayed["id"], "permission-without-options");
+        assert!(
+            events.try_recv().is_err(),
+            "malformed permission requests must not become blocked requests"
+        );
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert!(status.pending_blocked_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_question_request_without_prompt_stays_on_raw_path() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.attached_channels.insert(78);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(78, outbound_tx);
+        }
+        register_test_session(&state, 78, session).await;
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "question-without-prompt",
+                    "method": "request_question",
+                    "params": {"question": "   "}
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let frame = outbound_rx.try_recv().expect("raw question frame");
+        let Message::Binary(frame) = frame else {
+            panic!("expected binary chat frame");
+        };
+        assert_eq!(&frame[..2], &78u16.to_be_bytes());
+        let relayed: Value = serde_json::from_slice(&frame[2..]).expect("relayed JSON frame");
+        assert_eq!(relayed["method"], "request_question");
+        assert_eq!(relayed["id"], "question-without-prompt");
+        assert!(
+            events.try_recv().is_err(),
+            "malformed question requests must not become blocked requests"
+        );
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert!(status.pending_blocked_requests.is_empty());
     }
 
     #[tokio::test]
@@ -5324,6 +5541,12 @@ mod tests {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut session = make_test_session();
         session.input_tx = Some(input_tx);
+        session.attached_channels.insert(77);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(77, outbound_tx);
+        }
         register_test_session(&state, 77, session).await;
         fanout_output(
             Arc::clone(&state),
@@ -5340,6 +5563,16 @@ mod tests {
             .as_bytes(),
         )
         .await;
+
+        let relayed = outbound_rx.try_recv().expect("legacy ACP question frame");
+        let Message::Binary(frame) = relayed else {
+            panic!("expected binary relay frame");
+        };
+        assert_eq!(&frame[..2], &77u16.to_be_bytes());
+        let relayed_message: Value =
+            serde_json::from_slice(&frame[2..]).expect("parse relayed ACP question frame");
+        assert_eq!(relayed_message["method"], "request_question");
+        assert_eq!(relayed_message["id"], "question-1");
 
         let result = ChatService::answer_blocked_request(
             Arc::clone(&state),
