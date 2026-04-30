@@ -87,7 +87,7 @@ struct InvalidBlockedRequestRuntime {
 #[derive(Debug, Clone)]
 enum BlockedRequestFrame {
     NotBlockedRequest,
-    Pending(PendingBlockedRequestRuntime),
+    Pending(Box<PendingBlockedRequestRuntime>),
     Invalid(InvalidBlockedRequestRuntime),
 }
 
@@ -1317,7 +1317,7 @@ fn blocked_request_from_message(
             });
         };
         let title = permission_title(params, &message_text);
-        return BlockedRequestFrame::Pending(PendingBlockedRequestRuntime {
+        return BlockedRequestFrame::Pending(Box::new(PendingBlockedRequestRuntime {
             acp_request_id,
             request: protocol::BlockedRequest {
                 thread_id: session.thread_id.clone(),
@@ -1331,7 +1331,7 @@ fn blocked_request_from_message(
                 permission: Some(permission),
                 raw_request: Some(message.clone()),
             },
-        });
+        }));
     }
 
     if is_question_method {
@@ -1361,7 +1361,7 @@ fn blocked_request_from_message(
             .filter(|title| !title.is_empty())
             .unwrap_or("Question requested")
             .to_string();
-        return BlockedRequestFrame::Pending(PendingBlockedRequestRuntime {
+        return BlockedRequestFrame::Pending(Box::new(PendingBlockedRequestRuntime {
             acp_request_id,
             request: protocol::BlockedRequest {
                 thread_id: session.thread_id.clone(),
@@ -1382,7 +1382,7 @@ fn blocked_request_from_message(
                 permission: None,
                 raw_request: Some(message.clone()),
             },
-        });
+        }));
     }
 
     BlockedRequestFrame::NotBlockedRequest
@@ -1743,6 +1743,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
                     clear_pending_user_echoes_after_agent_turn(session, &message);
                     match blocked_request_from_message(session, &message) {
                         BlockedRequestFrame::Pending(pending) => {
+                            let pending = *pending;
                             if should_capture_blocked_requests {
                                 session
                                     .pending_blocked_requests
@@ -2070,11 +2071,10 @@ fn update_kind_from_message(message: &Value) -> Option<&str> {
 }
 
 fn clear_pending_user_echoes_after_agent_turn(session: &mut ChatSessionRuntime, message: &Value) {
-    match update_kind_from_message(message) {
-        Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call") => {
-            session.pending_user_echoes.clear();
-        }
-        _ => {}
+    if let Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call") =
+        update_kind_from_message(message)
+    {
+        session.pending_user_echoes.clear();
     }
 }
 

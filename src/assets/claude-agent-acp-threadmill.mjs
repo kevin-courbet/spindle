@@ -13,7 +13,9 @@ async function importFromPackage(relativePath) {
 }
 
 const { ClaudeAcpAgent } = await importFromPackage("dist/acp-agent.js");
-const { AgentSideConnection, ndJsonStream } = await importFromPackage("node_modules/@agentclientprotocol/sdk/dist/acp.js");
+const acpSdk = await importFromPackage("node_modules/@agentclientprotocol/sdk/dist/acp.js");
+const { AgentSideConnection } = acpSdk;
+const createJsonStream = acpSdk["ndJsonStream"];
 const { nodeToWebReadable, nodeToWebWritable } = await importFromPackage("dist/utils.js");
 
 const EFFORT_CONFIG_ID = "effort";
@@ -105,5 +107,5 @@ class ThreadmillClaudeAcpAgent extends ClaudeAcpAgent {
 
 const input = nodeToWebWritable(process.stdout);
 const output = nodeToWebReadable(process.stdin);
-const stream = ndJsonStream(input, output);
+const stream = createJsonStream(input, output);
 new AgentSideConnection((client) => new ThreadmillClaudeAcpAgent(client), stream);
