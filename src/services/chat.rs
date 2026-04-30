@@ -50,6 +50,11 @@ const CHAT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct ChatService;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChatSessionOptions {
+    pub capture_blocked_requests: bool,
+}
+
 #[derive(Default)]
 pub struct ChatState {
     sessions: HashMap<String, ChatSessionRuntime>,
@@ -278,6 +283,7 @@ impl ChatService {
     pub async fn start(
         state: Arc<AppState>,
         params: protocol::ChatStartParams,
+        options: ChatSessionOptions,
     ) -> Result<protocol::ChatStartResult, String> {
         tracing::info!(thread_id = %params.thread_id, agent = %params.agent_name, "chat_start");
         let (_project_path, command, cwd, project_preferred_model) =
@@ -336,7 +342,7 @@ impl ChatService {
                 models: None,
                 config_options: None,
                 pending_blocked_requests: HashMap::new(),
-                blocked_request_capture_enabled: false,
+                blocked_request_capture_enabled: options.capture_blocked_requests,
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
@@ -379,6 +385,7 @@ impl ChatService {
     pub async fn load(
         state: Arc<AppState>,
         params: protocol::ChatLoadParams,
+        options: ChatSessionOptions,
     ) -> Result<protocol::ChatLoadResult, String> {
         let history_root = {
             let chat = state.chat.lock().await;
@@ -403,6 +410,7 @@ impl ChatService {
                     params.session_id, params.thread_id
                 ));
             }
+            session.blocked_request_capture_enabled |= options.capture_blocked_requests;
             if session.summary.status == protocol::ChatSessionStatus::Starting {
                 return Ok(protocol::ChatLoadResult {
                     session_id: params.session_id,
@@ -2802,11 +2810,10 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let should_capture_blocked_requests = session.blocked_request_capture_enabled;
         let has_blocked_request_aware_target = attached_channels
             .iter()
             .any(|channel_id| blocked_request_aware_channels.contains(channel_id));
-        let should_capture_blocked_requests = has_blocked_request_aware_target
-            || (session.blocked_request_capture_enabled && attached_channels.is_empty());
         let mut blocked_requests = Vec::new();
         let mut pass_through_messages = Vec::new();
         let mut daemon_aware_payload = Vec::new();
@@ -4495,6 +4502,20 @@ mod tests {
     async fn mark_blocked_request_aware_channel(state: &Arc<AppState>, channel_id: u16) {
         let mut chat = state.chat.lock().await;
         chat.blocked_request_aware_channels.insert(channel_id);
+        if let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() {
+            if let Some(session) = chat.sessions.get_mut(&session_id) {
+                session.blocked_request_capture_enabled = true;
+            }
+        }
+    }
+
+    async fn enable_blocked_request_capture(state: &Arc<AppState>, session_id: &str) {
+        let mut chat = state.chat.lock().await;
+        let session = chat
+            .sessions
+            .get_mut(session_id)
+            .expect("test session exists");
+        session.blocked_request_capture_enabled = true;
     }
 
     #[tokio::test]
@@ -5739,6 +5760,7 @@ mod tests {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut session = make_test_session();
         session.input_tx = Some(input_tx);
+        session.blocked_request_capture_enabled = true;
         session.attached_channels.insert(77);
         session.attached_channels.insert(78);
         let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel();
@@ -5904,6 +5926,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_owned_pre_attach_permission_request_is_captured_for_recovery() {
+        let state = make_test_state();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.sessions
+                .insert("session-1".to_string(), make_test_session());
+            chat.sessions_by_thread
+                .entry("thread-1".to_string())
+                .or_default()
+                .push("session-1".to_string());
+        }
+        enable_blocked_request_capture(&state, "session-1").await;
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "pre-attach-permission",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let event = events.try_recv().expect("blocked request added event");
+        assert_eq!(event.method, "chat.blocked_request.added");
+        assert_eq!(
+            event.params["request"]["request_id"],
+            "pre-attach-permission"
+        );
+
+        let listed = ChatService::list(
+            Arc::clone(&state),
+            protocol::ChatListParams {
+                thread_id: "thread-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.list");
+        assert_eq!(listed[0].pending_blocked_requests.len(), 1);
+
+        let snapshot_sessions =
+            ChatService::thread_chat_sessions(Arc::clone(&state), "thread-1").await;
+        assert_eq!(snapshot_sessions[0].pending_blocked_requests.len(), 1);
+
+        let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+        let attached = ChatService::attach(
+            protocol::ChatAttachParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Arc::clone(&state),
+            Arc::new(Mutex::new(TerminalConnectionState::default())),
+            attach_tx,
+            true,
+        )
+        .await
+        .expect("chat.attach");
+        assert_eq!(attached.pending_blocked_requests.len(), 1);
+        assert_eq!(
+            attached.pending_blocked_requests[0].request_id,
+            "pre-attach-permission"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_load_with_blocked_request_support_marks_starting_session_owned() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.summary.status = protocol::ChatSessionStatus::Starting;
+        {
+            let mut chat = state.chat.lock().await;
+            chat.sessions.insert("session-1".to_string(), session);
+            chat.sessions_by_thread
+                .entry("thread-1".to_string())
+                .or_default()
+                .push("session-1".to_string());
+        }
+
+        let loaded = ChatService::load(
+            Arc::clone(&state),
+            protocol::ChatLoadParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                agent_name: None,
+                force_new_session: false,
+            },
+            ChatSessionOptions {
+                capture_blocked_requests: true,
+            },
+        )
+        .await
+        .expect("chat.load starting session");
+
+        assert_eq!(loaded.status, protocol::ChatSessionStatus::Starting);
+        let chat = state.chat.lock().await;
+        assert!(
+            chat.sessions
+                .get("session-1")
+                .expect("session")
+                .blocked_request_capture_enabled
+        );
+    }
+
+    #[tokio::test]
     async fn disconnected_daemon_aware_session_captures_blocked_request_for_recovery() {
         let state = make_test_state();
         {
@@ -6012,6 +6148,107 @@ mod tests {
             reattached.pending_blocked_requests[0].request_id,
             "permission-after-disconnect"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_session_captures_after_capable_detach_with_legacy_channel_remaining() {
+        let state = make_test_state();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.sessions
+                .insert("session-1".to_string(), make_test_session());
+            chat.sessions_by_thread
+                .entry("thread-1".to_string())
+                .or_default()
+                .push("session-1".to_string());
+        }
+
+        let connection_state = Arc::new(Mutex::new(TerminalConnectionState::default()));
+        let (capable_tx, mut capable_rx) = mpsc::unbounded_channel();
+        let capable = ChatService::attach(
+            protocol::ChatAttachParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Arc::clone(&state),
+            Arc::clone(&connection_state),
+            capable_tx,
+            true,
+        )
+        .await
+        .expect("capable chat.attach");
+        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel();
+        let _legacy = ChatService::attach(
+            protocol::ChatAttachParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Arc::clone(&state),
+            Arc::clone(&connection_state),
+            legacy_tx,
+            false,
+        )
+        .await
+        .expect("legacy chat.attach");
+        let detached = ChatService::detach(
+            protocol::ChatDetachParams {
+                channel_id: capable.channel_id,
+            },
+            Arc::clone(&state),
+            Arc::clone(&connection_state),
+        )
+        .await
+        .expect("capable chat.detach");
+        assert!(detached.detached);
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-after-aware-detach",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(
+            capable_rx.try_recv().is_err(),
+            "detached capable channel must not receive frames"
+        );
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "legacy channel must not receive raw blocked request after session opted in"
+        );
+        let event = events.try_recv().expect("blocked request added event");
+        assert_eq!(event.method, "chat.blocked_request.added");
+        assert_eq!(
+            event.params["request"]["request_id"],
+            "permission-after-aware-detach"
+        );
+
+        let listed = ChatService::list(
+            Arc::clone(&state),
+            protocol::ChatListParams {
+                thread_id: "thread-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.list");
+        assert_eq!(listed[0].pending_blocked_requests.len(), 1);
+
+        let snapshot_sessions =
+            ChatService::thread_chat_sessions(Arc::clone(&state), "thread-1").await;
+        assert_eq!(snapshot_sessions[0].pending_blocked_requests.len(), 1);
     }
 
     #[tokio::test]

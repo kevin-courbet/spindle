@@ -75,6 +75,19 @@ for raw in sys.stdin.buffer:
         sys.stdout.write(json.dumps(update) + "\n")
         sys.stdout.flush()
         result = {"ok": True}
+    elif method == "session/prompt" and "TRIGGER_PERMISSION" in json.dumps(msg.get("params") or {}):
+        request = {
+            "jsonrpc": "2.0",
+            "id": "agent-permission-before-attach",
+            "method": "request_permission",
+            "params": {
+                "message": "Allow shell command?",
+                "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+            },
+        }
+        sys.stdout.write(json.dumps(request) + "\n")
+        sys.stdout.flush()
+        result = {}
     else:
         result = {}
 
@@ -367,6 +380,85 @@ async fn chat_start_emits_ready_and_lists_in_snapshot() {
     assert!(chat_sessions
         .iter()
         .any(|entry| entry["session_id"] == session_id));
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn capable_chat_start_captures_initial_prompt_permission_before_first_attach() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping capable_chat_start_captures_initial_prompt_permission_before_first_attach: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = common::setup_test_server_with_capabilities(&[
+        "state.delta.operations.v1",
+        "preset.output.v1",
+        "rpc.errors.structured.v1",
+        "chat.blocked_requests.v1",
+    ])
+    .await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({
+                "thread_id": thread_id,
+                "agent_name": "mock",
+                "initial_prompt": "TRIGGER_PERMISSION before any attach"
+            }),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+    let blocked = harness
+        .wait_for_event("chat.blocked_request.added", Duration::from_secs(5))
+        .await
+        .expect("blocked request from initial prompt");
+    assert_eq!(
+        blocked["params"]["request"]["request_id"],
+        "agent-permission-before-attach"
+    );
+
+    let listed = harness
+        .rpc("chat.list", json!({"thread_id": thread_id}))
+        .await
+        .expect("chat.list");
+    let session = listed
+        .as_array()
+        .expect("chat.list array")
+        .iter()
+        .find(|entry| entry["session_id"] == session_id)
+        .expect("session in chat.list");
+    assert_eq!(
+        session["pending_blocked_requests"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let attached = harness
+        .rpc(
+            "chat.attach",
+            json!({"thread_id": thread_id, "session_id": session_id}),
+        )
+        .await
+        .expect("chat.attach");
+    assert_eq!(
+        attached["pending_blocked_requests"][0]["request_id"],
+        "agent-permission-before-attach"
+    );
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }

@@ -717,6 +717,7 @@ impl WorkflowService {
     pub async fn spawn_worker(
         state: Arc<AppState>,
         params: protocol::WorkflowSpawnWorkerParams,
+        chat_options: crate::services::chat::ChatSessionOptions,
     ) -> Result<protocol::WorkflowSpawnWorkerResult, String> {
         let (workflow_id, thread_id, worker_id) = {
             let mut store = state.workflows.lock().await;
@@ -808,6 +809,7 @@ impl WorkflowService {
                 parent_session_id: params.parent_session_id,
                 preferred_model: params.preferred_model,
             },
+            chat_options,
         )
         .await;
 
@@ -978,6 +980,7 @@ impl WorkflowService {
     pub async fn start_review(
         state: Arc<AppState>,
         params: protocol::WorkflowStartReviewParams,
+        chat_options: crate::services::chat::ChatSessionOptions,
     ) -> Result<protocol::WorkflowStartReviewResult, String> {
         let checkpoint = snapshot_review_start_checkpoint(&state, &params.workflow_id).await?;
         Self::transition(
@@ -1052,6 +1055,7 @@ impl WorkflowService {
                     display_name: reviewer.display_name,
                     preferred_model: reviewer.preferred_model,
                 },
+                chat_options,
             )
             .await;
             let spawned = match spawned {
@@ -1093,6 +1097,7 @@ impl WorkflowService {
     pub async fn spawn_reviewer(
         state: Arc<AppState>,
         params: protocol::WorkflowSpawnReviewerParams,
+        chat_options: crate::services::chat::ChatSessionOptions,
     ) -> Result<protocol::WorkflowSpawnReviewerResult, String> {
         let (workflow_id, thread_id, reviewer_id) = {
             let mut store = state.workflows.lock().await;
@@ -1146,6 +1151,7 @@ impl WorkflowService {
                 parent_session_id: params.parent_session_id,
                 preferred_model: params.preferred_model,
             },
+            chat_options,
         )
         .await;
 
@@ -1816,6 +1822,7 @@ impl WorkflowService {
     pub async fn start_from_issue(
         state: Arc<AppState>,
         params: protocol::WorkflowStartFromIssueParams,
+        chat_options: crate::services::chat::ChatSessionOptions,
     ) -> Result<protocol::WorkflowStartFromIssueResult, String> {
         // Resolve worktree so we can look up the persona file.
         let worktree = {
@@ -1875,6 +1882,7 @@ impl WorkflowService {
                 parent_session_id: None,
                 preferred_model: persona.model.clone(),
             },
+            chat_options,
         )
         .await?;
 

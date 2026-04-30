@@ -381,15 +381,17 @@ pub async fn dispatch_request(
             to_value("preset.restart", result)
         }
         RequestDispatch::ChatStart(params) => {
-            let result = ChatService::start(state, params)
-                .await
-                .map_err(|message| map_service_error("chat.start", message))?;
+            let result =
+                ChatService::start(state, params, chat_session_options(&session_state).await)
+                    .await
+                    .map_err(|message| map_service_error("chat.start", message))?;
             to_value("chat.start", result)
         }
         RequestDispatch::ChatLoad(params) => {
-            let result = ChatService::load(state, params)
-                .await
-                .map_err(|message| map_service_error("chat.load", message))?;
+            let result =
+                ChatService::load(state, params, chat_session_options(&session_state).await)
+                    .await
+                    .map_err(|message| map_service_error("chat.load", message))?;
             to_value("chat.load", result)
         }
         RequestDispatch::ChatStop(params) => {
@@ -405,10 +407,7 @@ pub async fn dispatch_request(
             to_value("chat.list", result)
         }
         RequestDispatch::ChatAttach(params) => {
-            let supports_blocked_requests = {
-                let guard = session_state.lock().await;
-                guard.supports_capability(protocol::CHAT_BLOCKED_REQUESTS_CAPABILITY)
-            };
+            let supports_blocked_requests = supports_blocked_requests(&session_state).await;
             let result = ChatService::attach(
                 params,
                 state,
@@ -475,9 +474,13 @@ pub async fn dispatch_request(
             to_value("workflow.transition", result)
         }
         RequestDispatch::WorkflowSpawnWorker(params) => {
-            let result = WorkflowService::spawn_worker(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.spawn_worker", message))?;
+            let result = WorkflowService::spawn_worker(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.spawn_worker", message))?;
             to_value("workflow.spawn_worker", result)
         }
         RequestDispatch::WorkflowRecordHandoff(params) => {
@@ -487,15 +490,23 @@ pub async fn dispatch_request(
             to_value("workflow.record_handoff", result)
         }
         RequestDispatch::WorkflowStartReview(params) => {
-            let result = WorkflowService::start_review(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.start_review", message))?;
+            let result = WorkflowService::start_review(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.start_review", message))?;
             to_value("workflow.start_review", result)
         }
         RequestDispatch::WorkflowSpawnReviewer(params) => {
-            let result = WorkflowService::spawn_reviewer(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.spawn_reviewer", message))?;
+            let result = WorkflowService::spawn_reviewer(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.spawn_reviewer", message))?;
             to_value("workflow.spawn_reviewer", result)
         }
         RequestDispatch::WorkflowListReviewers(params) => {
@@ -523,9 +534,13 @@ pub async fn dispatch_request(
             to_value("workflow.resolve_finding", result)
         }
         RequestDispatch::WorkflowStartFromIssue(params) => {
-            let result = WorkflowService::start_from_issue(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.start_from_issue", message))?;
+            let result = WorkflowService::start_from_issue(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.start_from_issue", message))?;
             to_value("workflow.start_from_issue", result)
         }
         RequestDispatch::WorkflowAddLinkedIssue(params) => {
@@ -594,6 +609,19 @@ pub async fn dispatch_request(
                 ),
             }
         }
+    }
+}
+
+async fn supports_blocked_requests(session_state: &Arc<Mutex<ConnectionSessionState>>) -> bool {
+    let guard = session_state.lock().await;
+    guard.supports_capability(protocol::CHAT_BLOCKED_REQUESTS_CAPABILITY)
+}
+
+async fn chat_session_options(
+    session_state: &Arc<Mutex<ConnectionSessionState>>,
+) -> crate::services::chat::ChatSessionOptions {
+    crate::services::chat::ChatSessionOptions {
+        capture_blocked_requests: supports_blocked_requests(session_state).await,
     }
 }
 
