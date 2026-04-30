@@ -17,7 +17,7 @@ use crate::{
         chat::{history_path_for_session, ChatService},
         preset::PresetService,
         project::load_project_presets,
-        thread::{load_threadmill_config, CheckpointConfig},
+        thread_config::{load_threadmill_config, CheckpointConfig},
     },
     AppState,
 };

@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{fs, process::Command};
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -100,6 +100,11 @@ const BUILT_IN_AGENTS: &[BuiltInAgent] = &[
     },
 ];
 
+const THREADMILL_CLAUDE_AGENT_ACP_PATH: &str = "/tmp/threadmill-claude-agent-acp.mjs";
+const THREADMILL_CLAUDE_AGENT_ACP_COMMAND: &str = "node /tmp/threadmill-claude-agent-acp.mjs";
+const THREADMILL_CLAUDE_AGENT_ACP_SOURCE: &str =
+    include_str!("../assets/claude-agent-acp-threadmill.mjs");
+
 fn install_method_from(agent: &BuiltInAgent) -> InstallMethod {
     match agent.install_type {
         "uv" => InstallMethod::Uv {
@@ -136,6 +141,20 @@ fn build_command(binary: &str, launch_args: &[&str]) -> String {
     parts.join(" ")
 }
 
+fn command_for_agent(agent: &BuiltInAgent) -> String {
+    if agent.id == "claude" {
+        if let Err(err) = fs::write(
+            THREADMILL_CLAUDE_AGENT_ACP_PATH,
+            THREADMILL_CLAUDE_AGENT_ACP_SOURCE,
+        ) {
+            tracing::warn!(error = %err, "failed to write Threadmill Claude ACP bridge");
+        }
+        return THREADMILL_CLAUDE_AGENT_ACP_COMMAND.to_string();
+    }
+
+    build_command(agent.binary, agent.launch_args)
+}
+
 pub fn discover_agents() -> Vec<AgentRegistryEntry> {
     let mut entries = Vec::with_capacity(BUILT_IN_AGENTS.len());
 
@@ -152,7 +171,7 @@ pub fn discover_agents() -> Vec<AgentRegistryEntry> {
         entries.push(AgentRegistryEntry {
             id: agent.id.to_string(),
             name: agent.name.to_string(),
-            command: build_command(agent.binary, agent.launch_args),
+            command: command_for_agent(agent),
             launch_args: agent.launch_args.iter().map(|s| s.to_string()).collect(),
             installed,
             resolved_path: resolved,
@@ -216,7 +235,15 @@ pub fn agent_command(agent_id: &str) -> Option<String> {
     BUILT_IN_AGENTS
         .iter()
         .find(|a| a.id == agent_id)
-        .map(|a| build_command(a.binary, a.launch_args))
+        .map(command_for_agent)
+}
+
+pub fn resolve_agent_command(agent_id: &str, project_command: Option<String>) -> Option<String> {
+    if agent_id == "claude" {
+        return agent_command(agent_id);
+    }
+
+    project_command.or_else(|| agent_command(agent_id))
 }
 
 #[cfg(test)]
@@ -246,8 +273,16 @@ mod tests {
         assert_eq!(agent_command("opencode"), Some("opencode acp".to_string()));
         assert_eq!(
             agent_command("claude"),
-            Some("claude-agent-acp".to_string())
+            Some("node /tmp/threadmill-claude-agent-acp.mjs".to_string())
         );
         assert_eq!(agent_command("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_claude_project_command_is_normalized_to_threadmill_bridge() {
+        assert_eq!(
+            resolve_agent_command("claude", Some("claude-agent-acp".to_string())),
+            Some("node /tmp/threadmill-claude-agent-acp.mjs".to_string())
+        );
     }
 }

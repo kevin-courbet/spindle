@@ -1,22 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    sync::{mpsc, oneshot, Mutex, Notify},
-    task::JoinHandle,
+    sync::{mpsc, Mutex},
     time::{timeout, Duration},
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -24,10 +17,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    config, protocol,
+    protocol,
     services::{
         agent_registry,
-        checkpoint::CheckpointService,
         project::{load_project_default_chat_model, project_agent_command},
         terminal::TerminalConnectionState,
     },
@@ -38,7 +30,6 @@ const CHAT_INPUT_CHANNEL_CAPACITY: usize = 256;
 const CHAT_IO_CHUNK_SIZE: usize = 8192;
 const CHAT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(35);
-const CHAT_HISTORY_BATCH_SIZE: usize = 100;
 const CHAT_UPDATE_METHOD: &str = "session/update";
 const CHAT_PROMPT_METHOD: &str = "session/prompt";
 const CHAT_CANCEL_METHOD: &str = "session/cancel";
@@ -47,6 +38,21 @@ const CHAT_SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission
 const CHAT_REQUEST_QUESTION_METHOD: &str = "request_question";
 const CHAT_SESSION_REQUEST_QUESTION_METHOD: &str = "session/request_question";
 const CHAT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+mod context;
+mod history;
+mod io;
+mod runtime;
+mod session;
+mod status;
+
+use context::build_conversation_context;
+use history::*;
+pub(crate) use history::{history_path_for_session, persist_session_metadata};
+use io::*;
+use runtime::ChatSessionRuntime;
+use session::*;
+use status::*;
 
 pub struct ChatService;
 
@@ -63,50 +69,6 @@ pub struct ChatState {
     channel_outbound: HashMap<u16, mpsc::UnboundedSender<Message>>,
     blocked_request_aware_channels: HashSet<u16>,
     history_root: PathBuf,
-}
-
-struct ChatSessionRuntime {
-    summary: protocol::ChatSessionSummary,
-    thread_id: String,
-    display_name: Option<String>,
-    parent_session_id: Option<String>,
-    agent_command: Option<String>,
-    system_prompt: Option<String>,
-    initial_prompt: Option<String>,
-    conversation_context: Option<String>,
-    acp_session_id: Option<String>,
-    attached_channels: HashSet<u16>,
-    input_tx: Option<mpsc::Sender<Vec<u8>>>,
-    stop_tx: Option<oneshot::Sender<()>>,
-    status_notify: Arc<Notify>,
-    ended_emitted: bool,
-    history_path: PathBuf,
-    input_buffer: Vec<u8>,
-    output_buffer: Vec<u8>,
-    active_tools: HashSet<String>,
-    total_tool_count: usize,
-    latest_tool_name: Option<String>,
-    latest_tool_title: Option<String>,
-    started_at: Option<chrono::DateTime<Utc>>,
-    pending_prompt_ids: HashSet<String>,
-    checkpoint_seq: u64,
-    last_update_time: Option<chrono::DateTime<Utc>>,
-    stall_generation: u64,
-    stall_task: Option<JoinHandle<()>>,
-    modes: Option<Value>,
-    models: Option<Value>,
-    config_options: Option<Value>,
-    pending_blocked_requests: HashMap<String, PendingBlockedRequestRuntime>,
-    blocked_request_capture_enabled: bool,
-    /// Tracks the injection prompt request ID so we can detect when the injection turn completes.
-    /// Set when injection is sent, cleared when the response arrives in apply_outbound_status_updates.
-    injection_prompt_id: Option<String>,
-    /// Number of user-originated prompts routed through this session.
-    user_prompt_count: u32,
-    /// Text of the first user prompt, captured for title generation.
-    first_prompt_text: Option<String>,
-    /// True if session was created with conversation_context (revert/fork). Suppresses title gen.
-    had_conversation_context: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +131,6 @@ impl std::fmt::Display for ChatBlockedRequestAnswerError {
         }
     }
 }
-
 impl ChatState {
     pub fn new(history_root: PathBuf) -> Self {
         Self {
@@ -198,11 +159,6 @@ struct HandshakeResult {
     model_id: Option<String>,
     /// Notifications collected during session/load replay. Empty for session/new.
     replay_notifications: Vec<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedChatSessionMetadata {
-    acp_session_id: Option<String>,
 }
 
 impl ChatService {
@@ -239,44 +195,9 @@ impl ChatService {
                 return;
             }
 
-            let runtime = ChatSessionRuntime {
-                summary,
-                thread_id: thread_id.clone(),
-                display_name: None,
-                parent_session_id: None,
-                agent_command: None,
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context: None,
-                acp_session_id,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: true,
-                history_path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: None,
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                pending_blocked_requests: HashMap::new(),
-                blocked_request_capture_enabled: false,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
-            };
+            let mut runtime = ChatSessionRuntime::new(summary, thread_id.clone(), history_path);
+            runtime.acp_session_id = acp_session_id;
+            runtime.ended_emitted = true;
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
                 .entry(thread_id.clone())
@@ -305,56 +226,28 @@ impl ChatService {
             let mut chat = state.chat.lock().await;
             let history_path =
                 history_path_for_session(&chat.history_root, &params.thread_id, &session_id);
-            let runtime = ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: session_id.clone(),
-                    agent_type: params.agent_name.clone(),
-                    status: protocol::ChatSessionStatus::Starting,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at,
-                    display_name: params.display_name.clone(),
-                    parent_session_id: params.parent_session_id.clone(),
-                    pending_blocked_requests: Vec::new(),
-                },
-                thread_id: params.thread_id.clone(),
+            let summary = protocol::ChatSessionSummary {
+                session_id: session_id.clone(),
+                agent_type: params.agent_name.clone(),
+                status: protocol::ChatSessionStatus::Starting,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at,
                 display_name: params.display_name.clone(),
                 parent_session_id: params.parent_session_id.clone(),
-                agent_command: Some(command.clone()),
-                system_prompt: params.system_prompt.clone(),
-                initial_prompt: params.initial_prompt.clone(),
-                conversation_context: None,
-                acp_session_id: None,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: false,
-                history_path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: Some(Utc::now()),
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                pending_blocked_requests: HashMap::new(),
-                blocked_request_capture_enabled: options.capture_blocked_requests,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
+                pending_blocked_requests: Vec::new(),
             };
+            let mut runtime =
+                ChatSessionRuntime::new(summary, params.thread_id.clone(), history_path);
+            runtime.display_name = params.display_name.clone();
+            runtime.parent_session_id = params.parent_session_id.clone();
+            runtime.agent_command = Some(command.clone());
+            runtime.system_prompt = params.system_prompt.clone();
+            runtime.initial_prompt = params.initial_prompt.clone();
+            runtime.started_at = Some(Utc::now());
+            runtime.blocked_request_capture_enabled = options.capture_blocked_requests;
             chat.sessions.insert(session_id.clone(), runtime);
             chat.sessions_by_thread
                 .entry(params.thread_id.clone())
@@ -593,56 +486,25 @@ impl ChatService {
         let created_at = Utc::now().to_rfc3339();
         {
             let mut chat = state.chat.lock().await;
-            let runtime = ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: fork_session_id.clone(),
-                    agent_type: source_agent_type.clone(),
-                    status: protocol::ChatSessionStatus::Ended,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at,
-                    display_name: fork_display_name.clone(),
-                    parent_session_id: Some(params.source_session_id.clone()),
-                    pending_blocked_requests: Vec::new(),
-                },
-                thread_id: target_thread_id.clone(),
+            let summary = protocol::ChatSessionSummary {
+                session_id: fork_session_id.clone(),
+                agent_type: source_agent_type.clone(),
+                status: protocol::ChatSessionStatus::Ended,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at,
                 display_name: fork_display_name.clone(),
                 parent_session_id: Some(params.source_session_id.clone()),
-                agent_command: source_agent_command,
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context,
-                acp_session_id: None,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: false,
-                history_path: fork_path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: None,
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                pending_blocked_requests: HashMap::new(),
-                blocked_request_capture_enabled: false,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: true,
+                pending_blocked_requests: Vec::new(),
             };
+            let mut runtime = ChatSessionRuntime::new(summary, target_thread_id.clone(), fork_path);
+            runtime.display_name = fork_display_name.clone();
+            runtime.parent_session_id = Some(params.source_session_id.clone());
+            runtime.agent_command = source_agent_command;
+            runtime.conversation_context = conversation_context;
+            runtime.had_conversation_context = true;
             chat.sessions.insert(fork_session_id.clone(), runtime);
             chat.sessions_by_thread
                 .entry(target_thread_id.clone())
@@ -1181,8 +1043,19 @@ impl ChatService {
         }
 
         if !prompt_updates.is_empty() {
-            if let Err(error) = append_updates_to_history(&history_path, &prompt_updates) {
-                warn!(channel_id, error = %error, "failed to persist user prompt to chat history");
+            match append_updates_to_history(&history_path, &prompt_updates) {
+                Ok(()) => {
+                    record_pending_user_echoes(&state, &session_id, &prompt_updates).await;
+                    emit_session_update_notifications(
+                        Arc::clone(&state),
+                        &session_id,
+                        &prompt_updates,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    warn!(channel_id, error = %error, "failed to persist user prompt to chat history");
+                }
             }
         }
 
@@ -1282,330 +1155,6 @@ impl ChatService {
     ) -> Vec<protocol::ChatSessionSummary> {
         chat_session_summaries_for_thread(&state, thread_id).await
     }
-}
-
-/// All the session identity + launch parameters needed to spawn and run one chat session.
-/// Grouped into a single type so spawn/run signatures don't balloon.
-struct SessionLaunchContext {
-    thread_id: String,
-    session_id: String,
-    command: String,
-    cwd: String,
-    load_session_id: Option<String>,
-    preferred_model: Option<String>,
-}
-
-fn spawn_session_task(state: Arc<AppState>, ctx: SessionLaunchContext) {
-    let fail_state = Arc::clone(&state);
-    let fail_thread_id = ctx.thread_id.clone();
-    let fail_session_id = ctx.session_id.clone();
-
-    // Build env vars for the agent process
-    let env_vars = {
-        let state_ref = state.clone();
-        let tid = ctx.thread_id.clone();
-        let sid = ctx.session_id.clone();
-        tokio::spawn(async move { build_agent_env_vars(&state_ref, &tid, &sid).await })
-    };
-
-    let handle = tokio::spawn(async move {
-        let env_vars = env_vars.await.unwrap_or_default();
-        if let Err(error) = run_session_task(Arc::clone(&state), ctx, env_vars).await {
-            warn!(error = %error, "chat session task failed");
-        }
-    });
-
-    // Monitor the spawned task — if it panics, emit a session_failed event
-    tokio::spawn(async move {
-        if let Err(join_error) = handle.await {
-            if join_error.is_panic() {
-                let panic_msg = match join_error.into_panic().downcast::<String>() {
-                    Ok(msg) => *msg,
-                    Err(payload) => match payload.downcast::<&str>() {
-                        Ok(s) => s.to_string(),
-                        Err(_) => "task panicked (unknown payload)".to_string(),
-                    },
-                };
-                tracing::error!(
-                    thread_id = %fail_thread_id,
-                    session_id = %fail_session_id,
-                    panic = %panic_msg,
-                    "chat session task panicked"
-                );
-                mark_session_failed(
-                    fail_state,
-                    &fail_thread_id,
-                    &fail_session_id,
-                    format!("internal error: session task panicked: {panic_msg}"),
-                )
-                .await;
-            }
-        }
-    });
-}
-
-async fn run_session_task(
-    state: Arc<AppState>,
-    ctx: SessionLaunchContext,
-    env_vars: Vec<(String, String)>,
-) -> Result<(), String> {
-    let SessionLaunchContext {
-        thread_id,
-        session_id,
-        command,
-        cwd,
-        load_session_id,
-        preferred_model,
-    } = ctx;
-    let mut cmd = Command::new("bash");
-    cmd.args(["-lc", &command])
-        .current_dir(&cwd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    for (key, value) in &env_vars {
-        cmd.env(key, value);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("failed to spawn chat agent process: {err}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture chat agent stdout".to_string())?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "failed to capture chat agent stdin".to_string())?;
-
-    let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(CHAT_INPUT_CHANNEL_CAPACITY);
-    let input_task = tokio::spawn(async move {
-        let mut writer = stdin;
-        while let Some(mut batch) = input_rx.recv().await {
-            while let Ok(more) = input_rx.try_recv() {
-                batch.extend_from_slice(&more);
-            }
-
-            if let Err(err) = writer.write_all(&batch).await {
-                warn!(error = %err, "failed to write chat agent stdin");
-                break;
-            }
-
-            if let Err(err) = writer.flush().await {
-                warn!(error = %err, "failed to flush chat agent stdin");
-                break;
-            }
-        }
-    });
-
-    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-    {
-        let mut chat = state.chat.lock().await;
-        let Some(session) = chat.sessions.get_mut(&session_id) else {
-            let _ = child.kill().await;
-            input_task.abort();
-            return Ok(());
-        };
-        session.input_tx = Some(input_tx.clone());
-        session.stop_tx = Some(stop_tx);
-    }
-
-    let mut stdout = stdout;
-    let is_new_session = load_session_id.is_none();
-    let handshake = timeout(
-        CHAT_HANDSHAKE_TIMEOUT,
-        perform_handshake(
-            &input_tx,
-            &mut stdout,
-            load_session_id,
-            &cwd,
-            preferred_model.as_deref(),
-        ),
-    )
-    .await
-    .map_err(|_| "chat handshake timed out after 30s".to_string())?;
-
-    let handshake = match handshake {
-        Ok(result) => result,
-        Err(error) => {
-            mark_session_failed(Arc::clone(&state), &thread_id, &session_id, error).await;
-            let _ = child.kill().await;
-            input_task.abort();
-            return Ok(());
-        }
-    };
-
-    // Persist replay notifications from session/load to JSONL so that
-    // chat.history returns the canonical conversation history from the agent.
-    // Done BEFORE mark_session_ready so the JSONL is ready when the Mac
-    // calls chat.history after attaching.
-    if !handshake.replay_notifications.is_empty() {
-        // Skip overwrite_history — the JSONL already contains the full history
-        // from live fanout_output. The agent's session/load replay is often
-        // incomplete (only the latest turn), so overwriting would destroy data.
-        // New updates after load will append normally via fanout_output.
-    }
-
-    mark_session_ready(Arc::clone(&state), &thread_id, &session_id, &handshake).await;
-
-    // Post-handshake context injection: platform prompt + system_prompt + initial_prompt.
-    // Only inject on session/new — session/load already has the context from the
-    // prior conversation. Re-injecting would show the injection text again.
-    //
-    // Project AGENTS.md is NOT injected here — each agent binary handles its own
-    // project context discovery (OpenCode reads AGENTS.md, Claude reads CLAUDE.md, etc.).
-    // We only inject platform-level awareness (Threadmill env vars, threadmill-cli,
-    // worker orchestration) which no agent can discover on its own.
-    let (had_conversation_context, is_fork_session) = {
-        let chat = state.chat.lock().await;
-        let session = chat.sessions.get(&session_id);
-        (
-            session.is_some_and(|session| session.had_conversation_context),
-            session.is_some_and(|session| session.parent_session_id.is_some()),
-        )
-    };
-    if should_send_initial_context_injection(
-        is_new_session,
-        had_conversation_context,
-        is_fork_session,
-    ) {
-        let (system_prompt, initial_prompt) = {
-            let chat = state.chat.lock().await;
-            let session = chat.sessions.get(&session_id);
-            let sp = session.and_then(|s| s.system_prompt.clone());
-            let ip = session.and_then(|s| s.initial_prompt.clone());
-            (sp, ip)
-        };
-
-        // Read platform system prompt from <config>/threadmill/system-prompt.md
-        // (XDG_CONFIG_HOME if set, else platform default).
-        let platform_prompt = {
-            let config_dir = config::config_dir().unwrap_or_default();
-            let platform_path = config_dir.join("threadmill").join("system-prompt.md");
-            match std::fs::read_to_string(&platform_path) {
-                Ok(content) => {
-                    tracing::info!(session_id = %session_id, "injecting platform system-prompt.md ({} bytes)", content.len());
-                    Some(content)
-                }
-                Err(_) => {
-                    tracing::debug!(session_id = %session_id, "no system-prompt.md found, skipping platform prompt");
-                    None
-                }
-            }
-        };
-
-        let combined = build_injection_prompt(
-            platform_prompt.as_deref(),
-            system_prompt.as_deref(),
-            initial_prompt.as_deref(),
-        );
-        if let Some(prompt_text) = combined {
-            tracing::info!(session_id = %session_id, len = prompt_text.len(), "sending injection prompt");
-            let injection_id: u64 = 100;
-            if let Err(err) = send_acp_request(
-                &input_tx,
-                injection_id,
-                "session/prompt",
-                json!({
-                    "sessionId": handshake.acp_session_id,
-                    "prompt": [{"type": "text", "text": prompt_text}]
-                }),
-            )
-            .await
-            {
-                tracing::warn!(session_id = %session_id, error = %err, "failed to send injection prompt");
-            } else {
-                // Track injection id so the outbound status machinery fires Busy→Idle
-                // when the agent responds, giving the Mac a clear "injection complete" signal.
-                let transitions = {
-                    let mut chat = state.chat.lock().await;
-                    let mut transitions = Vec::new();
-                    if let Some(session) = chat.sessions.get_mut(&session_id) {
-                        let id_str = injection_id.to_string();
-                        session.pending_prompt_ids.insert(id_str.clone());
-                        session.injection_prompt_id = Some(id_str);
-                        apply_status_transition(
-                            session,
-                            protocol::AgentStatus::Busy,
-                            &mut transitions,
-                        );
-                    }
-                    transitions
-                };
-                emit_status_transitions(&state, transitions).await;
-            }
-            // Don't wait for response — let it stream in the I/O loop.
-            // The response will be detected by apply_outbound_status_updates which
-            // fires Busy→Idle and emits chat.injection_complete.
-        } else {
-            // No injection content — signal immediately so the Mac doesn't wait
-            state.emit_event(
-                "chat.injection_complete",
-                json!({
-                    "thread_id": thread_id,
-                    "session_id": session_id,
-                }),
-            );
-        }
-    } else {
-        tracing::debug!(session_id = %session_id, "session load/restored context — skipping context injection");
-        // Loaded sessions don't inject — signal immediately
-        state.emit_event(
-            "chat.injection_complete",
-            json!({
-                "thread_id": thread_id,
-                "session_id": session_id,
-            }),
-        );
-    }
-
-    let mut buf = [0_u8; CHAT_IO_CHUNK_SIZE];
-    let mut explicit_stop = false;
-
-    let final_status = loop {
-        tokio::select! {
-            _ = &mut stop_rx => {
-                explicit_stop = true;
-                let _ = child.kill().await;
-                break child.wait().await;
-            }
-            read_result = stdout.read(&mut buf) => {
-                match read_result {
-                    Ok(0) => {
-                        break child.wait().await;
-                    }
-                    Ok(read_len) => {
-                        fanout_output(Arc::clone(&state), &session_id, &buf[..read_len]).await;
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => {
-                        warn!(error = %err, "failed to read chat agent stdout");
-                        break child.wait().await;
-                    }
-                }
-            }
-        }
-    };
-
-    input_task.abort();
-    let _ = input_task.await;
-
-    let reason = match final_status {
-        Ok(_) if explicit_stop => "stopped".to_string(),
-        Ok(status) if status.success() => "exited".to_string(),
-        Ok(status) => format!(
-            "crashed{}",
-            status
-                .code()
-                .map(|code| format!(" (code {code})"))
-                .unwrap_or_default()
-        ),
-        Err(err) => format!("crashed ({err})"),
-    };
-
-    mark_session_ended(Arc::clone(&state), &thread_id, &session_id, &reason, false).await;
-    Ok(())
 }
 
 async fn perform_handshake(
@@ -1715,454 +1264,6 @@ async fn perform_handshake(
             .map(ToOwned::to_owned),
         model_id,
         replay_notifications: collected,
-    })
-}
-
-/// Monotonic ID generator for Spindle-originated ACP requests (injections, etc.).
-///
-/// Starts at 1_000_000_000 to stay far above IDs the Mac uses for user-originated
-/// prompts, avoiding collisions in `pending_prompt_ids` tracking.
-fn injection_request_id() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(1_000_000_000);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-async fn send_acp_request(
-    input_tx: &mpsc::Sender<Vec<u8>>,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> Result<(), String> {
-    let payload = serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    }))
-    .map_err(|err| format!("failed to encode ACP request {method}: {err}"))?;
-
-    let mut frame = payload;
-    frame.push(b'\n');
-    input_tx
-        .send(frame)
-        .await
-        .map_err(|err| format!("failed to queue ACP request {method}: {err}"))
-}
-
-async fn wait_for_acp_response(
-    stdout: &mut tokio::process::ChildStdout,
-    buffer: &mut Vec<u8>,
-    response_id: u64,
-    collected: &mut Vec<Value>,
-) -> Result<Value, String> {
-    loop {
-        let Some(line) = next_json_line(stdout, buffer).await? else {
-            return Err("agent closed stdout during handshake".to_string());
-        };
-        let id_matches = line
-            .get("id")
-            .and_then(Value::as_u64)
-            .map(|id| id == response_id)
-            .unwrap_or(false)
-            || line
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(|id| id.parse::<u64>().ok())
-                .map(|id| id == response_id)
-                .unwrap_or(false);
-
-        if id_matches {
-            return Ok(line);
-        }
-        collected.push(line);
-    }
-}
-
-fn ensure_acp_success<'a>(response: &'a Value, method: &str) -> Result<&'a Value, String> {
-    if let Some(error) = response.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown ACP error");
-        return Err(format!("ACP {method} failed: {message}"));
-    }
-
-    response
-        .get("result")
-        .ok_or_else(|| format!("ACP {method} response missing result"))
-}
-
-async fn next_json_line(
-    stdout: &mut tokio::process::ChildStdout,
-    buffer: &mut Vec<u8>,
-) -> Result<Option<Value>, String> {
-    loop {
-        if let Some(newline_idx) = buffer.iter().position(|byte| *byte == b'\n') {
-            let line = buffer[..newline_idx].to_vec();
-            buffer.drain(..=newline_idx);
-            if line.is_empty() {
-                continue;
-            }
-
-            let parsed = serde_json::from_slice::<Value>(&line)
-                .map_err(|err| format!("failed to parse ACP line: {err}"))?;
-            return Ok(Some(parsed));
-        }
-
-        let mut chunk = [0_u8; CHAT_IO_CHUNK_SIZE];
-        let read_len = stdout
-            .read(&mut chunk)
-            .await
-            .map_err(|err| format!("failed to read ACP stdout: {err}"))?;
-        if read_len == 0 {
-            return Ok(None);
-        }
-
-        buffer.extend_from_slice(&chunk[..read_len]);
-    }
-}
-
-#[derive(Debug)]
-struct StatusTransition {
-    thread_id: String,
-    session_id: String,
-    old_status: protocol::AgentStatus,
-    new_status: protocol::AgentStatus,
-    worker_count: usize,
-}
-
-struct AutoCheckpointRequest {
-    thread_id: String,
-    session_id: String,
-    message: String,
-    prompt_preview: Option<String>,
-    /// Pre-computed history cursor captured BEFORE the user echo is appended
-    /// to the JSONL. Without this, the auto-checkpoint reads the line count
-    /// after the echo is already written, so checkpoint.restore truncates to
-    /// a point that includes the user echo but not the agent response.
-    history_cursor: Option<u64>,
-}
-
-async fn emit_status_transitions(state: &Arc<AppState>, transitions: Vec<StatusTransition>) {
-    for transition in transitions {
-        state.emit_chat_status_changed(protocol::ChatStatusChangedEvent {
-            thread_id: transition.thread_id.clone(),
-            session_id: transition.session_id.clone(),
-            old_status: transition.old_status,
-            new_status: transition.new_status,
-            worker_count: transition.worker_count,
-        });
-        emit_state_delta_updated(state, &transition.thread_id, &transition.session_id).await;
-    }
-}
-
-fn apply_status_transition(
-    session: &mut ChatSessionRuntime,
-    new_status: protocol::AgentStatus,
-    transitions: &mut Vec<StatusTransition>,
-) {
-    let old_status = session.summary.agent_status.clone();
-    if old_status == new_status {
-        return;
-    }
-
-    session.summary.agent_status = new_status.clone();
-    transitions.push(StatusTransition {
-        thread_id: session.thread_id.clone(),
-        session_id: session.summary.session_id.clone(),
-        old_status,
-        new_status,
-        worker_count: session.summary.worker_count,
-    });
-}
-
-fn reset_status_tracking(
-    session: &mut ChatSessionRuntime,
-    transitions: &mut Vec<StatusTransition>,
-) {
-    session.active_tools.clear();
-    session.pending_prompt_ids.clear();
-    session.summary.worker_count = 0;
-    cancel_stall_timer(session);
-    apply_status_transition(session, protocol::AgentStatus::Idle, transitions);
-}
-
-fn cancel_stall_timer(session: &mut ChatSessionRuntime) {
-    session.stall_generation = session.stall_generation.wrapping_add(1);
-    session.last_update_time = None;
-    if let Some(task) = session.stall_task.take() {
-        task.abort();
-    }
-}
-
-fn restart_stall_timer(state: &Arc<AppState>, session: &mut ChatSessionRuntime) {
-    session.stall_generation = session.stall_generation.wrapping_add(1);
-    session.last_update_time = Some(Utc::now());
-    if let Some(task) = session.stall_task.take() {
-        task.abort();
-    }
-
-    let generation = session.stall_generation;
-    let session_id = session.summary.session_id.clone();
-    let state = Arc::clone(state);
-    session.stall_task = Some(tokio::spawn(async move {
-        tokio::time::sleep(CHAT_STALL_TIMEOUT).await;
-        handle_stall_timeout(state, session_id, generation).await;
-    }));
-}
-
-async fn handle_stall_timeout(state: Arc<AppState>, session_id: String, generation: u64) {
-    let transitions = {
-        let mut transitions = Vec::new();
-        let mut chat = state.chat.lock().await;
-        let Some(session) = chat.sessions.get_mut(&session_id) else {
-            return;
-        };
-
-        if session.stall_generation != generation
-            || session.summary.agent_status != protocol::AgentStatus::Busy
-        {
-            return;
-        }
-
-        session.stall_task = None;
-        apply_status_transition(session, protocol::AgentStatus::Stalled, &mut transitions);
-        transitions
-    };
-
-    if transitions.is_empty() {
-        return;
-    }
-
-    emit_status_transitions(&state, transitions).await;
-}
-
-/// Output of `apply_inbound_status_updates`.
-struct SessionProcessingOutcome {
-    transitions: Vec<StatusTransition>,
-    /// If set, the original inbound payload was rewritten and should be
-    /// forwarded to the agent in place of the raw bytes.
-    replacement_payload: Option<Vec<u8>>,
-    history_updates: Vec<Value>,
-    auto_checkpoints: Vec<AutoCheckpointRequest>,
-    title_prompt_to_generate: Option<String>,
-    /// Whether the per-session conversation context was consumed during this batch.
-    consumed_conversation_context: bool,
-    blocked_request_cancellations: Vec<BlockedRequestCancellation>,
-}
-
-fn apply_inbound_status_updates(
-    state: &Arc<AppState>,
-    session: &mut ChatSessionRuntime,
-    messages: Vec<Value>,
-) -> SessionProcessingOutcome {
-    let mut transitions = Vec::new();
-    let mut messages = messages;
-    let mut replacement_payload = None;
-    let mut payload_rewritten = false;
-    let mut history_updates = Vec::new();
-    let mut auto_checkpoints = Vec::new();
-    let mut title_prompt_to_generate = None;
-    let mut consumed_conversation_context = false;
-    let mut blocked_request_cancellations = Vec::new();
-
-    for message in &mut messages {
-        let method = message
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        if method == CHAT_PROMPT_METHOD {
-            let params = message.get("params");
-            let session_id_value = params
-                .and_then(|params| params.get("sessionId"))
-                .cloned()
-                .unwrap_or_else(|| Value::String(String::new()));
-            let prompt_preview = prompt_preview_from_params(params);
-            let prompt_updates = user_prompt_history_updates(session_id_value.clone(), params);
-
-            if let Some(id) = request_id_key(message.get("id")) {
-                session.pending_prompt_ids.insert(id);
-            }
-
-            if session.user_prompt_count == 0 {
-                if let Some(text) = params
-                    .and_then(|p| p.get("prompt"))
-                    .and_then(Value::as_array)
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| {
-                                if p.get("type")?.as_str() == Some("text") {
-                                    p.get("text")?.as_str()
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .filter(|t| !t.is_empty())
-                {
-                    session.first_prompt_text = Some(text);
-                    if session.summary.parent_session_id.is_none()
-                        && !session.had_conversation_context
-                        && session.summary.title.is_none()
-                    {
-                        title_prompt_to_generate = session.first_prompt_text.clone();
-                    }
-                }
-            }
-            session.user_prompt_count += 1;
-
-            if let Some(conversation_context) = session.conversation_context.as_deref() {
-                let context_block = format!("{conversation_context}\n\n---\n\n");
-                if prepend_prompt_text_block(message, &context_block) {
-                    payload_rewritten = true;
-                    consumed_conversation_context = true;
-                }
-            }
-
-            history_updates.extend(prompt_updates);
-
-            session.checkpoint_seq += 1;
-            auto_checkpoints.push(AutoCheckpointRequest {
-                thread_id: session.thread_id.clone(),
-                session_id: session.summary.session_id.clone(),
-                message: format!("Auto-checkpoint before prompt {}", session.checkpoint_seq),
-                prompt_preview,
-                history_cursor: None, // filled in by handle_inbound_data before JSONL write
-            });
-            session.active_tools.clear();
-            session.summary.worker_count = 0;
-            apply_status_transition(session, protocol::AgentStatus::Busy, &mut transitions);
-            restart_stall_timer(state, session);
-            continue;
-        }
-
-        if method == CHAT_CANCEL_METHOD {
-            reset_status_tracking(session, &mut transitions);
-            blocked_request_cancellations
-                .extend(collect_pending_blocked_request_cancellations(session));
-        }
-    }
-
-    if payload_rewritten {
-        replacement_payload = Some(serialize_json_messages(&messages));
-    }
-
-    SessionProcessingOutcome {
-        transitions,
-        replacement_payload,
-        history_updates,
-        auto_checkpoints,
-        title_prompt_to_generate,
-        consumed_conversation_context,
-        blocked_request_cancellations,
-    }
-}
-
-fn spawn_auto_checkpoint(state: Arc<AppState>, request: AutoCheckpointRequest) {
-    tokio::spawn(async move {
-        if let Err(error) = CheckpointService::save_with_cursor(
-            state,
-            protocol::CheckpointSaveParams {
-                thread_id: request.thread_id,
-                session_id: Some(request.session_id),
-                message: Some(request.message),
-                prompt_preview: request.prompt_preview,
-            },
-            request.history_cursor,
-        )
-        .await
-        {
-            warn!(error = %error, "failed to save auto-checkpoint");
-        }
-    });
-}
-
-fn prompt_preview_from_params(params: Option<&Value>) -> Option<String> {
-    let prompt = params
-        .and_then(|params| params.get("prompt"))
-        .and_then(Value::as_array)?;
-    let preview = prompt
-        .iter()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if preview.is_empty() {
-        return None;
-    }
-
-    let mut preview = preview;
-    if preview.len() > 160 {
-        preview.truncate(preview.floor_char_boundary(160));
-        preview.push('…');
-    }
-    Some(preview)
-}
-
-fn user_prompt_history_updates(session_id_value: Value, params: Option<&Value>) -> Vec<Value> {
-    params
-        .and_then(|params| params.get("prompt"))
-        .and_then(Value::as_array)
-        .map(|prompt| {
-            prompt
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .map(|text| user_prompt_history_update(session_id_value.clone(), text))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn prepend_prompt_text_block(message: &mut Value, prompt_text: &str) -> bool {
-    let Some(message_object) = message.as_object_mut() else {
-        return false;
-    };
-    let params = message_object
-        .entry("params".to_string())
-        .or_insert_with(|| json!({}));
-    let Some(params_object) = params.as_object_mut() else {
-        return false;
-    };
-    let prompt = params_object
-        .entry("prompt".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-
-    let context_block = json!({
-        "type": "text",
-        "text": prompt_text,
-        "annotations": { "audience": ["assistant"] }
-    });
-    if let Some(prompt_array) = prompt.as_array_mut() {
-        prompt_array.insert(0, context_block);
-    } else {
-        *prompt = Value::Array(vec![context_block]);
-    }
-    true
-}
-
-fn serialize_json_messages(messages: &[Value]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    for message in messages {
-        serde_json::to_writer(&mut payload, message)
-            .expect("serializing serde_json::Value into Vec<u8> cannot fail");
-        payload.push(b'\n');
-    }
-    payload
-}
-
-fn user_prompt_history_update(session_id_value: Value, text: &str) -> Value {
-    json!({
-        "sessionId": session_id_value,
-        "update": {
-            "sessionUpdate": "user_message_chunk",
-            "content": { "type": "text", "text": text }
-        }
     })
 }
 
@@ -2304,6 +1405,7 @@ fn invalid_blocked_request_error_payload(error: &InvalidBlockedRequestRuntime) -
             }
         }
     })])
+    .unwrap_or_default()
 }
 
 fn blocked_permission_from_params(
@@ -2552,185 +1654,6 @@ fn blocked_request_removed_event(
     }
 }
 
-struct OutboundResult {
-    transitions: Vec<StatusTransition>,
-    injection_completed: bool,
-}
-
-/// Returns status transitions and whether the handshake-time injection completed.
-fn apply_outbound_status_updates(
-    state: &Arc<AppState>,
-    session: &mut ChatSessionRuntime,
-    messages: Vec<Value>,
-) -> OutboundResult {
-    let mut result = OutboundResult {
-        transitions: Vec::new(),
-        injection_completed: false,
-    };
-
-    for message in messages {
-        if let Some(method) = message.get("method").and_then(Value::as_str) {
-            if method == CHAT_UPDATE_METHOD {
-                apply_worker_update(session, message.get("params"));
-                if session.summary.agent_status == protocol::AgentStatus::Busy {
-                    restart_stall_timer(state, session);
-                } else if session.summary.agent_status == protocol::AgentStatus::Stalled {
-                    apply_status_transition(
-                        session,
-                        protocol::AgentStatus::Busy,
-                        &mut result.transitions,
-                    );
-                    restart_stall_timer(state, session);
-                }
-            }
-        }
-
-        if !(message.get("result").is_some() || message.get("error").is_some()) {
-            continue;
-        }
-
-        let Some(id) = request_id_key(message.get("id")) else {
-            continue;
-        };
-        if !session.pending_prompt_ids.remove(&id) {
-            continue;
-        }
-
-        // Detect injection turn completion
-        if session.injection_prompt_id.as_deref() == Some(&id) {
-            session.injection_prompt_id = None;
-            result.injection_completed = true;
-        }
-
-        reset_status_tracking(session, &mut result.transitions);
-    }
-
-    result
-}
-
-fn apply_worker_update(session: &mut ChatSessionRuntime, params: Option<&Value>) {
-    let Some(update) = params.and_then(|params| params.get("update")) else {
-        return;
-    };
-
-    let kind = update
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let status = extract_tool_status(update).unwrap_or_default();
-    let tool_call_id = extract_tool_call_id(update);
-
-    if kind == "tool_call" {
-        if matches!(status, "pending" | "in_progress") {
-            if let Some(tool_call_id) = tool_call_id {
-                session.active_tools.insert(tool_call_id);
-            }
-            session.total_tool_count += 1;
-
-            // Extract tool name and title for worker update relay
-            let tool_name = update
-                .get("toolCall")
-                .and_then(|tc| tc.get("name"))
-                .and_then(Value::as_str)
-                .or_else(|| update.get("name").and_then(Value::as_str))
-                .map(ToOwned::to_owned);
-            let tool_title = update
-                .get("toolCall")
-                .and_then(|tc| tc.get("state"))
-                .and_then(|s| s.get("title"))
-                .and_then(Value::as_str)
-                .or_else(|| update.get("title").and_then(Value::as_str))
-                .map(ToOwned::to_owned);
-            if let Some(name) = tool_name {
-                session.latest_tool_name = Some(name);
-            }
-            if let Some(title) = tool_title {
-                session.latest_tool_title = Some(title);
-            }
-        }
-    } else if kind == "tool_call_update" {
-        // Update title if available (tools stream their title as they progress)
-        let tool_title = update
-            .get("toolCall")
-            .and_then(|tc| tc.get("state"))
-            .and_then(|s| s.get("title"))
-            .and_then(Value::as_str)
-            .or_else(|| update.get("title").and_then(Value::as_str))
-            .map(ToOwned::to_owned);
-        if let Some(title) = tool_title {
-            session.latest_tool_title = Some(title);
-        }
-
-        if matches!(status, "completed" | "cancelled" | "error") {
-            if let Some(tool_call_id) = tool_call_id {
-                session.active_tools.remove(&tool_call_id);
-            }
-        }
-    }
-
-    session.summary.worker_count = session.active_tools.len();
-}
-
-fn extract_tool_call_id(update: &Value) -> Option<String> {
-    update
-        .get("toolCallId")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            update
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            update
-                .get("toolCall")
-                .and_then(|tool_call| tool_call.get("id"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-}
-
-fn extract_tool_status(update: &Value) -> Option<&str> {
-    update.get("status").and_then(Value::as_str).or_else(|| {
-        update
-            .get("toolCall")
-            .and_then(|tool_call| tool_call.get("status"))
-            .and_then(Value::as_str)
-    })
-}
-
-fn request_id_key(id_value: Option<&Value>) -> Option<String> {
-    let id_value = id_value?;
-    id_value
-        .as_str()
-        .map(ToOwned::to_owned)
-        .or_else(|| id_value.as_u64().map(|id| id.to_string()))
-        .or_else(|| id_value.as_i64().map(|id| id.to_string()))
-}
-
-fn extract_json_messages(buffer: &mut Vec<u8>, payload: &[u8], direction: &str) -> Vec<Value> {
-    buffer.extend_from_slice(payload);
-    let mut messages = Vec::new();
-
-    while let Some(newline_idx) = buffer.iter().position(|byte| *byte == b"\n"[0]) {
-        let line = buffer[..newline_idx].to_vec();
-        buffer.drain(..=newline_idx);
-        if line.is_empty() {
-            continue;
-        }
-
-        match serde_json::from_slice::<Value>(&line) {
-            Ok(value) => messages.push(value),
-            Err(error) => {
-                warn!(error = %error, direction, "failed to parse chat JSON frame");
-            }
-        }
-    }
-
-    messages
-}
-
 struct OutboundFrame {
     payload: Vec<u8>,
     message: Option<Value>,
@@ -2778,20 +1701,6 @@ fn collect_session_update_params(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Rewrite sessionId in a JSON payload. Spindle session IDs are the external
-/// contract; ACP session IDs are internal to the agent. Spindle translates
-/// at the relay boundary so clients never see ACP IDs.
-fn rewrite_session_id(payload: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
-    if from.is_empty() || to.is_empty() || from == to {
-        return None;
-    }
-    let payload_str = std::str::from_utf8(payload).ok()?;
-    if !payload_str.contains(from) {
-        return None;
-    }
-    Some(payload_str.replace(from, to).into_bytes())
-}
-
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
     let (
         targets,
@@ -2812,7 +1721,6 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
-
         let frames = extract_outbound_frames(&mut session.output_buffer, payload);
         let attached_channels = session
             .attached_channels
@@ -2828,56 +1736,62 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         let mut invalid_blocked_request_delivery_errors = Vec::new();
         for frame in frames {
             match frame.message {
-                Some(message) => match blocked_request_from_message(session, &message) {
-                    BlockedRequestFrame::Pending(pending) => {
-                        if should_capture_blocked_requests {
-                            session
-                                .pending_blocked_requests
-                                .insert(pending.request.request_id.clone(), pending.clone());
-                            blocked_requests.push(pending.request);
-                        } else {
-                            legacy_payload.extend_from_slice(&frame.payload);
-                            pass_through_messages.push(message);
-                        }
+                Some(message) => {
+                    if is_duplicate_user_echo(session, &message) {
+                        continue;
                     }
-                    BlockedRequestFrame::Invalid(error) => {
-                        if should_capture_blocked_requests {
-                            warn!(
-                                session_id,
-                                method = %error.method,
-                                request_id = %error.request_id,
-                                reason = %error.reason,
-                                "invalid blocked request from agent; sending error to agent stdin"
-                            );
-                            let payload = invalid_blocked_request_error_payload(&error);
-                            if let Some(input_tx) = session.input_tx.clone() {
-                                invalid_blocked_request_deliveries.push(
-                                    InvalidBlockedRequestDelivery {
-                                        input_tx,
-                                        payload,
-                                        method: error.method,
-                                        request_id: error.request_id.to_string(),
-                                    },
-                                );
+                    clear_pending_user_echoes_after_agent_turn(session, &message);
+                    match blocked_request_from_message(session, &message) {
+                        BlockedRequestFrame::Pending(pending) => {
+                            if should_capture_blocked_requests {
+                                session
+                                    .pending_blocked_requests
+                                    .insert(pending.request.request_id.clone(), pending.clone());
+                                blocked_requests.push(pending.request);
                             } else {
-                                invalid_blocked_request_delivery_errors.push(format!(
+                                legacy_payload.extend_from_slice(&frame.payload);
+                                pass_through_messages.push(message);
+                            }
+                        }
+                        BlockedRequestFrame::Invalid(error) => {
+                            if should_capture_blocked_requests {
+                                warn!(
+                                    session_id,
+                                    method = %error.method,
+                                    request_id = %error.request_id,
+                                    reason = %error.reason,
+                                    "invalid blocked request from agent; sending error to agent stdin"
+                                );
+                                let payload = invalid_blocked_request_error_payload(&error);
+                                if let Some(input_tx) = session.input_tx.clone() {
+                                    invalid_blocked_request_deliveries.push(
+                                        InvalidBlockedRequestDelivery {
+                                            input_tx,
+                                            payload,
+                                            method: error.method,
+                                            request_id: error.request_id.to_string(),
+                                        },
+                                    );
+                                } else {
+                                    invalid_blocked_request_delivery_errors.push(format!(
                                     "chat session {} cannot receive invalid blocked request error for {} request {}: agent stdin is not available",
                                     session.summary.session_id,
                                     error.method,
                                     error.request_id
                                 ));
+                                }
+                            } else {
+                                legacy_payload.extend_from_slice(&frame.payload);
+                                pass_through_messages.push(message);
                             }
-                        } else {
-                            legacy_payload.extend_from_slice(&frame.payload);
+                        }
+                        BlockedRequestFrame::NotBlockedRequest => {
                             pass_through_messages.push(message);
+                            daemon_aware_payload.extend_from_slice(&frame.payload);
+                            legacy_payload.extend_from_slice(&frame.payload);
                         }
                     }
-                    BlockedRequestFrame::NotBlockedRequest => {
-                        pass_through_messages.push(message);
-                        daemon_aware_payload.extend_from_slice(&frame.payload);
-                        legacy_payload.extend_from_slice(&frame.payload);
-                    }
-                },
+                }
                 None => {
                     daemon_aware_payload.extend_from_slice(&frame.payload);
                     legacy_payload.extend_from_slice(&frame.payload);
@@ -3029,6 +1943,141 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
     }
 }
 
+async fn record_pending_user_echoes(state: &Arc<AppState>, session_id: &str, updates: &[Value]) {
+    let pending = updates
+        .iter()
+        .filter_map(history_user_message_text)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return;
+    }
+
+    let mut chat = state.chat.lock().await;
+    if let Some(session) = chat.sessions.get_mut(session_id) {
+        session.pending_user_echoes.extend(pending);
+    }
+}
+
+async fn emit_session_update_notifications(
+    state: Arc<AppState>,
+    session_id: &str,
+    updates: &[Value],
+) {
+    if updates.is_empty() {
+        return;
+    }
+
+    let targets = {
+        let chat = state.chat.lock().await;
+        let Some(session) = chat.sessions.get(session_id) else {
+            return;
+        };
+        session
+            .attached_channels
+            .iter()
+            .filter_map(|channel_id| {
+                chat.channel_outbound
+                    .get(channel_id)
+                    .cloned()
+                    .map(|outbound| (*channel_id, outbound))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut dead_channels = Vec::new();
+    for update in updates {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": CHAT_UPDATE_METHOD,
+            "params": update,
+        });
+        let Ok(payload) = serde_json::to_vec(&notification) else {
+            continue;
+        };
+        for (channel_id, outbound) in &targets {
+            let mut frame = Vec::with_capacity(payload.len() + 2);
+            frame.extend_from_slice(&channel_id.to_be_bytes());
+            frame.extend_from_slice(&payload);
+            if outbound.send(Message::Binary(frame.into())).is_err() {
+                dead_channels.push(*channel_id);
+            }
+        }
+    }
+
+    if !dead_channels.is_empty() {
+        dead_channels.sort_unstable();
+        dead_channels.dedup();
+        detach_channels(state, dead_channels).await;
+    }
+}
+
+#[cfg(test)]
+fn filter_duplicate_user_echoes(
+    session: &mut ChatSessionRuntime,
+    messages: Vec<Value>,
+) -> (Vec<Value>, Option<Vec<u8>>) {
+    let original_count = messages.len();
+    let mut filtered = Vec::with_capacity(original_count);
+    for message in messages {
+        if is_duplicate_user_echo(session, &message) {
+            continue;
+        }
+        clear_pending_user_echoes_after_agent_turn(session, &message);
+        filtered.push(message);
+    }
+    let payload_override = if filtered.len() == original_count {
+        None
+    } else {
+        Some(serialize_json_messages(&filtered).unwrap_or_default())
+    };
+
+    (filtered, payload_override)
+}
+
+fn is_duplicate_user_echo(session: &mut ChatSessionRuntime, message: &Value) -> bool {
+    if message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method != CHAT_UPDATE_METHOD)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+
+    let Some(text) = message.get("params").and_then(history_user_message_text) else {
+        return false;
+    };
+
+    if session
+        .pending_user_echoes
+        .front()
+        .is_some_and(|pending| pending == text)
+    {
+        session.pending_user_echoes.pop_front();
+        return true;
+    }
+
+    false
+}
+
+fn update_kind_from_message(message: &Value) -> Option<&str> {
+    let update = message.get("params")?.get("update")?;
+    update
+        .get("sessionUpdate")
+        .or_else(|| update.get("kind"))
+        .and_then(Value::as_str)
+}
+
+fn clear_pending_user_echoes_after_agent_turn(session: &mut ChatSessionRuntime, message: &Value) {
+    match update_kind_from_message(message) {
+        Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call") => {
+            session.pending_user_echoes.clear();
+        }
+        _ => {}
+    }
+}
+
 fn spawn_title_generation(
     state: Arc<AppState>,
     session_id: String,
@@ -3104,77 +2153,6 @@ async fn emit_worker_update_to_parent(state: &Arc<AppState>, worker_session_id: 
     };
 
     state.emit_event("chat.worker_update", &event);
-}
-
-async fn mark_session_ready(
-    state: Arc<AppState>,
-    thread_id: &str,
-    session_id: &str,
-    handshake: &HandshakeResult,
-) {
-    tracing::info!(thread_id, session_id, model = ?handshake.model_id, "chat_session_ready");
-    let history_root = {
-        let chat = state.chat.lock().await;
-        chat.history_root.clone()
-    };
-    match persist_session_metadata(
-        &history_root,
-        thread_id,
-        session_id,
-        Some(handshake.acp_session_id.as_str()),
-    ) {
-        Ok(()) => {}
-        Err(error) => {
-            warn!(
-                thread_id,
-                session_id,
-                error = %error,
-                "failed to persist chat session metadata"
-            );
-        }
-    }
-    {
-        let mut chat = state.chat.lock().await;
-        if let Some(session) = chat.sessions.get_mut(session_id) {
-            session.summary.status = protocol::ChatSessionStatus::Ready;
-            session.summary.title = handshake.title.clone();
-            session.summary.model_id = handshake.model_id.clone();
-            session.acp_session_id = Some(handshake.acp_session_id.clone());
-            session.modes = handshake.modes.clone();
-            session.models = handshake.models.clone();
-            session.config_options = handshake.config_options.clone();
-            session.status_notify.notify_waiters();
-        }
-    }
-
-    state.emit_chat_session_ready(protocol::ChatSessionReadyEvent {
-        acp_session_id: handshake.acp_session_id.clone(),
-        thread_id: thread_id.to_string(),
-        session_id: session_id.to_string(),
-        modes: handshake.modes.clone(),
-        models: handshake.models.clone(),
-        config_options: handshake.config_options.clone(),
-    });
-    emit_state_delta_updated(&state, thread_id, session_id).await;
-}
-
-async fn clear_pending_conversation_context(
-    state: &Arc<AppState>,
-    thread_id: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    let history_root = {
-        let chat = state.chat.lock().await;
-        chat.history_root_path().to_path_buf()
-    };
-    clear_restored_session_marker(&history_root, thread_id, session_id)?;
-
-    let mut chat = state.chat.lock().await;
-    if let Some(session) = chat.sessions.get_mut(session_id) {
-        session.conversation_context = None;
-    }
-
-    Ok(())
 }
 
 fn drain_pending_blocked_request_removals(
@@ -3265,154 +2243,6 @@ fn emit_blocked_request_removed_events(
     for removal in removals {
         state.emit_event("chat.blocked_request.removed", removal);
     }
-}
-
-async fn mark_session_failed(
-    state: Arc<AppState>,
-    thread_id: &str,
-    session_id: &str,
-    error: String,
-) {
-    tracing::warn!(thread_id, session_id, %error, "chat_session_failed");
-    let (transitions, removals) = {
-        let mut transitions = Vec::new();
-        let mut removals = Vec::new();
-        let mut chat = state.chat.lock().await;
-        if let Some(session) = chat.sessions.get_mut(session_id) {
-            session.summary.status = protocol::ChatSessionStatus::Failed;
-            session.input_tx = None;
-            session.stop_tx = None;
-            removals = drain_pending_blocked_request_removals(session);
-            reset_status_tracking(session, &mut transitions);
-            session.status_notify.notify_waiters();
-        }
-        (transitions, removals)
-    };
-
-    emit_status_transitions(&state, transitions).await;
-    emit_blocked_request_removed_events(&state, removals);
-
-    state.emit_chat_session_failed(protocol::ChatSessionFailedEvent {
-        thread_id: thread_id.to_string(),
-        session_id: session_id.to_string(),
-        error,
-    });
-    emit_state_delta_updated(&state, thread_id, session_id).await;
-}
-async fn mark_session_ended(
-    state: Arc<AppState>,
-    thread_id: &str,
-    session_id: &str,
-    reason: &str,
-    purge: bool,
-) {
-    let (should_emit_ended, transitions, removals) = {
-        let mut should_emit_ended = false;
-        let mut transitions = Vec::new();
-        let mut removals = Vec::new();
-        let mut chat = state.chat.lock().await;
-        if let Some(session) = chat.sessions.get_mut(session_id) {
-            if !session.ended_emitted {
-                session.summary.status = protocol::ChatSessionStatus::Ended;
-                session.input_tx = None;
-                session.stop_tx = None;
-                session.ended_emitted = true;
-                should_emit_ended = true;
-            }
-            removals = drain_pending_blocked_request_removals(session);
-            reset_status_tracking(session, &mut transitions);
-            session.status_notify.notify_waiters();
-        }
-        (should_emit_ended, transitions, removals)
-    };
-
-    emit_status_transitions(&state, transitions).await;
-    emit_blocked_request_removed_events(&state, removals);
-
-    if should_emit_ended {
-        state.emit_chat_session_ended(protocol::ChatSessionEndedEvent {
-            thread_id: thread_id.to_string(),
-            session_id: session_id.to_string(),
-            reason: reason.to_string(),
-        });
-        emit_state_delta_updated(&state, thread_id, session_id).await;
-    }
-
-    if purge {
-        purge_session(state, thread_id, session_id).await;
-    }
-}
-async fn stop_session_internal(
-    state: Arc<AppState>,
-    thread_id: &str,
-    session_id: &str,
-    reason: &str,
-    purge: bool,
-) -> Result<(), String> {
-    let stop_tx = {
-        let mut chat = state.chat.lock().await;
-        let session = chat
-            .sessions
-            .get_mut(session_id)
-            .ok_or_else(|| format!("chat session not found: {session_id}"))?;
-        if session.thread_id != thread_id {
-            return Err(format!(
-                "chat session {session_id} does not belong to thread {thread_id}"
-            ));
-        }
-        session.stop_tx.take()
-    };
-
-    if let Some(stop_tx) = stop_tx {
-        let _ = stop_tx.send(());
-    }
-
-    mark_session_ended(state, thread_id, session_id, reason, purge).await;
-    Ok(())
-}
-
-async fn purge_session(state: Arc<AppState>, thread_id: &str, session_id: &str) {
-    let (removed_channels, history_path) = {
-        let mut chat = state.chat.lock().await;
-        let Some(mut session) = chat.sessions.remove(session_id) else {
-            return;
-        };
-
-        if let Some(thread_sessions) = chat.sessions_by_thread.get_mut(thread_id) {
-            thread_sessions.retain(|existing| existing != session_id);
-            if thread_sessions.is_empty() {
-                chat.sessions_by_thread.remove(thread_id);
-            }
-        }
-
-        let channels = session.attached_channels.drain().collect::<Vec<_>>();
-        for channel_id in &channels {
-            chat.channel_to_session.remove(channel_id);
-            chat.channel_outbound.remove(channel_id);
-            chat.blocked_request_aware_channels.remove(channel_id);
-        }
-        (channels, session.history_path)
-    };
-
-    if !removed_channels.is_empty() {
-        detach_channels(Arc::clone(&state), removed_channels).await;
-    }
-
-    if let Err(error) = remove_history_file(&history_path) {
-        warn!(
-            session_id,
-            path = %history_path.display(),
-            error = %error,
-            "failed to remove chat history file during purge"
-        );
-    }
-
-    state.emit_state_delta(vec![
-        protocol::StateDeltaOperationPayload::ChatSessionRemoved {
-            thread_id: thread_id.to_string(),
-            session_id: session_id.to_string(),
-        },
-    ]);
 }
 
 async fn emit_state_delta_added(state: &AppState, thread_id: &str, session_id: &str) {
@@ -3520,893 +2350,6 @@ fn chat_status_name(status: &protocol::ChatSessionStatus) -> &'static str {
     }
 }
 
-pub(crate) fn history_path_for_session(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-) -> PathBuf {
-    history_root
-        .join(thread_id)
-        .join(format!("{session_id}.jsonl"))
-}
-
-fn history_metadata_path_for_session(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-) -> PathBuf {
-    history_root
-        .join(thread_id)
-        .join(format!("{session_id}.metadata.json"))
-}
-
-fn restored_session_marker_path_for_session(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-) -> PathBuf {
-    history_root
-        .join(thread_id)
-        .join(format!("{session_id}.restore-session-new"))
-}
-
-fn persist_restored_session_marker(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    let marker_path = restored_session_marker_path_for_session(history_root, thread_id, session_id);
-    let parent = marker_path.parent().ok_or_else(|| {
-        format!(
-            "invalid restored session marker path: {}",
-            marker_path.display()
-        )
-    })?;
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-
-    let mut file = fs::File::create(&marker_path)
-        .map_err(|err| format!("failed to create {}: {err}", marker_path.display()))?;
-    file.write_all(b"session/new\n")
-        .map_err(|err| format!("failed to write {}: {err}", marker_path.display()))?;
-    file.sync_all()
-        .map_err(|err| format!("failed to fsync {}: {err}", marker_path.display()))
-}
-
-fn restored_session_marker_exists(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-) -> Result<bool, String> {
-    restored_session_marker_path_for_session(history_root, thread_id, session_id)
-        .try_exists()
-        .map_err(|err| {
-            format!(
-                "failed to stat restored session marker for {}: {err}",
-                session_id
-            )
-        })
-}
-
-fn clear_restored_session_marker(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    let marker_path = restored_session_marker_path_for_session(history_root, thread_id, session_id);
-    match fs::remove_file(&marker_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!("failed to remove {}: {err}", marker_path.display())),
-    }
-}
-
-pub(crate) fn persist_session_metadata(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-    acp_session_id: Option<&str>,
-) -> Result<(), String> {
-    let metadata_path = history_metadata_path_for_session(history_root, thread_id, session_id);
-    let parent = metadata_path.parent().ok_or_else(|| {
-        format!(
-            "invalid chat session metadata path: {}",
-            metadata_path.display()
-        )
-    })?;
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-
-    let metadata = PersistedChatSessionMetadata {
-        acp_session_id: acp_session_id.map(ToOwned::to_owned),
-    };
-    let mut file = fs::File::create(&metadata_path)
-        .map_err(|err| format!("failed to create {}: {err}", metadata_path.display()))?;
-    serde_json::to_writer(&mut file, &metadata)
-        .map_err(|err| format!("failed to encode {}: {err}", metadata_path.display()))?;
-    file.write_all(b"\n")
-        .map_err(|err| format!("failed to finalize {}: {err}", metadata_path.display()))?;
-    file.sync_all()
-        .map_err(|err| format!("failed to fsync {}: {err}", metadata_path.display()))
-}
-
-fn read_persisted_session_metadata(
-    history_root: &Path,
-    thread_id: &str,
-    session_id: &str,
-) -> Result<Option<PersistedChatSessionMetadata>, String> {
-    let metadata_path = history_metadata_path_for_session(history_root, thread_id, session_id);
-    if !metadata_path.exists() {
-        return Ok(None);
-    }
-
-    let file = fs::File::open(&metadata_path)
-        .map_err(|err| format!("failed to open {}: {err}", metadata_path.display()))?;
-    let reader = BufReader::new(file);
-    serde_json::from_reader(reader)
-        .map(Some)
-        .map_err(|err| format!("failed to parse {}: {err}", metadata_path.display()))
-}
-
-fn read_history_acp_session_id(history_path: &Path) -> Option<String> {
-    fs::File::open(history_path).ok().and_then(|file| {
-        let reader = BufReader::new(file);
-        reader
-            .lines()
-            .next()?
-            .ok()
-            .and_then(|line| serde_json::from_str::<Value>(&line).ok())
-            .and_then(|value| value.get("sessionId")?.as_str().map(ToOwned::to_owned))
-    })
-}
-
-fn is_safe_history_component(value: &str) -> bool {
-    !value.is_empty() && !value.contains('/') && !value.contains('\\') && !value.contains("..")
-}
-
-fn count_lines(path: &Path) -> Result<u64, String> {
-    let file =
-        fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut count = 0_u64;
-    for line in reader.lines() {
-        line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-fn append_updates_to_history(history_path: &Path, updates: &[Value]) -> Result<(), String> {
-    if updates.is_empty() {
-        return Ok(());
-    }
-
-    let parent = history_path
-        .parent()
-        .ok_or_else(|| format!("invalid chat history path: {}", history_path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path)
-        .map_err(|err| format!("failed to open {}: {err}", history_path.display()))?;
-
-    for update in updates {
-        serde_json::to_writer(&mut file, update)
-            .map_err(|err| format!("failed to encode history update: {err}"))?;
-        file.write_all(b"\n").map_err(|err| {
-            format!(
-                "failed to append newline to {}: {err}",
-                history_path.display()
-            )
-        })?;
-    }
-
-    file.sync_data()
-        .map_err(|err| format!("failed to fsync {}: {err}", history_path.display()))
-}
-
-fn read_history_page(
-    history_path: &Path,
-    cursor: Option<u64>,
-) -> Result<protocol::ChatHistoryResult, String> {
-    if !history_path.exists() {
-        return Ok(protocol::ChatHistoryResult {
-            updates: Vec::new(),
-            next_cursor: None,
-        });
-    }
-
-    let start_idx = cursor.unwrap_or(0) as usize;
-    let file = fs::File::open(history_path)
-        .map_err(|err| format!("failed to open {}: {err}", history_path.display()))?;
-    let reader = BufReader::new(file);
-
-    let mut updates = Vec::new();
-    let mut line_index = 0_usize;
-    let mut has_more = false;
-
-    for line in reader.lines() {
-        let line =
-            line.map_err(|err| format!("failed to read {}: {err}", history_path.display()))?;
-        if line_index < start_idx {
-            line_index += 1;
-            continue;
-        }
-
-        if updates.len() >= CHAT_HISTORY_BATCH_SIZE {
-            has_more = true;
-            break;
-        }
-
-        match serde_json::from_str::<Value>(&line) {
-            Ok(value) => updates.push(value),
-            Err(error) => {
-                warn!(
-                    path = %history_path.display(),
-                    line_index,
-                    error = %error,
-                    "failed to parse chat history line"
-                );
-            }
-        }
-        line_index += 1;
-    }
-
-    let next_cursor = if has_more {
-        Some(start_idx as u64 + CHAT_HISTORY_BATCH_SIZE as u64)
-    } else {
-        None
-    };
-
-    Ok(protocol::ChatHistoryResult {
-        updates,
-        next_cursor,
-    })
-}
-
-pub(crate) fn build_conversation_context(
-    history_path: &Path,
-    cursor: Option<u64>,
-) -> Option<String> {
-    if !history_path.exists() {
-        return None;
-    }
-
-    let file = fs::File::open(history_path).ok()?;
-    let reader = BufReader::new(file);
-    let max_lines = cursor.unwrap_or(u64::MAX).min(usize::MAX as u64) as usize;
-    let mut entries = Vec::new();
-    let mut message_indices = HashMap::new();
-    let mut tool_indices = HashMap::new();
-
-    for (line_index, line) in reader.lines().take(max_lines).enumerate() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                warn!(
-                    path = %history_path.display(),
-                    line_index,
-                    error = %error,
-                    "failed to read chat history line while building conversation context"
-                );
-                continue;
-            }
-        };
-
-        let value = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    path = %history_path.display(),
-                    line_index,
-                    error = %error,
-                    "failed to parse chat history line while building conversation context"
-                );
-                continue;
-            }
-        };
-
-        let Some(update) = value.get("update") else {
-            continue;
-        };
-
-        match session_update_kind(update) {
-            Some("user_message_chunk") => append_message_entry(
-                &mut entries,
-                &mut message_indices,
-                "[User]",
-                extract_message_id(update),
-                extract_inline_text(update.get("content")),
-            ),
-            Some("agent_message_chunk") => append_message_entry(
-                &mut entries,
-                &mut message_indices,
-                "[Assistant]",
-                extract_message_id(update),
-                extract_inline_text(update.get("content")),
-            ),
-            Some("agent_thought_chunk") => append_message_entry(
-                &mut entries,
-                &mut message_indices,
-                "[Assistant - Thinking]",
-                extract_message_id(update),
-                extract_inline_text(update.get("content")),
-            ),
-            Some("tool_call") => upsert_tool_call_entry(&mut entries, &mut tool_indices, update),
-            Some("tool_call_update") => {
-                apply_tool_call_update_entry(&mut entries, &mut tool_indices, update)
-            }
-            Some("plan") => {
-                if let Some(plan) = format_plan_update(update) {
-                    entries.push(ConversationContextEntry::Plan(plan));
-                }
-            }
-            Some("usage_update") | Some("config_option_update") => {}
-            _ => {}
-        }
-    }
-
-    let transcript = entries
-        .into_iter()
-        .filter_map(|entry| entry.render())
-        .collect::<Vec<_>>();
-
-    if transcript.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "<conversation-history>\nThe following is a conversation you were having with the user. All tool calls\nhave already been executed and their results are reflected in the current working\ndirectory state. Continue this conversation naturally — the user's message\nfollows after this context block.\n\n{}\n</conversation-history>",
-        transcript.join("\n\n")
-    ))
-}
-
-enum ConversationContextEntry {
-    Message {
-        label: &'static str,
-        content: String,
-    },
-    ToolCall {
-        title: String,
-        status: ConversationToolStatus,
-        input: Option<String>,
-        output: Option<String>,
-        error: Option<String>,
-    },
-    Plan(String),
-}
-
-impl ConversationContextEntry {
-    fn render(self) -> Option<String> {
-        match self {
-            Self::Message { label, content } => {
-                if content.trim().is_empty() {
-                    None
-                } else {
-                    Some(format!("{label}\n{content}"))
-                }
-            }
-            Self::ToolCall {
-                title,
-                status,
-                input,
-                output,
-                error,
-            } => {
-                let mut lines = vec![format!("[Tool Call: {title} ({})]", status.as_str())];
-                if let Some(input) = input.filter(|input| !input.trim().is_empty()) {
-                    lines.push(format!("Input: {input}"));
-                }
-                match status {
-                    ConversationToolStatus::Pending => {}
-                    ConversationToolStatus::Completed => {
-                        if let Some(output) = output.filter(|output| !output.trim().is_empty()) {
-                            lines.push(format!("Output: {output}"));
-                        }
-                    }
-                    ConversationToolStatus::Cancelled => {}
-                    ConversationToolStatus::Failed => {
-                        if let Some(error) = error.filter(|error| !error.trim().is_empty()) {
-                            lines.push(format!("Error: {error}"));
-                        }
-                    }
-                }
-                Some(lines.join("\n"))
-            }
-            Self::Plan(plan) => {
-                if plan.trim().is_empty() {
-                    None
-                } else {
-                    Some(format!("[Plan Update]\n{plan}"))
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ConversationToolStatus {
-    Pending,
-    Completed,
-    Cancelled,
-    Failed,
-}
-
-impl ConversationToolStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Completed => "completed",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-fn session_update_kind(update: &Value) -> Option<&str> {
-    update
-        .get("sessionUpdate")
-        .and_then(Value::as_str)
-        .or_else(|| update.get("kind").and_then(Value::as_str))
-}
-
-fn extract_message_id(update: &Value) -> Option<&str> {
-    update
-        .get("messageId")
-        .and_then(Value::as_str)
-        .or_else(|| update.get("message_id").and_then(Value::as_str))
-        .filter(|message_id| !message_id.is_empty())
-}
-
-fn append_message_entry(
-    entries: &mut Vec<ConversationContextEntry>,
-    message_indices: &mut HashMap<String, usize>,
-    label: &'static str,
-    message_id: Option<&str>,
-    content: Option<String>,
-) {
-    let Some(content) = content.filter(|content| !content.trim().is_empty()) else {
-        return;
-    };
-
-    if let Some(message_id) = message_id {
-        let key = format!("{label}:{message_id}");
-        if let Some(index) = message_indices.get(&key).copied() {
-            if let Some(ConversationContextEntry::Message {
-                content: existing, ..
-            }) = entries.get_mut(index)
-            {
-                existing.push_str(&content);
-                return;
-            }
-        }
-
-        message_indices.insert(key, entries.len());
-    }
-
-    entries.push(ConversationContextEntry::Message { label, content });
-}
-
-fn upsert_tool_call_entry(
-    entries: &mut Vec<ConversationContextEntry>,
-    tool_indices: &mut HashMap<String, usize>,
-    update: &Value,
-) {
-    let title = extract_tool_title(update);
-    let input = extract_raw_input(update);
-    if let Some(tool_call_id) = extract_tool_call_id(update) {
-        if let Some(index) = tool_indices.get(&tool_call_id).copied() {
-            if let Some(ConversationContextEntry::ToolCall {
-                title: existing_title,
-                status,
-                input: existing_input,
-                ..
-            }) = entries.get_mut(index)
-            {
-                *existing_title = title;
-                *status = ConversationToolStatus::Pending;
-                if input.is_some() {
-                    *existing_input = input;
-                }
-                return;
-            }
-        }
-
-        tool_indices.insert(tool_call_id, entries.len());
-    }
-
-    entries.push(ConversationContextEntry::ToolCall {
-        title,
-        status: ConversationToolStatus::Pending,
-        input,
-        output: None,
-        error: None,
-    });
-}
-
-fn apply_tool_call_update_entry(
-    entries: &mut Vec<ConversationContextEntry>,
-    tool_indices: &mut HashMap<String, usize>,
-    update: &Value,
-) {
-    let title = extract_tool_title(update);
-    let status = extract_tool_context_status(update);
-    let input = extract_raw_input(update);
-    let output = extract_tool_output(update);
-    let error = extract_tool_error(update);
-
-    if let Some(tool_call_id) = extract_tool_call_id(update) {
-        if let Some(index) = tool_indices.get(&tool_call_id).copied() {
-            if let Some(ConversationContextEntry::ToolCall {
-                title: existing_title,
-                status: existing_status,
-                input: existing_input,
-                output: existing_output,
-                error: existing_error,
-            }) = entries.get_mut(index)
-            {
-                *existing_title = title;
-                *existing_status = status;
-                if input.is_some() {
-                    *existing_input = input;
-                }
-                if output.is_some() {
-                    *existing_output = output;
-                }
-                if error.is_some() {
-                    *existing_error = error;
-                }
-                return;
-            }
-        }
-
-        tool_indices.insert(tool_call_id, entries.len());
-    }
-
-    entries.push(ConversationContextEntry::ToolCall {
-        title,
-        status,
-        input,
-        output,
-        error,
-    });
-}
-
-fn extract_tool_context_status(update: &Value) -> ConversationToolStatus {
-    match extract_tool_status(update).unwrap_or_default() {
-        "completed" => ConversationToolStatus::Completed,
-        "cancelled" => ConversationToolStatus::Cancelled,
-        "failed" | "error" => ConversationToolStatus::Failed,
-        _ => ConversationToolStatus::Pending,
-    }
-}
-
-fn extract_tool_title(update: &Value) -> String {
-    update
-        .get("title")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            update
-                .get("toolCall")
-                .and_then(|tool_call| tool_call.get("state"))
-                .and_then(|state| state.get("title"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            update
-                .get("toolCall")
-                .and_then(|tool_call| tool_call.get("title"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            update
-                .get("toolCall")
-                .and_then(|tool_call| tool_call.get("name"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| update.get("name").and_then(Value::as_str))
-        .unwrap_or("Tool")
-        .to_string()
-}
-
-fn extract_raw_input(update: &Value) -> Option<String> {
-    update
-        .get("rawInput")
-        .and_then(render_scalar_or_json)
-        .or_else(|| update.get("input").and_then(render_scalar_or_json))
-        .or_else(|| {
-            update
-                .get("toolCall")
-                .and_then(|tool_call| tool_call.get("rawInput"))
-                .and_then(render_scalar_or_json)
-        })
-}
-
-fn extract_tool_output(update: &Value) -> Option<String> {
-    extract_block_text(update.get("content"))
-        .or_else(|| extract_block_text(update.get("output")))
-        .or_else(|| {
-            update
-                .get("toolCall")
-                .and_then(|tool_call| tool_call.get("content"))
-                .and_then(|content| extract_block_text(Some(content)))
-        })
-}
-
-fn extract_tool_error(update: &Value) -> Option<String> {
-    extract_block_text(update.get("error"))
-        .or_else(|| update.get("error").and_then(render_scalar_or_json))
-}
-
-fn format_plan_update(update: &Value) -> Option<String> {
-    let entries = update
-        .get("entries")
-        .and_then(Value::as_array)
-        .or_else(|| {
-            update
-                .get("plan")
-                .and_then(|plan| plan.get("entries"))
-                .and_then(Value::as_array)
-        })?;
-
-    let mut lines = Vec::new();
-    for entry in entries {
-        let Some(text) = entry
-            .get("content")
-            .and_then(Value::as_str)
-            .or_else(|| entry.get("description").and_then(Value::as_str))
-            .or_else(|| entry.get("text").and_then(Value::as_str))
-            .or_else(|| entry.get("title").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        else {
-            continue;
-        };
-        let marker = match entry
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("pending")
-        {
-            "completed" => "[x]",
-            "in_progress" | "inProgress" => "[-]",
-            "cancelled" => "[/]",
-            "failed" | "error" => "[!]",
-            _ => "[ ]",
-        };
-        lines.push(format!("{marker} {text}"));
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
-}
-
-fn extract_inline_text(value: Option<&Value>) -> Option<String> {
-    extract_text_fragments(value).map(|fragments| fragments.join(""))
-}
-
-fn extract_block_text(value: Option<&Value>) -> Option<String> {
-    extract_text_fragments(value).map(|fragments| fragments.join("\n"))
-}
-
-fn extract_text_fragments(value: Option<&Value>) -> Option<Vec<String>> {
-    let value = value?;
-    let mut fragments = Vec::new();
-    collect_text_fragments(value, &mut fragments);
-    if fragments.is_empty() {
-        None
-    } else {
-        Some(fragments)
-    }
-}
-
-fn collect_text_fragments(value: &Value, fragments: &mut Vec<String>) {
-    match value {
-        Value::String(text) => {
-            if !text.is_empty() {
-                fragments.push(text.clone());
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_text_fragments(item, fragments);
-            }
-        }
-        Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(Value::as_str) {
-                if !text.is_empty() {
-                    fragments.push(text.to_string());
-                }
-                return;
-            }
-            if let Some(message) = map.get("message").and_then(Value::as_str) {
-                if !message.is_empty() {
-                    fragments.push(message.to_string());
-                }
-                return;
-            }
-            for key in ["content", "parts", "value", "error"] {
-                if let Some(nested) = map.get(key) {
-                    collect_text_fragments(nested, fragments);
-                    if !fragments.is_empty() {
-                        return;
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn render_scalar_or_json(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(text) => Some(text.clone()),
-        other => serde_json::to_string(other).ok(),
-    }
-}
-
-fn discover_history_sessions(
-    history_root: &Path,
-    known_threads: &HashSet<String>,
-) -> Result<Vec<ChatSessionRuntime>, String> {
-    if !history_root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut recovered = Vec::new();
-    let thread_dirs = fs::read_dir(history_root)
-        .map_err(|err| format!("failed to read {}: {err}", history_root.display()))?;
-
-    for thread_dir in thread_dirs {
-        let thread_dir =
-            thread_dir.map_err(|err| format!("failed to read chat thread dir entry: {err}"))?;
-        let file_type = thread_dir
-            .file_type()
-            .map_err(|err| format!("failed to inspect {}: {err}", thread_dir.path().display()))?;
-        if !file_type.is_dir() {
-            continue;
-        }
-
-        let thread_id = thread_dir.file_name().to_string_lossy().to_string();
-        if !known_threads.contains(&thread_id) {
-            continue;
-        }
-
-        let entries = fs::read_dir(thread_dir.path())
-            .map_err(|err| format!("failed to read {}: {err}", thread_dir.path().display()))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|err| format!("failed to read chat history file entry: {err}"))?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
-            }
-
-            let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let created_at = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .map(chrono::DateTime::<Utc>::from)
-                .unwrap_or_else(Utc::now)
-                .to_rfc3339();
-
-            let acp_session_id =
-                match restored_session_marker_exists(history_root, &thread_id, stem) {
-                    Ok(true) => None,
-                    Ok(false) => {
-                        match read_persisted_session_metadata(history_root, &thread_id, stem) {
-                            Ok(Some(metadata)) => metadata.acp_session_id,
-                            Ok(None) => {
-                                // Legacy sessions derive ACP session ID from first JSONL entry.
-                                // Restored sessions persist metadata with acp_session_id = null so
-                                // recovery durably falls back to session/new after daemon restart.
-                                read_history_acp_session_id(&path)
-                            }
-                            Err(error) => {
-                                warn!(
-                                    thread_id,
-                                    session_id = stem,
-                                    error = %error,
-                                    "failed to read persisted chat session metadata"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        warn!(
-                            thread_id,
-                            session_id = stem,
-                            error = %error,
-                            "failed to read restored chat session marker"
-                        );
-                        None
-                    }
-                };
-
-            recovered.push(ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: stem.to_string(),
-                    agent_type: "unknown".to_string(),
-                    status: protocol::ChatSessionStatus::Ended,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at,
-                    display_name: None,
-                    parent_session_id: None,
-                    pending_blocked_requests: Vec::new(),
-                },
-                thread_id: thread_id.clone(),
-                display_name: None,
-                parent_session_id: None,
-                agent_command: None,
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context: None,
-                acp_session_id,
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: true,
-                history_path: path,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: None,
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                pending_blocked_requests: HashMap::new(),
-                blocked_request_capture_enabled: false,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
-            });
-        }
-    }
-
-    Ok(recovered)
-}
-
-fn remove_history_file(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    fs::remove_file(path).map_err(|err| format!("failed to remove {}: {err}", path.display()))
-}
-
-fn remove_thread_history_dir(history_root: &Path, thread_id: &str) -> Result<(), String> {
-    let thread_dir = history_root.join(thread_id);
-    if !thread_dir.exists() {
-        return Ok(());
-    }
-
-    fs::remove_dir_all(&thread_dir)
-        .map_err(|err| format!("failed to remove {}: {err}", thread_dir.display()))
-}
-
 fn build_injection_prompt(
     platform_prompt: Option<&str>,
     system_prompt: Option<&str>,
@@ -4473,7 +2416,7 @@ async fn build_agent_env_vars(
         (thread, project)
     };
 
-    let port_base = match crate::services::thread::load_threadmill_config(
+    let port_base = match crate::services::thread_config::load_threadmill_config(
         thread.checkout_path(&project.path),
         &project.path,
     ) {
@@ -4506,9 +2449,11 @@ async fn resolve_agent_launch(
         (project.path, worktree_path)
     };
 
-    let command = project_agent_command(&project_path, agent_name)
-        .or_else(|| agent_registry::agent_command(agent_name))
-        .ok_or_else(|| format!("agent not found: {agent_name}"))?;
+    let command = agent_registry::resolve_agent_command(
+        agent_name,
+        project_agent_command(&project_path, agent_name),
+    )
+    .ok_or_else(|| format!("agent not found: {agent_name}"))?;
 
     let preferred_model = load_project_default_chat_model(&project_path)?;
 
@@ -4674,56 +2619,28 @@ mod tests {
         session_id: &str,
         acp_session_id: &str,
     ) -> ChatSessionRuntime {
-        ChatSessionRuntime {
-            summary: protocol::ChatSessionSummary {
-                session_id: session_id.to_string(),
-                agent_type: "opencode".to_string(),
-                status: protocol::ChatSessionStatus::Ready,
-                agent_status: protocol::AgentStatus::Idle,
-                worker_count: 0,
-                title: None,
-                model_id: None,
-                created_at: Utc::now().to_rfc3339(),
-                display_name: None,
-                parent_session_id: None,
-                pending_blocked_requests: Vec::new(),
-            },
-            thread_id: thread_id.to_string(),
+        let summary = protocol::ChatSessionSummary {
+            session_id: session_id.to_string(),
+            agent_type: "opencode".to_string(),
+            status: protocol::ChatSessionStatus::Ready,
+            agent_status: protocol::AgentStatus::Idle,
+            worker_count: 0,
+            title: None,
+            model_id: None,
+            created_at: Utc::now().to_rfc3339(),
             display_name: None,
             parent_session_id: None,
-            agent_command: Some("opencode acp".to_string()),
-            system_prompt: None,
-            initial_prompt: None,
-            conversation_context: None,
-            acp_session_id: Some(acp_session_id.to_string()),
-            attached_channels: HashSet::new(),
-            input_tx: None,
-            stop_tx: None,
-            status_notify: Arc::new(Notify::new()),
-            ended_emitted: false,
-            history_path: PathBuf::from("/tmp/history.jsonl"),
-            input_buffer: Vec::new(),
-            output_buffer: Vec::new(),
-            active_tools: HashSet::new(),
-            total_tool_count: 0,
-            latest_tool_name: None,
-            latest_tool_title: None,
-            started_at: Some(Utc::now()),
-            pending_prompt_ids: HashSet::new(),
-            checkpoint_seq: 0,
-            modes: None,
-            models: None,
-            config_options: None,
-            pending_blocked_requests: HashMap::new(),
-            blocked_request_capture_enabled: false,
-            last_update_time: None,
-            injection_prompt_id: None,
-            stall_generation: 0,
-            stall_task: None,
-            user_prompt_count: 0,
-            first_prompt_text: None,
-            had_conversation_context: false,
-        }
+            pending_blocked_requests: Vec::new(),
+        };
+        let mut session = ChatSessionRuntime::new(
+            summary,
+            thread_id.to_string(),
+            PathBuf::from("/tmp/history.jsonl"),
+        );
+        session.agent_command = Some("opencode acp".to_string());
+        session.acp_session_id = Some(acp_session_id.to_string());
+        session.started_at = Some(Utc::now());
+        session
     }
 
     fn make_test_session() -> ChatSessionRuntime {
@@ -5219,6 +3136,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_binary_frame_emits_synthetic_user_echo_for_prompt_cursor() {
+        let thread_id = unique_test_id("thread");
+        let session_id = unique_test_id("session");
+        let acp_session_id = unique_test_id("acp-session");
+        let state = make_test_state_with_thread(&thread_id);
+        let (temp_root, history_path) = write_history_file(&[]);
+        let mut session = make_test_session_with_ids(&thread_id, &session_id, &acp_session_id);
+        session.history_path = history_path.clone();
+        session.attached_channels.insert(8);
+
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 8, session).await;
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(8, outbound_tx);
+        }
+
+        let payload = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "plain prompt"}]
+                }
+            })
+        )
+        .into_bytes();
+
+        let handled = ChatService::handle_binary_frame(Arc::clone(&state), 8, payload)
+            .await
+            .expect("handle binary frame");
+
+        assert!(handled);
+        let _forwarded = input_rx.recv().await.expect("forwarded payload");
+
+        let outbound = timeout(Duration::from_millis(50), outbound_rx.recv())
+            .await
+            .expect("synthetic echo should be emitted")
+            .expect("outbound frame");
+        let Message::Binary(frame) = outbound else {
+            panic!("expected binary outbound frame");
+        };
+        assert_eq!(&frame[..2], &8_u16.to_be_bytes());
+        let notification: Value = serde_json::from_slice(&frame[2..]).expect("parse notification");
+        assert_eq!(notification["method"], "session/update");
+        assert_eq!(notification["params"]["sessionId"], session_id);
+        assert_eq!(
+            notification["params"]["update"],
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "plain prompt" }
+            })
+        );
+
+        let persisted = fs::read_to_string(&history_path).expect("read persisted history");
+        assert_eq!(persisted.lines().count(), 1);
+
+        cancel_registered_stall_timer(&state, &session_id).await;
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn filter_duplicate_user_echoes_suppresses_agent_echo_after_spindle_echo() {
+        let mut session = make_test_session();
+        session
+            .pending_user_echoes
+            .push_back("plain prompt".to_string());
+
+        let (filtered, payload_override) = filter_duplicate_user_echoes(
+            &mut session,
+            vec![
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": { "type": "text", "text": "plain prompt" }
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "kind": "agent_message_chunk",
+                            "content": { "type": "text", "text": "reply" }
+                        }
+                    }
+                }),
+            ],
+        );
+
+        assert!(session.pending_user_echoes.is_empty());
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0]["params"]["update"],
+            json!({
+                "kind": "agent_message_chunk",
+                "content": { "type": "text", "text": "reply" }
+            })
+        );
+        let payload = payload_override.expect("payload should be rewritten");
+        let payload_text = String::from_utf8(payload).expect("payload utf8");
+        assert!(!payload_text.contains("plain prompt"));
+        assert!(payload_text.contains("reply"));
+    }
+
+    #[test]
+    fn filter_duplicate_user_echoes_clears_pending_echoes_when_agent_replies() {
+        let mut session = make_test_session();
+        session
+            .pending_user_echoes
+            .push_back("claude prompt".to_string());
+
+        let (filtered, payload_override) = filter_duplicate_user_echoes(
+            &mut session,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "kind": "agent_message_chunk",
+                        "content": { "type": "text", "text": "reply" }
+                    }
+                }
+            })],
+        );
+
+        assert!(session.pending_user_echoes.is_empty());
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(payload_override, None);
+    }
+
+    #[tokio::test]
     async fn prepare_restored_session_context_builds_context_and_clears_acp_session_id() {
         let state = make_test_state();
         let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
@@ -5656,7 +3717,7 @@ mod tests {
 
         let expected = format!("{}\n", messages[0]).into_bytes();
 
-        assert_eq!(serialize_json_messages(&messages), expected);
+        assert_eq!(serialize_json_messages(&messages), Some(expected));
     }
 
     #[tokio::test]
@@ -7706,56 +5767,25 @@ mod tests {
         // Register source session in chat state
         {
             let mut chat = state.chat.lock().await;
-            let runtime = ChatSessionRuntime {
-                summary: protocol::ChatSessionSummary {
-                    session_id: source_session_id.to_string(),
-                    agent_type: "opencode".to_string(),
-                    status: protocol::ChatSessionStatus::Ready,
-                    agent_status: protocol::AgentStatus::Idle,
-                    worker_count: 0,
-                    title: None,
-                    model_id: None,
-                    created_at: Utc::now().to_rfc3339(),
-                    display_name: Some("Test Session".to_string()),
-                    parent_session_id: None,
-                    pending_blocked_requests: Vec::new(),
-                },
-                thread_id: thread_id.to_string(),
+            let summary = protocol::ChatSessionSummary {
+                session_id: source_session_id.to_string(),
+                agent_type: "opencode".to_string(),
+                status: protocol::ChatSessionStatus::Ready,
+                agent_status: protocol::AgentStatus::Idle,
+                worker_count: 0,
+                title: None,
+                model_id: None,
+                created_at: Utc::now().to_rfc3339(),
                 display_name: Some("Test Session".to_string()),
                 parent_session_id: None,
-                agent_command: Some("opencode acp".to_string()),
-                system_prompt: None,
-                initial_prompt: None,
-                conversation_context: None,
-                acp_session_id: Some("acp-1".to_string()),
-                attached_channels: HashSet::new(),
-                input_tx: None,
-                stop_tx: None,
-                status_notify: Arc::new(Notify::new()),
-                ended_emitted: false,
-                history_path: source_history.clone(),
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                active_tools: HashSet::new(),
-                total_tool_count: 0,
-                latest_tool_name: None,
-                latest_tool_title: None,
-                started_at: Some(Utc::now()),
-                pending_prompt_ids: HashSet::new(),
-                checkpoint_seq: 0,
-                last_update_time: None,
-                stall_generation: 0,
-                stall_task: None,
-                modes: None,
-                models: None,
-                config_options: None,
-                pending_blocked_requests: HashMap::new(),
-                blocked_request_capture_enabled: false,
-                injection_prompt_id: None,
-                user_prompt_count: 0,
-                first_prompt_text: None,
-                had_conversation_context: false,
+                pending_blocked_requests: Vec::new(),
             };
+            let mut runtime =
+                ChatSessionRuntime::new(summary, thread_id.to_string(), source_history.clone());
+            runtime.display_name = Some("Test Session".to_string());
+            runtime.agent_command = Some("opencode acp".to_string());
+            runtime.acp_session_id = Some("acp-1".to_string());
+            runtime.started_at = Some(Utc::now());
             chat.sessions.insert(source_session_id.to_string(), runtime);
             chat.sessions_by_thread
                 .entry(thread_id.to_string())

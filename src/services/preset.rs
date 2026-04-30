@@ -7,7 +7,7 @@ use crate::{
     protocol,
     services::{
         project::{load_project_presets, resolve_preset_cwd},
-        thread::load_threadmill_config,
+        thread_config::load_threadmill_config,
     },
     state_store::{port_base_with_offset, thread_env, Thread},
     tmux, AppState,
