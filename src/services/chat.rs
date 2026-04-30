@@ -2568,6 +2568,39 @@ fn extract_json_messages(buffer: &mut Vec<u8>, payload: &[u8], direction: &str) 
     messages
 }
 
+struct OutboundFrame {
+    payload: Vec<u8>,
+    message: Option<Value>,
+}
+
+fn extract_outbound_frames(buffer: &mut Vec<u8>, payload: &[u8]) -> Vec<OutboundFrame> {
+    buffer.extend_from_slice(payload);
+    let mut frames = Vec::new();
+
+    while let Some(newline_idx) = buffer.iter().position(|byte| *byte == b'\n') {
+        let mut line = buffer[..newline_idx].to_vec();
+        buffer.drain(..=newline_idx);
+        if line.is_empty() {
+            continue;
+        }
+
+        let message = match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(error = %error, direction = "output", "failed to parse chat JSON frame");
+                None
+            }
+        };
+        line.push(b'\n');
+        frames.push(OutboundFrame {
+            payload: line,
+            message,
+        });
+    }
+
+    frames
+}
+
 fn collect_session_update_params(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
@@ -2605,31 +2638,33 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         injection_completed,
         thread_id,
         blocked_requests,
-        replacement_payload,
+        outbound_payload,
     ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
-        let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let frames = extract_outbound_frames(&mut session.output_buffer, payload);
         let mut blocked_requests = Vec::new();
         let mut pass_through_messages = Vec::new();
-        for message in messages {
-            if let Some(pending) = blocked_request_from_message(session, &message) {
-                session
-                    .pending_blocked_requests
-                    .insert(pending.request.request_id.clone(), pending.clone());
-                blocked_requests.push(pending.request);
-            } else {
-                pass_through_messages.push(message);
+        let mut outbound_payload = Vec::new();
+        for frame in frames {
+            match frame.message {
+                Some(message) => {
+                    if let Some(pending) = blocked_request_from_message(session, &message) {
+                        session
+                            .pending_blocked_requests
+                            .insert(pending.request.request_id.clone(), pending.clone());
+                        blocked_requests.push(pending.request);
+                    } else {
+                        pass_through_messages.push(message);
+                        outbound_payload.extend_from_slice(&frame.payload);
+                    }
+                }
+                None => outbound_payload.extend_from_slice(&frame.payload),
             }
         }
-        let replacement_payload = if blocked_requests.is_empty() {
-            None
-        } else {
-            Some(serialize_json_messages(&pass_through_messages))
-        };
 
         let updates = collect_session_update_params(&pass_through_messages);
         let outbound = apply_outbound_status_updates(&state, session, pass_through_messages);
@@ -2659,7 +2694,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.injection_completed,
             thread_id,
             blocked_requests,
-            replacement_payload,
+            outbound_payload,
         )
     };
 
@@ -2704,7 +2739,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         }
     }
 
-    let filtered_payload = replacement_payload.as_deref().unwrap_or(payload);
+    let filtered_payload = outbound_payload.as_slice();
     // Rewrite ACP session ID to Spindle session ID in outbound payload
     let rewritten_payload = {
         let chat = state.chat.lock().await;
@@ -5363,6 +5398,141 @@ mod tests {
         .expect("chat.attach");
         assert_eq!(attached.pending_blocked_requests.len(), 1);
         assert_eq!(attached.pending_blocked_requests[0].request_id, "55");
+    }
+
+    #[tokio::test]
+    async fn split_outbound_permission_request_is_buffered_until_complete_and_filtered() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(77, outbound_tx);
+        }
+        register_test_session(&state, 77, session).await;
+        let mut events = state.subscribe_events();
+
+        let blocked_frame = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "permission-split",
+                "method": "request_permission",
+                "params": {
+                    "message": "Allow shell command?",
+                    "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                }
+            })
+        );
+        let split_at = blocked_frame
+            .find("request_permission")
+            .expect("method marker");
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            blocked_frame[..split_at].as_bytes(),
+        )
+        .await;
+
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "partial blocked request bytes must not be relayed before newline"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "partial blocked request must not emit event before complete frame"
+        );
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            blocked_frame[split_at..].as_bytes(),
+        )
+        .await;
+
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "captured split blocked request must not be relayed"
+        );
+        let event = events.try_recv().expect("blocked request added event");
+        assert_eq!(event.method, "chat.blocked_request.added");
+        assert_eq!(event.params["request"]["request_id"], "permission-split");
+    }
+
+    #[tokio::test]
+    async fn blocked_request_followed_by_partial_nonblocked_frame_keeps_partial_bytes() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(77, outbound_tx);
+        }
+        register_test_session(&state, 77, session).await;
+        let mut events = state.subscribe_events();
+
+        let blocked_frame = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "permission-before-partial",
+                "method": "request_permission",
+                "params": {
+                    "message": "Allow file edit?",
+                    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow"}]
+                }
+            })
+        );
+        let passthrough_frame = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/notify",
+                "params": {"text": "still relayed"}
+            })
+        );
+        let split_at = passthrough_frame
+            .find("still relayed")
+            .expect("payload marker");
+        let first_chunk = format!("{}{}", blocked_frame, &passthrough_frame[..split_at]);
+
+        fanout_output(Arc::clone(&state), "session-1", first_chunk.as_bytes()).await;
+
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "partial pass-through frame after blocked request must stay buffered"
+        );
+        let event = events.try_recv().expect("blocked request added event");
+        assert_eq!(event.method, "chat.blocked_request.added");
+        assert_eq!(
+            event.params["request"]["request_id"],
+            "permission-before-partial"
+        );
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            passthrough_frame[split_at..].as_bytes(),
+        )
+        .await;
+
+        let frame = outbound_rx
+            .try_recv()
+            .expect("completed pass-through frame");
+        let Message::Binary(frame) = frame else {
+            panic!("expected binary chat frame");
+        };
+        assert_eq!(&frame[..2], &77u16.to_be_bytes());
+        let relayed: Value = serde_json::from_slice(&frame[2..]).expect("relayed JSON frame");
+        assert_eq!(relayed["method"], "session/notify");
+        assert_eq!(relayed["params"]["text"], "still relayed");
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "only completed non-blocked frame should be relayed"
+        );
     }
 
     #[test]
