@@ -428,6 +428,12 @@ pub async fn dispatch_request(
                 .map_err(|message| map_service_error("chat.status", message))?;
             to_value("chat.status", result)
         }
+        RequestDispatch::ChatAnswerBlockedRequest(params) => {
+            let result = ChatService::answer_blocked_request(state, params)
+                .await
+                .map_err(map_chat_blocked_request_error)?;
+            to_value("chat.answer_blocked_request", result)
+        }
         RequestDispatch::ChatFork(params) => {
             let result = ChatService::fork(state, params)
                 .await
@@ -644,6 +650,22 @@ fn map_service_error(method: &str, message: String) -> RpcError {
     RpcError::internal(message)
 }
 
+fn map_chat_blocked_request_error(
+    error: crate::services::chat::ChatBlockedRequestAnswerError,
+) -> RpcError {
+    match error {
+        crate::services::chat::ChatBlockedRequestAnswerError::AlreadyResolved(details) => {
+            RpcError::blocked_request_already_resolved(details)
+        }
+        crate::services::chat::ChatBlockedRequestAnswerError::NotFound(message) => {
+            RpcError::not_found("chat.not_found", message)
+        }
+        crate::services::chat::ChatBlockedRequestAnswerError::Invalid(message) => {
+            RpcError::invalid_params(message)
+        }
+    }
+}
+
 fn terminal_attach_session_missing(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("tmux session not running")
@@ -659,10 +681,10 @@ mod tests {
     use tokio::sync::{mpsc, Mutex};
     use uuid::Uuid;
 
-    use super::{dispatch_request, map_service_error};
+    use super::{dispatch_request, map_chat_blocked_request_error, map_service_error};
     use crate::{
         protocol,
-        services::terminal::TerminalConnectionState,
+        services::{chat::ChatBlockedRequestAnswerError, terminal::TerminalConnectionState},
         state_store::{AppData, StateStore},
         AppState, ConnectionSessionState,
     };
@@ -734,5 +756,27 @@ mod tests {
         assert_eq!(error.code, -32001);
         let data = error.data.expect("internal errors should include data");
         assert_eq!(data.kind.as_deref(), Some("rpc.internal"));
+    }
+
+    #[test]
+    fn stale_blocked_request_answer_maps_to_structured_already_resolved_error() {
+        let error = map_chat_blocked_request_error(ChatBlockedRequestAnswerError::AlreadyResolved(
+            protocol::BlockedRequestAlreadyResolvedError {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "old-request".to_string(),
+            },
+        ));
+
+        assert_eq!(error.code, -32042);
+        let data = error.data.expect("structured error data");
+        assert_eq!(
+            data.kind.as_deref(),
+            Some("chat.blocked_request_already_resolved")
+        );
+        let details = data.details.expect("resolved details");
+        assert_eq!(details["thread_id"], "thread-1");
+        assert_eq!(details["session_id"], "session-1");
+        assert_eq!(details["request_id"], "old-request");
     }
 }

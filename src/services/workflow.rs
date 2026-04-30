@@ -2868,6 +2868,7 @@ mod tests {
                 created_at: Utc::now().to_rfc3339(),
                 display_name: None,
                 parent_session_id: None,
+                pending_blocked_requests: Vec::new(),
             },
         )
         .await
@@ -2905,6 +2906,7 @@ mod tests {
                 created_at: Utc::now().to_rfc3339(),
                 display_name: None,
                 parent_session_id: None,
+                pending_blocked_requests: Vec::new(),
             },
         )
         .await

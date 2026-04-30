@@ -224,6 +224,7 @@ async fn restore_registered_external_sessions(
             created_at: entry.adopted_at.clone(),
             display_name: None,
             parent_session_id: None,
+            pending_blocked_requests: Vec::new(),
         };
         crate::services::chat::ChatService::register_imported_session(
             Arc::clone(state),
@@ -284,6 +285,7 @@ async fn adopt_external_session(
             .unwrap_or_else(|| Utc::now().to_rfc3339()),
         display_name: None,
         parent_session_id: None,
+        pending_blocked_requests: Vec::new(),
     };
 
     crate::services::chat::ChatService::register_imported_session(

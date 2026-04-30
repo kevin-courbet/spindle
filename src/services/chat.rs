@@ -42,6 +42,10 @@ const CHAT_HISTORY_BATCH_SIZE: usize = 100;
 const CHAT_UPDATE_METHOD: &str = "session/update";
 const CHAT_PROMPT_METHOD: &str = "session/prompt";
 const CHAT_CANCEL_METHOD: &str = "session/cancel";
+const CHAT_REQUEST_PERMISSION_METHOD: &str = "request_permission";
+const CHAT_SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
+const CHAT_REQUEST_QUESTION_METHOD: &str = "request_question";
+const CHAT_SESSION_REQUEST_QUESTION_METHOD: &str = "session/request_question";
 const CHAT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct ChatService;
@@ -86,6 +90,7 @@ struct ChatSessionRuntime {
     modes: Option<Value>,
     models: Option<Value>,
     config_options: Option<Value>,
+    pending_blocked_requests: HashMap<String, PendingBlockedRequestRuntime>,
     /// Tracks the injection prompt request ID so we can detect when the injection turn completes.
     /// Set when injection is sent, cleared when the response arrives in apply_outbound_status_updates.
     injection_prompt_id: Option<String>,
@@ -95,6 +100,32 @@ struct ChatSessionRuntime {
     first_prompt_text: Option<String>,
     /// True if session was created with conversation_context (revert/fork). Suppresses title gen.
     had_conversation_context: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBlockedRequestRuntime {
+    request: protocol::BlockedRequest,
+    acp_request_id: Value,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChatBlockedRequestAnswerError {
+    NotFound(String),
+    Invalid(String),
+    AlreadyResolved(protocol::BlockedRequestAlreadyResolvedError),
+}
+
+impl std::fmt::Display for ChatBlockedRequestAnswerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(message) | Self::Invalid(message) => write!(f, "{message}"),
+            Self::AlreadyResolved(error) => write!(
+                f,
+                "blocked request already resolved: {}/{}/{}",
+                error.thread_id, error.session_id, error.request_id
+            ),
+        }
+    }
 }
 
 impl ChatState {
@@ -196,6 +227,7 @@ impl ChatService {
                 modes: None,
                 models: None,
                 config_options: None,
+                pending_blocked_requests: HashMap::new(),
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
@@ -240,6 +272,7 @@ impl ChatService {
                     created_at,
                     display_name: params.display_name.clone(),
                     parent_session_id: params.parent_session_id.clone(),
+                    pending_blocked_requests: Vec::new(),
                 },
                 thread_id: params.thread_id.clone(),
                 display_name: params.display_name.clone(),
@@ -270,6 +303,7 @@ impl ChatService {
                 modes: None,
                 models: None,
                 config_options: None,
+                pending_blocked_requests: HashMap::new(),
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
@@ -523,6 +557,7 @@ impl ChatService {
                     created_at,
                     display_name: fork_display_name.clone(),
                     parent_session_id: Some(params.source_session_id.clone()),
+                    pending_blocked_requests: Vec::new(),
                 },
                 thread_id: target_thread_id.clone(),
                 display_name: fork_display_name.clone(),
@@ -553,6 +588,7 @@ impl ChatService {
                 modes: None,
                 models: None,
                 config_options: None,
+                pending_blocked_requests: HashMap::new(),
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
@@ -670,7 +706,79 @@ impl ChatService {
             .sessions
             .get(&params.session_id)
             .ok_or_else(|| format!("session not found: {}", params.session_id))?;
-        Ok(runtime.summary.clone())
+        Ok(summary_with_blocked_requests(runtime))
+    }
+
+    pub async fn answer_blocked_request(
+        state: Arc<AppState>,
+        params: protocol::ChatAnswerBlockedRequestParams,
+    ) -> Result<protocol::ChatAnswerBlockedRequestResult, ChatBlockedRequestAnswerError> {
+        let answered_at = Utc::now().to_rfc3339();
+        let (result, removed) = {
+            let mut chat = state.chat.lock().await;
+            let session = chat.sessions.get_mut(&params.session_id).ok_or_else(|| {
+                ChatBlockedRequestAnswerError::NotFound(format!(
+                    "chat session not found: {}",
+                    params.session_id
+                ))
+            })?;
+            if session.thread_id != params.thread_id {
+                return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                    "chat session {} does not belong to thread {}",
+                    params.session_id, params.thread_id
+                )));
+            }
+            let Some(pending) = session
+                .pending_blocked_requests
+                .get(&params.request_id)
+                .cloned()
+            else {
+                return Err(ChatBlockedRequestAnswerError::AlreadyResolved(
+                    protocol::BlockedRequestAlreadyResolvedError {
+                        thread_id: params.thread_id,
+                        session_id: params.session_id,
+                        request_id: params.request_id,
+                    },
+                ));
+            };
+            let result =
+                build_blocked_request_answer_result(&pending.request, &params, answered_at)?;
+            let response = agent_response_for_blocked_request(&pending, &result)?;
+            let input_tx = session.input_tx.as_ref().ok_or_else(|| {
+                ChatBlockedRequestAnswerError::Invalid(format!(
+                    "chat session {} is not running",
+                    session.summary.session_id
+                ))
+            })?;
+            input_tx.try_send(response).map_err(|err| {
+                ChatBlockedRequestAnswerError::Invalid(format!(
+                    "failed to queue blocked request answer for {}: {err}",
+                    result.request_id
+                ))
+            })?;
+            let removed = session.pending_blocked_requests.remove(&params.request_id);
+            (result, removed)
+        };
+
+        if removed.is_some() {
+            state.emit_event(
+                "chat.blocked_request.answered",
+                protocol::BlockedRequestAnsweredEvent {
+                    result: result.clone(),
+                },
+            );
+            state.emit_event(
+                "chat.blocked_request.removed",
+                protocol::BlockedRequestRemovedEvent {
+                    thread_id: result.thread_id.clone(),
+                    session_id: result.session_id.clone(),
+                    request_id: result.request_id.clone(),
+                },
+            );
+            emit_state_delta_updated(&state, &result.thread_id, &result.session_id).await;
+        }
+
+        Ok(result)
     }
 
     /// Inject a `<system-context>` ACP prompt into a live session.
@@ -859,7 +967,7 @@ impl ChatService {
                 }
             }
 
-            let (acp_sid, modes, models, config_options) = {
+            let (acp_sid, modes, models, config_options, pending_blocked_requests) = {
                 let session = chat.sessions.get(&params.session_id);
                 (
                     session
@@ -868,6 +976,9 @@ impl ChatService {
                     session.and_then(|s| s.modes.clone()),
                     session.and_then(|s| s.models.clone()),
                     session.and_then(|s| s.config_options.clone()),
+                    session
+                        .map(pending_blocked_requests_for_session)
+                        .unwrap_or_default(),
                 )
             };
 
@@ -887,6 +998,7 @@ impl ChatService {
                 modes,
                 models,
                 config_options,
+                pending_blocked_requests,
             });
         }
     }
@@ -1969,6 +2081,273 @@ fn user_prompt_history_update(session_id_value: Value, text: &str) -> Value {
     })
 }
 
+fn blocked_request_from_message(
+    session: &ChatSessionRuntime,
+    message: &Value,
+) -> Option<PendingBlockedRequestRuntime> {
+    let method = message.get("method").and_then(Value::as_str)?;
+    let request_id = request_id_key(message.get("id"))?;
+    let acp_request_id = message
+        .get("id")
+        .cloned()
+        .unwrap_or(Value::String(request_id.clone()));
+    let params = message.get("params");
+    let created_at = Utc::now().to_rfc3339();
+
+    if matches!(
+        method,
+        CHAT_REQUEST_PERMISSION_METHOD | CHAT_SESSION_REQUEST_PERMISSION_METHOD
+    ) {
+        let message_text = params
+            .and_then(|params| params.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let permission = blocked_permission_from_params(params);
+        let title = permission_title(params, &message_text);
+        return Some(PendingBlockedRequestRuntime {
+            acp_request_id,
+            request: protocol::BlockedRequest {
+                thread_id: session.thread_id.clone(),
+                session_id: session.summary.session_id.clone(),
+                request_id,
+                kind: protocol::BlockedRequestKind::Permission,
+                title,
+                message: message_text,
+                created_at,
+                question: None,
+                permission: Some(permission),
+                raw_request: Some(message.clone()),
+            },
+        });
+    }
+
+    if matches!(
+        method,
+        CHAT_REQUEST_QUESTION_METHOD | CHAT_SESSION_REQUEST_QUESTION_METHOD
+    ) {
+        let prompt = params
+            .and_then(|params| {
+                params
+                    .get("question")
+                    .or_else(|| params.get("prompt"))
+                    .or_else(|| params.get("message"))
+            })
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let title = params
+            .and_then(|params| params.get("title"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .unwrap_or("Question requested")
+            .to_string();
+        return Some(PendingBlockedRequestRuntime {
+            acp_request_id,
+            request: protocol::BlockedRequest {
+                thread_id: session.thread_id.clone(),
+                session_id: session.summary.session_id.clone(),
+                request_id,
+                kind: protocol::BlockedRequestKind::Question,
+                title,
+                message: prompt.clone(),
+                created_at,
+                question: Some(protocol::BlockedQuestionRequest {
+                    prompt,
+                    actions: vec![
+                        protocol::BlockedRequestAnswerAction::Accept,
+                        protocol::BlockedRequestAnswerAction::Decline,
+                        protocol::BlockedRequestAnswerAction::Cancel,
+                    ],
+                }),
+                permission: None,
+                raw_request: Some(message.clone()),
+            },
+        });
+    }
+
+    None
+}
+
+fn blocked_permission_from_params(params: Option<&Value>) -> protocol::BlockedPermissionRequest {
+    let options = params
+        .and_then(|params| params.get("options"))
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    let id = option
+                        .get("optionId")
+                        .or_else(|| option.get("option_id"))
+                        .or_else(|| option.get("id"))
+                        .and_then(Value::as_str)?;
+                    let label = option
+                        .get("name")
+                        .or_else(|| option.get("label"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(id);
+                    let kind = option
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    Some(protocol::BlockedPermissionOption {
+                        id: id.to_string(),
+                        label: label.to_string(),
+                        kind,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let tool_call = params.and_then(|params| params.get("toolCall"));
+    protocol::BlockedPermissionRequest {
+        tool_call_id: tool_call
+            .and_then(|tool_call| tool_call.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        tool_name: tool_call
+            .and_then(|tool_call| tool_call.get("name"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        options,
+    }
+}
+
+fn permission_title(params: Option<&Value>, fallback_message: &str) -> String {
+    let raw_input = params
+        .and_then(|params| params.get("toolCall"))
+        .and_then(|tool_call| tool_call.get("rawInput"));
+    if let Some(path) = raw_input
+        .and_then(|raw| {
+            raw.get("file_path")
+                .or_else(|| raw.get("filePath"))
+                .or_else(|| raw.get("path"))
+        })
+        .and_then(Value::as_str)
+    {
+        return format!("File: {path}");
+    }
+    if let Some(command) = raw_input
+        .and_then(|raw| raw.get("command").or_else(|| raw.get("cmd")))
+        .and_then(Value::as_str)
+    {
+        let mut command = command.to_string();
+        if command.len() > 80 {
+            command.truncate(command.floor_char_boundary(77));
+            command.push('…');
+        }
+        return format!("Run: {command}");
+    }
+    if !fallback_message.is_empty() {
+        return fallback_message.to_string();
+    }
+    "Permission requested".to_string()
+}
+
+fn build_blocked_request_answer_result(
+    request: &protocol::BlockedRequest,
+    params: &protocol::ChatAnswerBlockedRequestParams,
+    answered_at: String,
+) -> Result<protocol::BlockedRequestAnswerResult, ChatBlockedRequestAnswerError> {
+    match request.kind {
+        protocol::BlockedRequestKind::Question => {
+            if params.option_id.is_some() {
+                return Err(ChatBlockedRequestAnswerError::Invalid(
+                    "question blocked requests must be answered with action".to_string(),
+                ));
+            }
+            let action = params.action.clone().ok_or_else(|| {
+                ChatBlockedRequestAnswerError::Invalid(
+                    "question blocked requests require action".to_string(),
+                )
+            })?;
+            Ok(protocol::BlockedRequestAnswerResult {
+                thread_id: request.thread_id.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                action: Some(action),
+                option_id: None,
+                answered_at,
+            })
+        }
+        protocol::BlockedRequestKind::Permission => {
+            if params.action.is_some() {
+                return Err(ChatBlockedRequestAnswerError::Invalid(
+                    "permission blocked requests must be answered with option_id".to_string(),
+                ));
+            }
+            let option_id = params.option_id.clone().ok_or_else(|| {
+                ChatBlockedRequestAnswerError::Invalid(
+                    "permission blocked requests require option_id".to_string(),
+                )
+            })?;
+            let is_valid_option = request
+                .permission
+                .as_ref()
+                .map(|permission| {
+                    permission
+                        .options
+                        .iter()
+                        .any(|option| option.id == option_id)
+                })
+                .unwrap_or(false);
+            if !is_valid_option {
+                return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                    "permission option_id is not valid for blocked request {}",
+                    request.request_id
+                )));
+            }
+            Ok(protocol::BlockedRequestAnswerResult {
+                thread_id: request.thread_id.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                action: None,
+                option_id: Some(option_id),
+                answered_at,
+            })
+        }
+    }
+}
+
+fn agent_response_for_blocked_request(
+    pending: &PendingBlockedRequestRuntime,
+    result: &protocol::BlockedRequestAnswerResult,
+) -> Result<Vec<u8>, ChatBlockedRequestAnswerError> {
+    let result_value = match pending.request.kind {
+        protocol::BlockedRequestKind::Permission => json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": result.option_id.clone().unwrap_or_default(),
+            }
+        }),
+        protocol::BlockedRequestKind::Question => json!({
+            "action": result
+                .action
+                .as_ref()
+                .map(|action| match action {
+                    protocol::BlockedRequestAnswerAction::Accept => "accept",
+                    protocol::BlockedRequestAnswerAction::Decline => "decline",
+                    protocol::BlockedRequestAnswerAction::Cancel => "cancel",
+                })
+                .unwrap_or("cancel"),
+        }),
+    };
+    let mut payload = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": pending.acp_request_id,
+        "result": result_value,
+    }))
+    .map_err(|err| {
+        ChatBlockedRequestAnswerError::Invalid(format!(
+            "failed to encode blocked request answer: {err}"
+        ))
+    })?;
+    payload.push(b'\n');
+    Ok(payload)
+}
+
 struct OutboundResult {
     transitions: Vec<StatusTransition>,
     injection_completed: bool,
@@ -2177,16 +2556,42 @@ fn rewrite_session_id(payload: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
 }
 
 async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
-    let (targets, history_path, updates, transitions, injection_completed, thread_id) = {
+    let (
+        targets,
+        history_path,
+        updates,
+        transitions,
+        injection_completed,
+        thread_id,
+        blocked_requests,
+        replacement_payload,
+    ) = {
         let mut chat = state.chat.lock().await;
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
         let messages = extract_json_messages(&mut session.output_buffer, payload, "output");
+        let mut blocked_requests = Vec::new();
+        let mut pass_through_messages = Vec::new();
+        for message in messages {
+            if let Some(pending) = blocked_request_from_message(session, &message) {
+                session
+                    .pending_blocked_requests
+                    .insert(pending.request.request_id.clone(), pending.clone());
+                blocked_requests.push(pending.request);
+            } else {
+                pass_through_messages.push(message);
+            }
+        }
+        let replacement_payload = if blocked_requests.is_empty() {
+            None
+        } else {
+            serialize_json_messages(&pass_through_messages).or_else(|| Some(Vec::new()))
+        };
 
-        let updates = collect_session_update_params(&messages);
-        let outbound = apply_outbound_status_updates(&state, session, messages);
+        let updates = collect_session_update_params(&pass_through_messages);
+        let outbound = apply_outbound_status_updates(&state, session, pass_through_messages);
         let thread_id = session.thread_id.clone();
         let history_path = session.history_path.clone();
         let attached_channels = session
@@ -2212,10 +2617,19 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.transitions,
             outbound.injection_completed,
             thread_id,
+            blocked_requests,
+            replacement_payload,
         )
     };
 
     emit_status_transitions(&state, transitions).await;
+
+    for request in blocked_requests {
+        state.emit_event(
+            "chat.blocked_request.added",
+            protocol::BlockedRequestAddedEvent { request },
+        );
+    }
 
     if injection_completed {
         tracing::info!(
@@ -2245,13 +2659,13 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         }
     }
 
+    let filtered_payload = replacement_payload.as_deref().unwrap_or(payload);
     // Rewrite ACP session ID to Spindle session ID in outbound payload
-    let base_payload = payload;
     let rewritten_payload = {
         let chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get(session_id) {
             if let Some(ref acp_id) = session.acp_session_id {
-                rewrite_session_id(base_payload, acp_id, session_id)
+                rewrite_session_id(filtered_payload, acp_id, session_id)
             } else {
                 None
             }
@@ -2259,7 +2673,11 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             None
         }
     };
-    let out_payload = rewritten_payload.as_deref().unwrap_or(base_payload);
+    let out_payload = rewritten_payload.as_deref().unwrap_or(filtered_payload);
+
+    if out_payload.is_empty() {
+        return;
+    }
 
     if let Ok(s) = std::str::from_utf8(out_payload) {
         warn!(
@@ -2433,6 +2851,29 @@ async fn clear_pending_conversation_context(
     Ok(())
 }
 
+fn drain_pending_blocked_request_removals(
+    session: &mut ChatSessionRuntime,
+) -> Vec<protocol::BlockedRequestRemovedEvent> {
+    session
+        .pending_blocked_requests
+        .drain()
+        .map(|(_, pending)| protocol::BlockedRequestRemovedEvent {
+            thread_id: pending.request.thread_id,
+            session_id: pending.request.session_id,
+            request_id: pending.request.request_id,
+        })
+        .collect()
+}
+
+fn emit_blocked_request_removed_events(
+    state: &AppState,
+    removals: Vec<protocol::BlockedRequestRemovedEvent>,
+) {
+    for removal in removals {
+        state.emit_event("chat.blocked_request.removed", removal);
+    }
+}
+
 async fn mark_session_failed(
     state: Arc<AppState>,
     thread_id: &str,
@@ -2440,20 +2881,23 @@ async fn mark_session_failed(
     error: String,
 ) {
     tracing::warn!(thread_id, session_id, %error, "chat_session_failed");
-    let transitions = {
+    let (transitions, removals) = {
         let mut transitions = Vec::new();
+        let mut removals = Vec::new();
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
             session.summary.status = protocol::ChatSessionStatus::Failed;
             session.input_tx = None;
             session.stop_tx = None;
+            removals = drain_pending_blocked_request_removals(session);
             reset_status_tracking(session, &mut transitions);
             session.status_notify.notify_waiters();
         }
-        transitions
+        (transitions, removals)
     };
 
     emit_status_transitions(&state, transitions).await;
+    emit_blocked_request_removed_events(&state, removals);
 
     state.emit_chat_session_failed(protocol::ChatSessionFailedEvent {
         thread_id: thread_id.to_string(),
@@ -2469,9 +2913,10 @@ async fn mark_session_ended(
     reason: &str,
     purge: bool,
 ) {
-    let (should_emit_ended, transitions) = {
+    let (should_emit_ended, transitions, removals) = {
         let mut should_emit_ended = false;
         let mut transitions = Vec::new();
+        let mut removals = Vec::new();
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
             if !session.ended_emitted {
@@ -2481,13 +2926,15 @@ async fn mark_session_ended(
                 session.ended_emitted = true;
                 should_emit_ended = true;
             }
+            removals = drain_pending_blocked_request_removals(session);
             reset_status_tracking(session, &mut transitions);
             session.status_notify.notify_waiters();
         }
-        (should_emit_ended, transitions)
+        (should_emit_ended, transitions, removals)
     };
 
     emit_status_transitions(&state, transitions).await;
+    emit_blocked_request_removed_events(&state, removals);
 
     if should_emit_ended {
         state.emit_chat_session_ended(protocol::ChatSessionEndedEvent {
@@ -2600,7 +3047,25 @@ async fn find_summary(state: &AppState, session_id: &str) -> Option<protocol::Ch
     let chat = state.chat.lock().await;
     chat.sessions
         .get(session_id)
-        .map(|session| session.summary.clone())
+        .map(summary_with_blocked_requests)
+}
+
+fn summary_with_blocked_requests(session: &ChatSessionRuntime) -> protocol::ChatSessionSummary {
+    let mut summary = session.summary.clone();
+    summary.pending_blocked_requests = pending_blocked_requests_for_session(session);
+    summary
+}
+
+fn pending_blocked_requests_for_session(
+    session: &ChatSessionRuntime,
+) -> Vec<protocol::BlockedRequest> {
+    let mut requests = session
+        .pending_blocked_requests
+        .values()
+        .map(|pending| pending.request.clone())
+        .collect::<Vec<_>>();
+    requests.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    requests
 }
 
 async fn detach_channel(
@@ -2644,9 +3109,17 @@ async fn chat_session_summaries_for_thread(
         .filter_map(|session_id| {
             chat.sessions
                 .get(&session_id)
-                .map(|session| session.summary.clone())
+                .map(summary_with_blocked_requests)
         })
         .collect::<Vec<_>>();
+    if sessions.is_empty() {
+        sessions = chat
+            .sessions
+            .values()
+            .filter(|session| session.thread_id == thread_id)
+            .map(summary_with_blocked_requests)
+            .collect::<Vec<_>>();
+    }
     sessions.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     sessions
 }
@@ -3485,6 +3958,7 @@ fn discover_history_sessions(
                     created_at,
                     display_name: None,
                     parent_session_id: None,
+                    pending_blocked_requests: Vec::new(),
                 },
                 thread_id: thread_id.clone(),
                 display_name: None,
@@ -3515,6 +3989,7 @@ fn discover_history_sessions(
                 modes: None,
                 models: None,
                 config_options: None,
+                pending_blocked_requests: HashMap::new(),
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
@@ -3753,6 +4228,7 @@ mod tests {
                 created_at: Utc::now().to_rfc3339(),
                 display_name: None,
                 parent_session_id: None,
+                pending_blocked_requests: Vec::new(),
             },
             thread_id: thread_id.to_string(),
             display_name: None,
@@ -3780,6 +4256,7 @@ mod tests {
             modes: None,
             models: None,
             config_options: None,
+            pending_blocked_requests: HashMap::new(),
             last_update_time: None,
             injection_prompt_id: None,
             stall_generation: 0,
@@ -4670,6 +5147,377 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_permission_request_creates_pending_blocked_request_and_filters_frame() {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(77, outbound_tx);
+        }
+        register_test_session(&state, 77, session).await;
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 55,
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow file edit?",
+                        "options": [
+                            {"optionId": "allow", "name": "Allow", "kind": "allow"},
+                            {"optionId": "deny", "name": "Deny", "kind": "deny"}
+                        ],
+                        "toolCall": {"rawInput": {"file_path": "Sources/App.swift"}}
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "blocked requests must not be relayed to clients"
+        );
+        let event = events.try_recv().expect("blocked request added event");
+        assert_eq!(event.method, "chat.blocked_request.added");
+        assert_eq!(event.params["request"]["request_id"], "55");
+        assert_eq!(event.params["request"]["kind"], "permission");
+        assert_eq!(event.params["request"]["title"], "File: Sources/App.swift");
+        assert_eq!(
+            event.params["request"]["permission"]["options"][0]["id"],
+            "allow"
+        );
+
+        let listed = ChatService::list(
+            Arc::clone(&state),
+            protocol::ChatListParams {
+                thread_id: "thread-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.list");
+        assert_eq!(listed[0].pending_blocked_requests.len(), 1);
+        assert_eq!(listed[0].pending_blocked_requests[0].request_id, "55");
+
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert_eq!(status.pending_blocked_requests.len(), 1);
+
+        let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+        let attached = ChatService::attach(
+            protocol::ChatAttachParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Arc::clone(&state),
+            Arc::new(Mutex::new(TerminalConnectionState::default())),
+            attach_tx,
+        )
+        .await
+        .expect("chat.attach");
+        assert_eq!(attached.pending_blocked_requests.len(), 1);
+        assert_eq!(attached.pending_blocked_requests[0].request_id, "55");
+    }
+
+    #[tokio::test]
+    async fn answer_blocked_permission_sends_result_and_removes_pending_request() {
+        let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 77, session).await;
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-1",
+                    "method": "session/request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+        let mut events = state.subscribe_events();
+
+        let result = ChatService::answer_blocked_request(
+            Arc::clone(&state),
+            protocol::ChatAnswerBlockedRequestParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "permission-1".to_string(),
+                action: None,
+                option_id: Some("run".to_string()),
+            },
+        )
+        .await
+        .expect("answer blocked permission");
+
+        assert_eq!(result.request_id, "permission-1");
+        assert_eq!(result.option_id.as_deref(), Some("run"));
+        let forwarded = input_rx.try_recv().expect("agent response frame");
+        let response: Value = serde_json::from_slice(&forwarded).expect("parse agent response");
+        assert_eq!(response["id"], "permission-1");
+        assert_eq!(response["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(response["result"]["outcome"]["optionId"], "run");
+
+        let answered = events.try_recv().expect("answered event");
+        assert_eq!(answered.method, "chat.blocked_request.answered");
+        let removed = events.try_recv().expect("removed event");
+        assert_eq!(removed.method, "chat.blocked_request.removed");
+
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert!(status.pending_blocked_requests.is_empty());
+
+        let second = ChatService::answer_blocked_request(
+            Arc::clone(&state),
+            protocol::ChatAnswerBlockedRequestParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "permission-1".to_string(),
+                action: None,
+                option_id: Some("run".to_string()),
+            },
+        )
+        .await
+        .expect_err("stale answer should fail");
+        match second {
+            ChatBlockedRequestAnswerError::AlreadyResolved(details) => {
+                assert_eq!(details.thread_id, "thread-1");
+                assert_eq!(details.session_id, "session-1");
+                assert_eq!(details.request_id, "permission-1");
+            }
+            other => panic!("expected already resolved error, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_blocked_question_sends_selected_action() {
+        let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 77, session).await;
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "question-1",
+                    "method": "request_question",
+                    "params": {"title": "Confirm", "question": "Continue?"}
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let result = ChatService::answer_blocked_request(
+            Arc::clone(&state),
+            protocol::ChatAnswerBlockedRequestParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "question-1".to_string(),
+                action: Some(protocol::BlockedRequestAnswerAction::Decline),
+                option_id: None,
+            },
+        )
+        .await
+        .expect("answer blocked question");
+
+        assert_eq!(
+            result.action,
+            Some(protocol::BlockedRequestAnswerAction::Decline)
+        );
+        let forwarded = input_rx.try_recv().expect("agent response frame");
+        let response: Value = serde_json::from_slice(&forwarded).expect("parse agent response");
+        assert_eq!(response["id"], "question-1");
+        assert_eq!(response["result"]["action"], "decline");
+    }
+
+    #[tokio::test]
+    async fn invalid_permission_option_keeps_blocked_request_pending() {
+        let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 77, session).await;
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-2",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let error = ChatService::answer_blocked_request(
+            Arc::clone(&state),
+            protocol::ChatAnswerBlockedRequestParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "permission-2".to_string(),
+                action: None,
+                option_id: Some("not-advertised".to_string()),
+            },
+        )
+        .await
+        .expect_err("invalid option must fail");
+
+        assert!(matches!(error, ChatBlockedRequestAnswerError::Invalid(_)));
+        assert!(input_rx.try_recv().is_err());
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert_eq!(status.pending_blocked_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_failure_keeps_blocked_request_pending() {
+        let state = make_test_state();
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        input_tx.try_send(vec![b'x']).expect("fill input queue");
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 77, session).await;
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-3",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+        let mut events = state.subscribe_events();
+
+        let error = ChatService::answer_blocked_request(
+            Arc::clone(&state),
+            protocol::ChatAnswerBlockedRequestParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "permission-3".to_string(),
+                action: None,
+                option_id: Some("run".to_string()),
+            },
+        )
+        .await
+        .expect_err("full input queue must fail");
+
+        assert!(matches!(error, ChatBlockedRequestAnswerError::Invalid(_)));
+        assert!(
+            events.try_recv().is_err(),
+            "failed send must not emit removal"
+        );
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert_eq!(status.pending_blocked_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_exit_removes_pending_blocked_requests() {
+        let state = make_test_state();
+        register_test_session(&state, 77, make_test_session()).await;
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "question-1",
+                    "method": "session/request_question",
+                    "params": {"question": "Continue?"}
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+        let mut events = state.subscribe_events();
+
+        mark_session_ended(
+            Arc::clone(&state),
+            "thread-1",
+            "session-1",
+            "agent exited",
+            false,
+        )
+        .await;
+
+        let removed = events.try_recv().expect("removed event");
+        assert_eq!(removed.method, "chat.blocked_request.removed");
+        assert_eq!(removed.params["request_id"], "question-1");
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert!(status.pending_blocked_requests.is_empty());
+    }
+
+    #[tokio::test]
     async fn prompt_response_transitions_agent_back_to_idle() {
         let state = make_test_state();
         let mut session = make_test_session();
@@ -4943,6 +5791,7 @@ mod tests {
                     created_at: Utc::now().to_rfc3339(),
                     display_name: Some("Test Session".to_string()),
                     parent_session_id: None,
+                    pending_blocked_requests: Vec::new(),
                 },
                 thread_id: thread_id.to_string(),
                 display_name: Some("Test Session".to_string()),
@@ -4973,6 +5822,7 @@ mod tests {
                 modes: None,
                 models: None,
                 config_options: None,
+                pending_blocked_requests: HashMap::new(),
                 injection_prompt_id: None,
                 user_prompt_count: 0,
                 first_prompt_text: None,
