@@ -9,10 +9,12 @@ use serde_json::Value;
 pub type StateVersion = u64;
 
 pub const PROTOCOL_VERSION: &str = "2026-03-17";
+pub const CHAT_BLOCKED_REQUESTS_CAPABILITY: &str = "chat.blocked_requests.v1";
 pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "state.delta.operations.v1",
     "preset.output.v1",
     "rpc.errors.structured.v1",
+    CHAT_BLOCKED_REQUESTS_CAPABILITY,
 ];
 
 pub const REQUIRED_CLIENT_CAPABILITIES: &[&str] = &[

@@ -405,9 +405,19 @@ pub async fn dispatch_request(
             to_value("chat.list", result)
         }
         RequestDispatch::ChatAttach(params) => {
-            let result = ChatService::attach(params, state, connection_state, outbound_tx)
-                .await
-                .map_err(|message| map_service_error("chat.attach", message))?;
+            let supports_blocked_requests = {
+                let guard = session_state.lock().await;
+                guard.supports_capability(protocol::CHAT_BLOCKED_REQUESTS_CAPABILITY)
+            };
+            let result = ChatService::attach(
+                params,
+                state,
+                connection_state,
+                outbound_tx,
+                supports_blocked_requests,
+            )
+            .await
+            .map_err(|message| map_service_error("chat.attach", message))?;
             to_value("chat.attach", result)
         }
         RequestDispatch::ChatDetach(params) => {

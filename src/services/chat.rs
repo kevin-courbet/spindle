@@ -56,6 +56,7 @@ pub struct ChatState {
     sessions_by_thread: HashMap<String, Vec<String>>,
     channel_to_session: HashMap<u16, String>,
     channel_outbound: HashMap<u16, mpsc::UnboundedSender<Message>>,
+    blocked_request_aware_channels: HashSet<u16>,
     history_root: PathBuf,
 }
 
@@ -114,6 +115,11 @@ struct BlockedRequestCancellation {
     removal: protocol::BlockedRequestRemovedEvent,
 }
 
+struct BlockedRequestCancellationDelivery {
+    removals: Vec<protocol::BlockedRequestRemovedEvent>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatBlockedRequestAnswerError {
     NotFound(String),
@@ -144,6 +150,7 @@ impl ChatState {
             sessions_by_thread: HashMap::new(),
             channel_to_session: HashMap::new(),
             channel_outbound: HashMap::new(),
+            blocked_request_aware_channels: HashSet::new(),
             history_root,
         }
     }
@@ -912,6 +919,7 @@ impl ChatService {
         state: Arc<AppState>,
         connection_state: Arc<Mutex<TerminalConnectionState>>,
         outbound_tx: mpsc::UnboundedSender<Message>,
+        supports_blocked_requests: bool,
     ) -> Result<protocol::ChatAttachResult, String> {
         loop {
             let wait_notify = {
@@ -998,6 +1006,9 @@ impl ChatService {
                 .insert(channel_id, params.session_id.clone());
             chat.channel_outbound
                 .insert(channel_id, outbound_tx.clone());
+            if supports_blocked_requests {
+                chat.blocked_request_aware_channels.insert(channel_id);
+            }
             conn.by_chat_channel
                 .insert(channel_id, params.session_id.clone());
 
@@ -1087,22 +1098,24 @@ impl ChatService {
 
         emit_status_transitions(&state, transitions).await;
 
-        let had_blocked_request_cancellations = !blocked_request_cancellations.is_empty();
-        let blocked_request_removals = blocked_request_cancellations
-            .iter()
-            .map(|cancellation| cancellation.removal.clone())
-            .collect::<Vec<_>>();
-        for cancellation in blocked_request_cancellations {
-            input_tx.try_send(cancellation.response).map_err(|err| {
-                format!(
-                    "failed to queue blocked request cancellation for channel {channel_id}: {err}"
-                )
-            })?;
-        }
+        let BlockedRequestCancellationDelivery {
+            removals: blocked_request_removals,
+            error: blocked_request_delivery_error,
+        } = deliver_blocked_request_cancellations(
+            &state,
+            &session_id,
+            channel_id,
+            blocked_request_cancellations,
+        )
+        .await;
 
+        let had_blocked_request_cancellations = !blocked_request_removals.is_empty();
         emit_blocked_request_removed_events(&state, blocked_request_removals);
         if had_blocked_request_cancellations {
             emit_state_delta_updated(&state, &thread_id, &session_id).await;
+        }
+        if let Some(error) = blocked_request_delivery_error {
+            return Err(error);
         }
 
         if let Some(first_prompt) = title_prompt_to_generate {
@@ -1994,7 +2007,7 @@ fn apply_inbound_status_updates(
         if method == CHAT_CANCEL_METHOD {
             reset_status_tracking(session, &mut transitions);
             blocked_request_cancellations
-                .extend(drain_pending_blocked_request_cancellations(session));
+                .extend(collect_pending_blocked_request_cancellations(session));
         }
     }
 
@@ -2701,31 +2714,52 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         injection_completed,
         thread_id,
         blocked_requests,
-        outbound_payload,
+        daemon_aware_payload,
+        legacy_payload,
+        acp_session_id,
     ) = {
         let mut chat = state.chat.lock().await;
+        let blocked_request_aware_channels = chat.blocked_request_aware_channels.clone();
         let Some(session) = chat.sessions.get_mut(session_id) else {
             return;
         };
 
         let frames = extract_outbound_frames(&mut session.output_buffer, payload);
+        let attached_channels = session
+            .attached_channels
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let has_blocked_request_aware_target = attached_channels
+            .iter()
+            .any(|channel_id| blocked_request_aware_channels.contains(channel_id));
         let mut blocked_requests = Vec::new();
         let mut pass_through_messages = Vec::new();
-        let mut outbound_payload = Vec::new();
+        let mut daemon_aware_payload = Vec::new();
+        let mut legacy_payload = Vec::new();
         for frame in frames {
             match frame.message {
                 Some(message) => {
                     if let Some(pending) = blocked_request_from_message(session, &message) {
-                        session
-                            .pending_blocked_requests
-                            .insert(pending.request.request_id.clone(), pending.clone());
-                        blocked_requests.push(pending.request);
+                        legacy_payload.extend_from_slice(&frame.payload);
+                        if has_blocked_request_aware_target {
+                            session
+                                .pending_blocked_requests
+                                .insert(pending.request.request_id.clone(), pending.clone());
+                            blocked_requests.push(pending.request);
+                        } else {
+                            pass_through_messages.push(message);
+                        }
                     } else {
                         pass_through_messages.push(message);
-                        outbound_payload.extend_from_slice(&frame.payload);
+                        daemon_aware_payload.extend_from_slice(&frame.payload);
+                        legacy_payload.extend_from_slice(&frame.payload);
                     }
                 }
-                None => outbound_payload.extend_from_slice(&frame.payload),
+                None => {
+                    daemon_aware_payload.extend_from_slice(&frame.payload);
+                    legacy_payload.extend_from_slice(&frame.payload);
+                }
             }
         }
 
@@ -2733,11 +2767,7 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         let outbound = apply_outbound_status_updates(&state, session, pass_through_messages);
         let thread_id = session.thread_id.clone();
         let history_path = session.history_path.clone();
-        let attached_channels = session
-            .attached_channels
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        let acp_session_id = session.acp_session_id.clone();
 
         let targets = attached_channels
             .iter()
@@ -2745,7 +2775,13 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
                 chat.channel_outbound
                     .get(channel_id)
                     .cloned()
-                    .map(|outbound| (*channel_id, outbound))
+                    .map(|outbound| {
+                        (
+                            *channel_id,
+                            outbound,
+                            blocked_request_aware_channels.contains(channel_id),
+                        )
+                    })
             })
             .collect::<Vec<_>>();
 
@@ -2757,7 +2793,9 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             outbound.injection_completed,
             thread_id,
             blocked_requests,
-            outbound_payload,
+            daemon_aware_payload,
+            legacy_payload,
+            acp_session_id,
         )
     };
 
@@ -2802,37 +2840,40 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         }
     }
 
-    let filtered_payload = outbound_payload.as_slice();
-    // Rewrite ACP session ID to Spindle session ID in outbound payload
-    let rewritten_payload = {
-        let chat = state.chat.lock().await;
-        if let Some(session) = chat.sessions.get(session_id) {
-            if let Some(ref acp_id) = session.acp_session_id {
-                rewrite_session_id(filtered_payload, acp_id, session_id)
-            } else {
-                None
-            }
-        } else {
-            None
+    let rewrite_outbound = |payload: Vec<u8>| -> Vec<u8> {
+        if payload.is_empty() {
+            return payload;
         }
+        acp_session_id
+            .as_deref()
+            .and_then(|acp_id| rewrite_session_id(&payload, acp_id, session_id))
+            .unwrap_or(payload)
     };
-    let out_payload = rewritten_payload.as_deref().unwrap_or(filtered_payload);
+    let daemon_aware_payload = rewrite_outbound(daemon_aware_payload);
+    let legacy_payload = rewrite_outbound(legacy_payload);
 
-    if out_payload.is_empty() {
+    if daemon_aware_payload.is_empty() && legacy_payload.is_empty() {
         return;
     }
 
-    if let Ok(s) = std::str::from_utf8(out_payload) {
-        warn!(
-            session_id,
-            "chat_outbound_frame payload_len={} snippet={:?}",
-            out_payload.len(),
-            &s[..s.floor_char_boundary(s.len().min(200))]
-        );
-    }
-
     let mut dead_channels = Vec::new();
-    for (channel_id, outbound) in targets {
+    for (channel_id, outbound, supports_blocked_requests) in targets {
+        let out_payload = if supports_blocked_requests {
+            daemon_aware_payload.as_slice()
+        } else {
+            legacy_payload.as_slice()
+        };
+        if out_payload.is_empty() {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(out_payload) {
+            warn!(
+                session_id,
+                "chat_outbound_frame payload_len={} snippet={:?}",
+                out_payload.len(),
+                &s[..s.floor_char_boundary(s.len().min(200))]
+            );
+        }
         let mut frame = Vec::with_capacity(out_payload.len() + 2);
         frame.extend_from_slice(&channel_id.to_be_bytes());
         frame.extend_from_slice(out_payload);
@@ -3008,13 +3049,13 @@ fn drain_pending_blocked_request_removals(
         .collect()
 }
 
-fn drain_pending_blocked_request_cancellations(
+fn collect_pending_blocked_request_cancellations(
     session: &mut ChatSessionRuntime,
 ) -> Vec<BlockedRequestCancellation> {
     let mut pending = session
         .pending_blocked_requests
-        .drain()
-        .map(|(_, pending)| pending)
+        .values()
+        .cloned()
         .collect::<Vec<_>>();
     pending.sort_by(|left, right| {
         left.request
@@ -3030,6 +3071,49 @@ fn drain_pending_blocked_request_cancellations(
             removal: blocked_request_removed_event(&pending),
         })
         .collect()
+}
+
+async fn deliver_blocked_request_cancellations(
+    state: &Arc<AppState>,
+    session_id: &str,
+    channel_id: u16,
+    cancellations: Vec<BlockedRequestCancellation>,
+) -> BlockedRequestCancellationDelivery {
+    let mut removals = Vec::new();
+    let mut error = None;
+
+    for cancellation in cancellations {
+        let request_id = cancellation.removal.request_id.clone();
+        let mut chat = state.chat.lock().await;
+        let Some(session) = chat.sessions.get_mut(session_id) else {
+            continue;
+        };
+        if !session.pending_blocked_requests.contains_key(&request_id) {
+            continue;
+        }
+        let Some(input_tx) = session.input_tx.clone() else {
+            error = Some(format!(
+                "chat session {} is not running",
+                session.summary.session_id
+            ));
+            break;
+        };
+
+        match input_tx.try_send(cancellation.response) {
+            Ok(()) => {
+                session.pending_blocked_requests.remove(&request_id);
+                removals.push(cancellation.removal);
+            }
+            Err(err) => {
+                error = Some(format!(
+                    "failed to queue blocked request cancellation for channel {channel_id}: {err}"
+                ));
+                break;
+            }
+        }
+    }
+
+    BlockedRequestCancellationDelivery { removals, error }
 }
 
 fn emit_blocked_request_removed_events(
@@ -3163,6 +3247,7 @@ async fn purge_session(state: Arc<AppState>, thread_id: &str, session_id: &str) 
         for channel_id in &channels {
             chat.channel_to_session.remove(channel_id);
             chat.channel_outbound.remove(channel_id);
+            chat.blocked_request_aware_channels.remove(channel_id);
         }
         (channels, session.history_path)
     };
@@ -3249,6 +3334,7 @@ async fn detach_channel(
 
     chat.channel_to_session.remove(&channel_id);
     chat.channel_outbound.remove(&channel_id);
+    chat.blocked_request_aware_channels.remove(&channel_id);
     if let Some(session) = chat.sessions.get_mut(&session_id) {
         session.attached_channels.remove(&channel_id);
     }
@@ -4313,6 +4399,11 @@ mod tests {
         {
             indexed_sessions.push(session_id);
         }
+    }
+
+    async fn mark_blocked_request_aware_channel(state: &Arc<AppState>, channel_id: u16) {
+        let mut chat = state.chat.lock().await;
+        chat.blocked_request_aware_channels.insert(channel_id);
     }
 
     #[tokio::test]
@@ -5401,7 +5492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_permission_request_creates_pending_blocked_request_and_filters_frame() {
+    async fn legacy_outbound_permission_request_stays_on_raw_path() {
         let state = make_test_state();
         let mut session = make_test_session();
         session.attached_channels.insert(77);
@@ -5436,9 +5527,97 @@ mod tests {
         )
         .await;
 
+        let frame = outbound_rx.try_recv().expect("raw permission frame");
+        let Message::Binary(frame) = frame else {
+            panic!("expected binary chat frame");
+        };
+        assert_eq!(&frame[..2], &77u16.to_be_bytes());
+        let relayed: Value = serde_json::from_slice(&frame[2..]).expect("relayed JSON frame");
+        assert_eq!(relayed["method"], "request_permission");
+        assert_eq!(relayed["id"], 55);
+        assert!(
+            events.try_recv().is_err(),
+            "legacy raw path must not emit daemon-owned blocked request events"
+        );
+
+        let listed = ChatService::list(
+            Arc::clone(&state),
+            protocol::ChatListParams {
+                thread_id: "thread-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.list");
+        assert!(listed[0].pending_blocked_requests.is_empty());
+
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert!(status.pending_blocked_requests.is_empty());
+
+        let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+        let attached = ChatService::attach(
+            protocol::ChatAttachParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Arc::clone(&state),
+            Arc::new(Mutex::new(TerminalConnectionState::default())),
+            attach_tx,
+            false,
+        )
+        .await
+        .expect("chat.attach");
+        assert!(attached.pending_blocked_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_aware_outbound_permission_request_creates_pending_blocked_request_and_filters_frame(
+    ) {
+        let state = make_test_state();
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(77, outbound_tx);
+            chat.blocked_request_aware_channels.insert(77);
+        }
+        register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 55,
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow file edit?",
+                        "options": [
+                            {"optionId": "allow", "name": "Allow", "kind": "allow"},
+                            {"optionId": "deny", "name": "Deny", "kind": "deny"}
+                        ],
+                        "toolCall": {"rawInput": {"file_path": "Sources/App.swift"}}
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
         assert!(
             outbound_rx.try_recv().is_err(),
-            "captured blocked request must not be relayed to legacy clients"
+            "daemon-aware clients consume blocked request events instead of raw frames"
         );
         let event = events.try_recv().expect("blocked request added event");
         assert_eq!(event.method, "chat.blocked_request.added");
@@ -5460,7 +5639,62 @@ mod tests {
         .expect("chat.list");
         assert_eq!(listed[0].pending_blocked_requests.len(), 1);
         assert_eq!(listed[0].pending_blocked_requests[0].request_id, "55");
+    }
 
+    #[tokio::test]
+    async fn attach_with_blocked_request_support_enables_daemon_owned_suppression() {
+        let state = make_test_state();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.sessions
+                .insert("session-1".to_string(), make_test_session());
+            chat.sessions_by_thread
+                .entry("thread-1".to_string())
+                .or_default()
+                .push("session-1".to_string());
+        }
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        let attached = ChatService::attach(
+            protocol::ChatAttachParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Arc::clone(&state),
+            Arc::new(Mutex::new(TerminalConnectionState::default())),
+            outbound_tx,
+            true,
+        )
+        .await
+        .expect("chat.attach");
+        assert!(attached.pending_blocked_requests.is_empty());
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "attached-permission",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "capability-aware attached channel must not receive raw permission frame"
+        );
+        let event = events.try_recv().expect("blocked request added event");
+        assert_eq!(event.method, "chat.blocked_request.added");
+        assert_eq!(event.params["request"]["request_id"], "attached-permission");
         let status = ChatService::status(
             Arc::clone(&state),
             protocol::ChatStatusParams {
@@ -5470,21 +5704,6 @@ mod tests {
         .await
         .expect("chat.status");
         assert_eq!(status.pending_blocked_requests.len(), 1);
-
-        let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
-        let attached = ChatService::attach(
-            protocol::ChatAttachParams {
-                thread_id: "thread-1".to_string(),
-                session_id: "session-1".to_string(),
-            },
-            Arc::clone(&state),
-            Arc::new(Mutex::new(TerminalConnectionState::default())),
-            attach_tx,
-        )
-        .await
-        .expect("chat.attach");
-        assert_eq!(attached.pending_blocked_requests.len(), 1);
-        assert_eq!(attached.pending_blocked_requests[0].request_id, "55");
     }
 
     #[tokio::test]
@@ -5498,6 +5717,7 @@ mod tests {
             chat.channel_outbound.insert(77, outbound_tx);
         }
         register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         let mut events = state.subscribe_events();
 
         let blocked_frame = format!(
@@ -5519,7 +5739,7 @@ mod tests {
         fanout_output(
             Arc::clone(&state),
             "session-1",
-            blocked_frame[..split_at].as_bytes(),
+            &blocked_frame.as_bytes()[..split_at],
         )
         .await;
 
@@ -5535,7 +5755,7 @@ mod tests {
         fanout_output(
             Arc::clone(&state),
             "session-1",
-            blocked_frame[split_at..].as_bytes(),
+            &blocked_frame.as_bytes()[split_at..],
         )
         .await;
 
@@ -5559,6 +5779,7 @@ mod tests {
             chat.channel_outbound.insert(77, outbound_tx);
         }
         register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         let mut events = state.subscribe_events();
 
         let blocked_frame = format!(
@@ -5602,7 +5823,7 @@ mod tests {
         fanout_output(
             Arc::clone(&state),
             "session-1",
-            passthrough_frame[split_at..].as_bytes(),
+            &passthrough_frame.as_bytes()[split_at..],
         )
         .await;
 
@@ -5647,7 +5868,10 @@ mod tests {
     #[tokio::test]
     async fn blocked_request_insertion_emits_session_update_state_delta() {
         let state = make_test_state();
-        register_test_session(&state, 77, make_test_session()).await;
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         let mut events = state.subscribe_events();
 
         fanout_output(
@@ -5802,7 +6026,9 @@ mod tests {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut session = make_test_session();
         session.input_tx = Some(input_tx);
+        session.attached_channels.insert(77);
         register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         fanout_output(
             Arc::clone(&state),
             "session-1",
@@ -5894,6 +6120,7 @@ mod tests {
             chat.channel_outbound.insert(77, outbound_tx);
         }
         register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         fanout_output(
             Arc::clone(&state),
             "session-1",
@@ -5939,12 +6166,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_cancel_send_failure_keeps_blocked_request_pending() {
+        let state = make_test_state();
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        input_tx.try_send(vec![b'x']).expect("fill input queue");
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        session.attached_channels.insert(77);
+        register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-cancel-failure",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+        let mut events = state.subscribe_events();
+
+        let error = ChatService::handle_binary_frame(
+            Arc::clone(&state),
+            77,
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "cancel-queue-full",
+                    "method": "session/cancel",
+                    "params": {"sessionId": "session-1"}
+                })
+            )
+            .into_bytes(),
+        )
+        .await
+        .expect_err("full input queue must fail cancel delivery");
+
+        assert!(error.contains("failed to queue blocked request cancellation"));
+        assert!(
+            events.try_recv().is_err(),
+            "failed cancellation send must not emit removal"
+        );
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert_eq!(status.pending_blocked_requests.len(), 1);
+        assert_eq!(
+            status.pending_blocked_requests[0].request_id,
+            "permission-cancel-failure"
+        );
+    }
+
+    #[tokio::test]
     async fn session_cancel_cancels_pending_blocked_requests_and_recovers_cleanly() {
         let state = make_test_state();
         let (input_tx, mut input_rx) = mpsc::channel(8);
         let mut session = make_test_session();
         session.input_tx = Some(input_tx);
+        session.attached_channels.insert(77);
         register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
 
         fanout_output(
             Arc::clone(&state),
@@ -6050,6 +6347,7 @@ mod tests {
             Arc::clone(&state),
             connection_state,
             outbound_tx,
+            false,
         )
         .await
         .expect("chat.attach");
@@ -6102,7 +6400,9 @@ mod tests {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut session = make_test_session();
         session.input_tx = Some(input_tx);
+        session.attached_channels.insert(77);
         register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         fanout_output(
             Arc::clone(&state),
             "session-1",
@@ -6155,7 +6455,9 @@ mod tests {
         input_tx.try_send(vec![b'x']).expect("fill input queue");
         let mut session = make_test_session();
         session.input_tx = Some(input_tx);
+        session.attached_channels.insert(77);
         register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         fanout_output(
             Arc::clone(&state),
             "session-1",
@@ -6208,7 +6510,10 @@ mod tests {
     #[tokio::test]
     async fn stopped_session_delivery_failure_keeps_blocked_request_pending() {
         let state = make_test_state();
-        register_test_session(&state, 77, make_test_session()).await;
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         fanout_output(
             Arc::clone(&state),
             "session-1",
@@ -6261,7 +6566,10 @@ mod tests {
     #[tokio::test]
     async fn session_exit_removes_pending_blocked_requests() {
         let state = make_test_state();
-        register_test_session(&state, 77, make_test_session()).await;
+        let mut session = make_test_session();
+        session.attached_channels.insert(77);
+        register_test_session(&state, 77, session).await;
+        mark_blocked_request_aware_channel(&state, 77).await;
         fanout_output(
             Arc::clone(&state),
             "session-1",

@@ -334,6 +334,12 @@ impl ConnectionSessionState {
         self.hello_acknowledged = true;
         true
     }
+
+    pub fn supports_capability(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|existing| existing == capability)
+    }
 }
 
 #[derive(Debug, Clone)]
