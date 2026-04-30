@@ -1617,9 +1617,11 @@ async fn resolve_agent_launch(
         (project.path, worktree_path)
     };
 
-    let command = project_agent_command(&project_path, agent_name)
-        .or_else(|| agent_registry::agent_command(agent_name))
-        .ok_or_else(|| format!("agent not found: {agent_name}"))?;
+    let command = agent_registry::resolve_agent_command(
+        agent_name,
+        project_agent_command(&project_path, agent_name),
+    )
+    .ok_or_else(|| format!("agent not found: {agent_name}"))?;
 
     let preferred_model = load_project_default_chat_model(&project_path)?;
 

@@ -238,6 +238,14 @@ pub fn agent_command(agent_id: &str) -> Option<String> {
         .map(command_for_agent)
 }
 
+pub fn resolve_agent_command(agent_id: &str, project_command: Option<String>) -> Option<String> {
+    if agent_id == "claude" {
+        return agent_command(agent_id);
+    }
+
+    project_command.or_else(|| agent_command(agent_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +276,13 @@ mod tests {
             Some("node /tmp/threadmill-claude-agent-acp.mjs".to_string())
         );
         assert_eq!(agent_command("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_claude_project_command_is_normalized_to_threadmill_bridge() {
+        assert_eq!(
+            resolve_agent_command("claude", Some("claude-agent-acp".to_string())),
+            Some("node /tmp/threadmill-claude-agent-acp.mjs".to_string())
+        );
     }
 }
