@@ -129,6 +129,13 @@ enum BlockedRequestFrame {
     Invalid(InvalidBlockedRequestRuntime),
 }
 
+struct InvalidBlockedRequestDelivery {
+    input_tx: mpsc::Sender<Vec<u8>>,
+    payload: Vec<u8>,
+    method: String,
+    request_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct BlockedRequestCancellation {
     response: Vec<u8>,
@@ -2797,6 +2804,8 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
         daemon_aware_payload,
         legacy_payload,
         acp_session_id,
+        invalid_blocked_request_deliveries,
+        invalid_blocked_request_delivery_errors,
     ) = {
         let mut chat = state.chat.lock().await;
         let blocked_request_aware_channels = chat.blocked_request_aware_channels.clone();
@@ -2811,13 +2820,12 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             .copied()
             .collect::<Vec<_>>();
         let should_capture_blocked_requests = session.blocked_request_capture_enabled;
-        let has_blocked_request_aware_target = attached_channels
-            .iter()
-            .any(|channel_id| blocked_request_aware_channels.contains(channel_id));
         let mut blocked_requests = Vec::new();
         let mut pass_through_messages = Vec::new();
         let mut daemon_aware_payload = Vec::new();
         let mut legacy_payload = Vec::new();
+        let mut invalid_blocked_request_deliveries = Vec::new();
+        let mut invalid_blocked_request_delivery_errors = Vec::new();
         for frame in frames {
             match frame.message {
                 Some(message) => match blocked_request_from_message(session, &message) {
@@ -2833,15 +2841,32 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
                         }
                     }
                     BlockedRequestFrame::Invalid(error) => {
-                        if has_blocked_request_aware_target {
+                        if should_capture_blocked_requests {
                             warn!(
                                 session_id,
                                 method = %error.method,
+                                request_id = %error.request_id,
                                 reason = %error.reason,
-                                "invalid blocked request from agent"
+                                "invalid blocked request from agent; sending error to agent stdin"
                             );
-                            daemon_aware_payload
-                                .extend(invalid_blocked_request_error_payload(&error));
+                            let payload = invalid_blocked_request_error_payload(&error);
+                            if let Some(input_tx) = session.input_tx.clone() {
+                                invalid_blocked_request_deliveries.push(
+                                    InvalidBlockedRequestDelivery {
+                                        input_tx,
+                                        payload,
+                                        method: error.method,
+                                        request_id: error.request_id.to_string(),
+                                    },
+                                );
+                            } else {
+                                invalid_blocked_request_delivery_errors.push(format!(
+                                    "chat session {} cannot receive invalid blocked request error for {} request {}: agent stdin is not available",
+                                    session.summary.session_id,
+                                    error.method,
+                                    error.request_id
+                                ));
+                            }
                         } else {
                             legacy_payload.extend_from_slice(&frame.payload);
                             pass_through_messages.push(message);
@@ -2893,8 +2918,28 @@ async fn fanout_output(state: Arc<AppState>, session_id: &str, payload: &[u8]) {
             daemon_aware_payload,
             legacy_payload,
             acp_session_id,
+            invalid_blocked_request_deliveries,
+            invalid_blocked_request_delivery_errors,
         )
     };
+
+    if let Some(error) = invalid_blocked_request_delivery_errors.into_iter().next() {
+        tracing::error!(session_id, error = %error, "failed to deliver invalid blocked request error");
+        mark_session_failed(Arc::clone(&state), &thread_id, session_id, error).await;
+        return;
+    }
+
+    for delivery in invalid_blocked_request_deliveries {
+        if let Err(error) = delivery.input_tx.try_send(delivery.payload) {
+            let message = format!(
+                "failed to queue invalid blocked request error for {} request {}: {error}",
+                delivery.method, delivery.request_id
+            );
+            tracing::error!(session_id, error = %message, "failed to deliver invalid blocked request error");
+            mark_session_failed(Arc::clone(&state), &thread_id, session_id, message).await;
+            return;
+        }
+    }
 
     emit_status_transitions(&state, transitions).await;
 
@@ -4516,6 +4561,16 @@ mod tests {
             .get_mut(session_id)
             .expect("test session exists");
         session.blocked_request_capture_enabled = true;
+    }
+
+    fn assert_invalid_blocked_request_agent_error(payload: &[u8], request_id: &str, method: &str) {
+        let response: Value = serde_json::from_slice(payload).expect("agent error response JSON");
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], request_id);
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["data"]["kind"], "invalid_blocked_request");
+        assert_eq!(response["error"]["data"]["retryable"], false);
+        assert_eq!(response["error"]["data"]["details"]["method"], method);
     }
 
     #[tokio::test]
@@ -6514,9 +6569,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_aware_malformed_permission_request_emits_protocol_error_without_raw_relay() {
+    async fn daemon_aware_malformed_permission_request_sends_agent_error_without_client_relay() {
         let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
         session.attached_channels.insert(77);
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
         {
@@ -6549,27 +6606,133 @@ mod tests {
         )
         .await;
 
-        let frame = outbound_rx.try_recv().expect("protocol error frame");
-        let Message::Binary(frame) = frame else {
-            panic!("expected binary chat frame");
-        };
-        assert_eq!(&frame[..2], &77u16.to_be_bytes());
-        let relayed: Value = serde_json::from_slice(&frame[2..]).expect("relayed JSON frame");
         assert!(
-            relayed.get("method").is_none(),
-            "daemon-aware clients must not receive malformed blocked request raw method"
+            outbound_rx.try_recv().is_err(),
+            "daemon-aware clients must not receive malformed blocked request raw method or error"
         );
-        assert_eq!(relayed["jsonrpc"], "2.0");
-        assert_eq!(relayed["id"], "permission-without-options");
-        assert_eq!(relayed["error"]["code"], -32602);
-        assert_eq!(relayed["error"]["data"]["kind"], "invalid_blocked_request");
-        assert_eq!(
-            relayed["error"]["data"]["details"]["method"],
-            "request_permission"
+        let agent_error = input_rx.try_recv().expect("agent stdin error frame");
+        assert_invalid_blocked_request_agent_error(
+            &agent_error,
+            "permission-without-options",
+            "request_permission",
         );
         assert!(
             events.try_recv().is_err(),
             "malformed permission requests must not become blocked requests"
+        );
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert!(status.pending_blocked_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_owned_malformed_permission_without_attached_clients_errors_agent_only() {
+        let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        session.blocked_request_capture_enabled = true;
+        {
+            let mut chat = state.chat.lock().await;
+            chat.sessions.insert("session-1".to_string(), session);
+            chat.sessions_by_thread
+                .entry("thread-1".to_string())
+                .or_default()
+                .push("session-1".to_string());
+        }
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "disconnected-malformed-permission",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow file edit?",
+                        "options": []
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let agent_error = input_rx.try_recv().expect("agent stdin error frame");
+        assert_invalid_blocked_request_agent_error(
+            &agent_error,
+            "disconnected-malformed-permission",
+            "request_permission",
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "owned malformed request must not emit client events"
+        );
+        let status = ChatService::status(
+            Arc::clone(&state),
+            protocol::ChatStatusParams {
+                session_id: "session-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.status");
+        assert!(status.pending_blocked_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_owned_malformed_question_with_only_legacy_channel_errors_agent_only() {
+        let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        session.blocked_request_capture_enabled = true;
+        session.attached_channels.insert(78);
+        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel();
+        {
+            let mut chat = state.chat.lock().await;
+            chat.channel_outbound.insert(78, legacy_tx);
+        }
+        register_test_session(&state, 78, session).await;
+        let mut events = state.subscribe_events();
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "legacy-only-malformed-question",
+                    "method": "request_question",
+                    "params": {"question": "   "}
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "legacy clients must not receive malformed blocked request raw method or error after session opts in"
+        );
+        let agent_error = input_rx.try_recv().expect("agent stdin error frame");
+        assert_invalid_blocked_request_agent_error(
+            &agent_error,
+            "legacy-only-malformed-question",
+            "request_question",
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "owned malformed request must not emit client events"
         );
         let status = ChatService::status(
             Arc::clone(&state),
@@ -6635,9 +6798,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_aware_malformed_question_request_emits_protocol_error_without_raw_relay() {
+    async fn daemon_aware_malformed_question_request_sends_agent_error_without_client_relay() {
         let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
         session.attached_channels.insert(78);
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
         {
@@ -6664,23 +6829,15 @@ mod tests {
         )
         .await;
 
-        let frame = outbound_rx.try_recv().expect("protocol error frame");
-        let Message::Binary(frame) = frame else {
-            panic!("expected binary chat frame");
-        };
-        assert_eq!(&frame[..2], &78u16.to_be_bytes());
-        let relayed: Value = serde_json::from_slice(&frame[2..]).expect("relayed JSON frame");
         assert!(
-            relayed.get("method").is_none(),
-            "daemon-aware clients must not receive malformed blocked request raw method"
+            outbound_rx.try_recv().is_err(),
+            "daemon-aware clients must not receive malformed blocked request raw method or error"
         );
-        assert_eq!(relayed["jsonrpc"], "2.0");
-        assert_eq!(relayed["id"], "question-without-prompt");
-        assert_eq!(relayed["error"]["code"], -32602);
-        assert_eq!(relayed["error"]["data"]["kind"], "invalid_blocked_request");
-        assert_eq!(
-            relayed["error"]["data"]["details"]["method"],
-            "request_question"
+        let agent_error = input_rx.try_recv().expect("agent stdin error frame");
+        assert_invalid_blocked_request_agent_error(
+            &agent_error,
+            "question-without-prompt",
+            "request_question",
         );
         assert!(
             events.try_recv().is_err(),
