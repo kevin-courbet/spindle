@@ -109,6 +109,12 @@ struct PendingBlockedRequestRuntime {
 }
 
 #[derive(Debug, Clone)]
+struct BlockedRequestCancellation {
+    response: Vec<u8>,
+    removal: protocol::BlockedRequestRemovedEvent,
+}
+
+#[derive(Debug, Clone)]
 pub enum ChatBlockedRequestAnswerError {
     NotFound(String),
     Invalid(String),
@@ -1036,6 +1042,7 @@ impl ChatService {
             title_prompt_to_generate,
             history_path,
             consumed_conversation_context,
+            blocked_request_cancellations,
         ) = {
             let mut chat = state.chat.lock().await;
             let Some(session_id) = chat.channel_to_session.get(&channel_id).cloned() else {
@@ -1061,6 +1068,7 @@ impl ChatService {
                 auto_checkpoints,
                 title_prompt_to_generate,
                 consumed_conversation_context,
+                blocked_request_cancellations,
             } = apply_inbound_status_updates(&state, session, messages);
             (
                 session.thread_id.clone(),
@@ -1073,10 +1081,29 @@ impl ChatService {
                 title_prompt_to_generate,
                 history_path,
                 consumed_conversation_context,
+                blocked_request_cancellations,
             )
         };
 
         emit_status_transitions(&state, transitions).await;
+
+        let had_blocked_request_cancellations = !blocked_request_cancellations.is_empty();
+        let blocked_request_removals = blocked_request_cancellations
+            .iter()
+            .map(|cancellation| cancellation.removal.clone())
+            .collect::<Vec<_>>();
+        for cancellation in blocked_request_cancellations {
+            input_tx.try_send(cancellation.response).map_err(|err| {
+                format!(
+                    "failed to queue blocked request cancellation for channel {channel_id}: {err}"
+                )
+            })?;
+        }
+
+        emit_blocked_request_removed_events(&state, blocked_request_removals);
+        if had_blocked_request_cancellations {
+            emit_state_delta_updated(&state, &thread_id, &session_id).await;
+        }
 
         if let Some(first_prompt) = title_prompt_to_generate {
             spawn_title_generation(
@@ -1872,6 +1899,7 @@ struct SessionProcessingOutcome {
     title_prompt_to_generate: Option<String>,
     /// Whether the per-session conversation context was consumed during this batch.
     consumed_conversation_context: bool,
+    blocked_request_cancellations: Vec<BlockedRequestCancellation>,
 }
 
 fn apply_inbound_status_updates(
@@ -1887,6 +1915,7 @@ fn apply_inbound_status_updates(
     let mut auto_checkpoints = Vec::new();
     let mut title_prompt_to_generate = None;
     let mut consumed_conversation_context = false;
+    let mut blocked_request_cancellations = Vec::new();
 
     for message in &mut messages {
         let method = message
@@ -1964,6 +1993,8 @@ fn apply_inbound_status_updates(
 
         if method == CHAT_CANCEL_METHOD {
             reset_status_tracking(session, &mut transitions);
+            blocked_request_cancellations
+                .extend(drain_pending_blocked_request_cancellations(session));
         }
     }
 
@@ -1978,6 +2009,7 @@ fn apply_inbound_status_updates(
         auto_checkpoints,
         title_prompt_to_generate,
         consumed_conversation_context,
+        blocked_request_cancellations,
     }
 }
 
@@ -2387,6 +2419,37 @@ fn agent_response_for_blocked_request(
     })?;
     payload.push(b'\n');
     Ok(payload)
+}
+
+fn cancelled_agent_response_for_blocked_request(pending: &PendingBlockedRequestRuntime) -> Vec<u8> {
+    let result_value = match pending.request.kind {
+        protocol::BlockedRequestKind::Permission => json!({
+            "outcome": {
+                "outcome": "cancelled",
+            }
+        }),
+        protocol::BlockedRequestKind::Question => json!({
+            "action": "cancel",
+        }),
+    };
+    let mut payload = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": pending.acp_request_id,
+        "result": result_value,
+    }))
+    .expect("blocked request cancellation response must serialize");
+    payload.push(b'\n');
+    payload
+}
+
+fn blocked_request_removed_event(
+    pending: &PendingBlockedRequestRuntime,
+) -> protocol::BlockedRequestRemovedEvent {
+    protocol::BlockedRequestRemovedEvent {
+        thread_id: pending.request.thread_id.clone(),
+        session_id: pending.request.session_id.clone(),
+        request_id: pending.request.request_id.clone(),
+    }
 }
 
 struct OutboundResult {
@@ -2941,6 +3004,30 @@ fn drain_pending_blocked_request_removals(
             thread_id: pending.request.thread_id,
             session_id: pending.request.session_id,
             request_id: pending.request.request_id,
+        })
+        .collect()
+}
+
+fn drain_pending_blocked_request_cancellations(
+    session: &mut ChatSessionRuntime,
+) -> Vec<BlockedRequestCancellation> {
+    let mut pending = session
+        .pending_blocked_requests
+        .drain()
+        .map(|(_, pending)| pending)
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| {
+        left.request
+            .created_at
+            .cmp(&right.request.created_at)
+            .then_with(|| left.request.request_id.cmp(&right.request.request_id))
+    });
+
+    pending
+        .into_iter()
+        .map(|pending| BlockedRequestCancellation {
+            response: cancelled_agent_response_for_blocked_request(&pending),
+            removal: blocked_request_removed_event(&pending),
         })
         .collect()
 }
@@ -5849,6 +5936,124 @@ mod tests {
         let response: Value = serde_json::from_slice(&forwarded).expect("parse agent response");
         assert_eq!(response["id"], "question-1");
         assert_eq!(response["result"]["action"], "decline");
+    }
+
+    #[tokio::test]
+    async fn session_cancel_cancels_pending_blocked_requests_and_recovers_cleanly() {
+        let state = make_test_state();
+        let (input_tx, mut input_rx) = mpsc::channel(8);
+        let mut session = make_test_session();
+        session.input_tx = Some(input_tx);
+        register_test_session(&state, 77, session).await;
+
+        fanout_output(
+            Arc::clone(&state),
+            "session-1",
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission-1",
+                    "method": "request_permission",
+                    "params": {
+                        "message": "Allow shell command?",
+                        "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "question-1",
+                    "method": "request_question",
+                    "params": {"title": "Confirm", "question": "Continue?"}
+                })
+            )
+            .as_bytes(),
+        )
+        .await;
+        let mut events = state.subscribe_events();
+
+        let handled = ChatService::handle_binary_frame(
+            Arc::clone(&state),
+            77,
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "cancel-1",
+                    "method": "session/cancel",
+                    "params": {"sessionId": "session-1"}
+                })
+            )
+            .into_bytes(),
+        )
+        .await
+        .expect("handle cancel frame");
+        assert!(handled);
+
+        let permission = input_rx.recv().await.expect("permission cancellation");
+        let permission_response: Value =
+            serde_json::from_slice(&permission).expect("parse permission response");
+        assert_eq!(permission_response["id"], "permission-1");
+        assert_eq!(
+            permission_response["result"]["outcome"]["outcome"],
+            "cancelled"
+        );
+
+        let question = input_rx.recv().await.expect("question cancellation");
+        let question_response: Value =
+            serde_json::from_slice(&question).expect("parse question response");
+        assert_eq!(question_response["id"], "question-1");
+        assert_eq!(question_response["result"]["action"], "cancel");
+
+        let cancel = input_rx.recv().await.expect("forwarded cancel");
+        let forwarded_cancel: Value = serde_json::from_slice(&cancel).expect("parse cancel frame");
+        assert_eq!(forwarded_cancel["method"], "session/cancel");
+        assert_eq!(forwarded_cancel["params"]["sessionId"], "acp-session-1");
+
+        let removed_permission = events.try_recv().expect("permission removed event");
+        assert_eq!(removed_permission.method, "chat.blocked_request.removed");
+        assert_eq!(removed_permission.params["request_id"], "permission-1");
+        let removed_question = events.try_recv().expect("question removed event");
+        assert_eq!(removed_question.method, "chat.blocked_request.removed");
+        assert_eq!(removed_question.params["request_id"], "question-1");
+        let state_delta = events.try_recv().expect("cancel state delta");
+        assert_eq!(state_delta.method, "state.delta");
+        let operation = state_delta.params["operations"]
+            .as_array()
+            .and_then(|operations| operations.first())
+            .expect("state delta operation");
+        assert_eq!(operation["type"], "chat.session_updated");
+        assert!(operation["chat_session"]
+            .get("pending_blocked_requests")
+            .and_then(Value::as_array)
+            .map(Vec::is_empty)
+            .unwrap_or(true));
+
+        let listed = ChatService::list(
+            Arc::clone(&state),
+            protocol::ChatListParams {
+                thread_id: "thread-1".to_string(),
+            },
+        )
+        .await
+        .expect("chat.list");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].pending_blocked_requests.is_empty());
+
+        let connection_state = Arc::new(Mutex::new(TerminalConnectionState::default()));
+        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+        let attached = ChatService::attach(
+            protocol::ChatAttachParams {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Arc::clone(&state),
+            connection_state,
+            outbound_tx,
+        )
+        .await
+        .expect("chat.attach");
+        assert!(attached.pending_blocked_requests.is_empty());
     }
 
     #[test]
