@@ -415,20 +415,23 @@ pub(super) async fn mark_session_failed(
     error: String,
 ) {
     tracing::warn!(thread_id, session_id, %error, "chat_session_failed");
-    let transitions = {
+    let (transitions, removals) = {
         let mut transitions = Vec::new();
+        let mut removals = Vec::new();
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
             session.summary.status = protocol::ChatSessionStatus::Failed;
             session.input_tx = None;
             session.stop_tx = None;
+            removals = drain_pending_blocked_request_removals(session);
             reset_status_tracking(session, &mut transitions);
             session.status_notify.notify_waiters();
         }
-        transitions
+        (transitions, removals)
     };
 
     emit_status_transitions(&state, transitions).await;
+    emit_blocked_request_removed_events(&state, removals);
 
     state.emit_chat_session_failed(protocol::ChatSessionFailedEvent {
         thread_id: thread_id.to_string(),
@@ -444,9 +447,10 @@ pub(super) async fn mark_session_ended(
     reason: &str,
     purge: bool,
 ) {
-    let (should_emit_ended, transitions) = {
+    let (should_emit_ended, transitions, removals) = {
         let mut should_emit_ended = false;
         let mut transitions = Vec::new();
+        let mut removals = Vec::new();
         let mut chat = state.chat.lock().await;
         if let Some(session) = chat.sessions.get_mut(session_id) {
             if !session.ended_emitted {
@@ -456,13 +460,15 @@ pub(super) async fn mark_session_ended(
                 session.ended_emitted = true;
                 should_emit_ended = true;
             }
+            removals = drain_pending_blocked_request_removals(session);
             reset_status_tracking(session, &mut transitions);
             session.status_notify.notify_waiters();
         }
-        (should_emit_ended, transitions)
+        (should_emit_ended, transitions, removals)
     };
 
     emit_status_transitions(&state, transitions).await;
+    emit_blocked_request_removed_events(&state, removals);
 
     if should_emit_ended {
         state.emit_chat_session_ended(protocol::ChatSessionEndedEvent {
@@ -524,6 +530,7 @@ pub(super) async fn purge_session(state: Arc<AppState>, thread_id: &str, session
         for channel_id in &channels {
             chat.channel_to_session.remove(channel_id);
             chat.channel_outbound.remove(channel_id);
+            chat.blocked_request_aware_channels.remove(channel_id);
         }
         (channels, session.history_path)
     };

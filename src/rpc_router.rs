@@ -381,15 +381,17 @@ pub async fn dispatch_request(
             to_value("preset.restart", result)
         }
         RequestDispatch::ChatStart(params) => {
-            let result = ChatService::start(state, params)
-                .await
-                .map_err(|message| map_service_error("chat.start", message))?;
+            let result =
+                ChatService::start(state, params, chat_session_options(&session_state).await)
+                    .await
+                    .map_err(|message| map_service_error("chat.start", message))?;
             to_value("chat.start", result)
         }
         RequestDispatch::ChatLoad(params) => {
-            let result = ChatService::load(state, params)
-                .await
-                .map_err(|message| map_service_error("chat.load", message))?;
+            let result =
+                ChatService::load(state, params, chat_session_options(&session_state).await)
+                    .await
+                    .map_err(|message| map_service_error("chat.load", message))?;
             to_value("chat.load", result)
         }
         RequestDispatch::ChatStop(params) => {
@@ -405,9 +407,16 @@ pub async fn dispatch_request(
             to_value("chat.list", result)
         }
         RequestDispatch::ChatAttach(params) => {
-            let result = ChatService::attach(params, state, connection_state, outbound_tx)
-                .await
-                .map_err(|message| map_service_error("chat.attach", message))?;
+            let supports_blocked_requests = supports_blocked_requests(&session_state).await;
+            let result = ChatService::attach(
+                params,
+                state,
+                connection_state,
+                outbound_tx,
+                supports_blocked_requests,
+            )
+            .await
+            .map_err(|message| map_service_error("chat.attach", message))?;
             to_value("chat.attach", result)
         }
         RequestDispatch::ChatDetach(params) => {
@@ -427,6 +436,12 @@ pub async fn dispatch_request(
                 .await
                 .map_err(|message| map_service_error("chat.status", message))?;
             to_value("chat.status", result)
+        }
+        RequestDispatch::ChatAnswerBlockedRequest(params) => {
+            let result = ChatService::answer_blocked_request(state, params)
+                .await
+                .map_err(map_chat_blocked_request_error)?;
+            to_value("chat.answer_blocked_request", result)
         }
         RequestDispatch::ChatFork(params) => {
             let result = ChatService::fork(state, params)
@@ -459,9 +474,13 @@ pub async fn dispatch_request(
             to_value("workflow.transition", result)
         }
         RequestDispatch::WorkflowSpawnWorker(params) => {
-            let result = WorkflowService::spawn_worker(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.spawn_worker", message))?;
+            let result = WorkflowService::spawn_worker(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.spawn_worker", message))?;
             to_value("workflow.spawn_worker", result)
         }
         RequestDispatch::WorkflowRecordHandoff(params) => {
@@ -471,15 +490,23 @@ pub async fn dispatch_request(
             to_value("workflow.record_handoff", result)
         }
         RequestDispatch::WorkflowStartReview(params) => {
-            let result = WorkflowService::start_review(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.start_review", message))?;
+            let result = WorkflowService::start_review(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.start_review", message))?;
             to_value("workflow.start_review", result)
         }
         RequestDispatch::WorkflowSpawnReviewer(params) => {
-            let result = WorkflowService::spawn_reviewer(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.spawn_reviewer", message))?;
+            let result = WorkflowService::spawn_reviewer(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.spawn_reviewer", message))?;
             to_value("workflow.spawn_reviewer", result)
         }
         RequestDispatch::WorkflowListReviewers(params) => {
@@ -507,9 +534,13 @@ pub async fn dispatch_request(
             to_value("workflow.resolve_finding", result)
         }
         RequestDispatch::WorkflowStartFromIssue(params) => {
-            let result = WorkflowService::start_from_issue(state, params)
-                .await
-                .map_err(|message| map_service_error("workflow.start_from_issue", message))?;
+            let result = WorkflowService::start_from_issue(
+                state,
+                params,
+                chat_session_options(&session_state).await,
+            )
+            .await
+            .map_err(|message| map_service_error("workflow.start_from_issue", message))?;
             to_value("workflow.start_from_issue", result)
         }
         RequestDispatch::WorkflowAddLinkedIssue(params) => {
@@ -581,6 +612,19 @@ pub async fn dispatch_request(
     }
 }
 
+async fn supports_blocked_requests(session_state: &Arc<Mutex<ConnectionSessionState>>) -> bool {
+    let guard = session_state.lock().await;
+    guard.supports_capability(protocol::CHAT_BLOCKED_REQUESTS_CAPABILITY)
+}
+
+async fn chat_session_options(
+    session_state: &Arc<Mutex<ConnectionSessionState>>,
+) -> crate::services::chat::ChatSessionOptions {
+    crate::services::chat::ChatSessionOptions {
+        capture_blocked_requests: supports_blocked_requests(session_state).await,
+    }
+}
+
 fn normalize_params(method: &str, params: Value) -> Value {
     if !params.is_null() {
         return params;
@@ -644,6 +688,25 @@ fn map_service_error(method: &str, message: String) -> RpcError {
     RpcError::internal(message)
 }
 
+fn map_chat_blocked_request_error(
+    error: crate::services::chat::ChatBlockedRequestAnswerError,
+) -> RpcError {
+    match error {
+        crate::services::chat::ChatBlockedRequestAnswerError::AlreadyResolved(details) => {
+            RpcError::blocked_request_already_resolved(details)
+        }
+        crate::services::chat::ChatBlockedRequestAnswerError::NotFound(message) => {
+            RpcError::not_found("chat.not_found", message)
+        }
+        crate::services::chat::ChatBlockedRequestAnswerError::Invalid(message) => {
+            RpcError::invalid_params(message)
+        }
+        crate::services::chat::ChatBlockedRequestAnswerError::Delivery(message) => {
+            RpcError::retryable_internal(message)
+        }
+    }
+}
+
 fn terminal_attach_session_missing(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("tmux session not running")
@@ -659,10 +722,10 @@ mod tests {
     use tokio::sync::{mpsc, Mutex};
     use uuid::Uuid;
 
-    use super::{dispatch_request, map_service_error};
+    use super::{dispatch_request, map_chat_blocked_request_error, map_service_error};
     use crate::{
         protocol,
-        services::terminal::TerminalConnectionState,
+        services::{chat::ChatBlockedRequestAnswerError, terminal::TerminalConnectionState},
         state_store::{AppData, StateStore},
         AppState, ConnectionSessionState,
     };
@@ -734,5 +797,39 @@ mod tests {
         assert_eq!(error.code, -32001);
         let data = error.data.expect("internal errors should include data");
         assert_eq!(data.kind.as_deref(), Some("rpc.internal"));
+    }
+
+    #[test]
+    fn stale_blocked_request_answer_maps_to_structured_already_resolved_error() {
+        let error = map_chat_blocked_request_error(ChatBlockedRequestAnswerError::AlreadyResolved(
+            protocol::BlockedRequestAlreadyResolvedError {
+                thread_id: "thread-1".to_string(),
+                session_id: "session-1".to_string(),
+                request_id: "old-request".to_string(),
+            },
+        ));
+
+        assert_eq!(error.code, -32042);
+        let data = error.data.expect("structured error data");
+        assert_eq!(
+            data.kind.as_deref(),
+            Some("chat.blocked_request_already_resolved")
+        );
+        let details = data.details.expect("resolved details");
+        assert_eq!(details["thread_id"], "thread-1");
+        assert_eq!(details["session_id"], "session-1");
+        assert_eq!(details["request_id"], "old-request");
+    }
+
+    #[test]
+    fn blocked_request_delivery_failure_maps_to_retryable_internal_error() {
+        let error = map_chat_blocked_request_error(ChatBlockedRequestAnswerError::Delivery(
+            "failed to queue blocked request answer for permission-3".to_string(),
+        ));
+
+        assert_eq!(error.code, -32001);
+        let data = error.data.expect("internal error data");
+        assert_eq!(data.kind.as_deref(), Some("rpc.internal"));
+        assert_eq!(data.retryable, Some(true));
     }
 }

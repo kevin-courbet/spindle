@@ -334,6 +334,12 @@ impl ConnectionSessionState {
         self.hello_acknowledged = true;
         true
     }
+
+    pub fn supports_capability(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|existing| existing == capability)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -463,10 +469,28 @@ impl RpcError {
         })
     }
 
+    pub fn blocked_request_already_resolved(
+        details: protocol::BlockedRequestAlreadyResolvedError,
+    ) -> Self {
+        Self::new(-32042, "blocked request already resolved").with_data(protocol::RpcErrorData {
+            kind: Some("chat.blocked_request_already_resolved".to_string()),
+            retryable: Some(false),
+            details: Some(json!(details)),
+        })
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(-32001, message).with_data(protocol::RpcErrorData {
             kind: Some("rpc.internal".to_string()),
             retryable: Some(false),
+            details: None,
+        })
+    }
+
+    pub fn retryable_internal(message: impl Into<String>) -> Self {
+        Self::new(-32001, message).with_data(protocol::RpcErrorData {
+            kind: Some("rpc.internal".to_string()),
+            retryable: Some(true),
             details: None,
         })
     }

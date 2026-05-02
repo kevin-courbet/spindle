@@ -359,6 +359,7 @@ pub(super) fn discover_history_sessions(
                 created_at,
                 display_name: None,
                 parent_session_id: None,
+                pending_blocked_requests: Vec::new(),
             };
             let mut runtime = ChatSessionRuntime::new(summary, thread_id.clone(), path);
             runtime.acp_session_id = acp_session_id;

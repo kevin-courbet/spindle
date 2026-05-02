@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
 };
@@ -12,6 +12,8 @@ use tokio::{
 };
 
 use crate::protocol;
+
+use super::PendingBlockedRequestRuntime;
 
 pub(super) struct ChatSessionRuntime {
     pub(super) summary: protocol::ChatSessionSummary,
@@ -44,6 +46,8 @@ pub(super) struct ChatSessionRuntime {
     pub(super) modes: Option<Value>,
     pub(super) models: Option<Value>,
     pub(super) config_options: Option<Value>,
+    pub(super) pending_blocked_requests: HashMap<String, PendingBlockedRequestRuntime>,
+    pub(super) blocked_request_capture_enabled: bool,
     /// Tracks the injection prompt request ID so we can detect when the injection turn completes.
     /// Set when injection is sent, cleared when the response arrives in apply_outbound_status_updates.
     pub(super) injection_prompt_id: Option<String>,
@@ -94,6 +98,8 @@ impl ChatSessionRuntime {
             modes: None,
             models: None,
             config_options: None,
+            pending_blocked_requests: HashMap::new(),
+            blocked_request_capture_enabled: false,
             injection_prompt_id: None,
             user_prompt_count: 0,
             first_prompt_text: None,

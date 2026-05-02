@@ -389,22 +389,27 @@ impl Drop for TestHarness {
 }
 
 pub async fn setup_test_server() -> TestHarness {
+    setup_test_server_with_capabilities(TEST_CAPABILITIES).await
+}
+
+pub async fn setup_test_server_with_capabilities(capabilities: &[&str]) -> TestHarness {
     let guard = test_mutex().lock().await;
 
     let config_home = unique_temp_path("spindle-config");
     fs::create_dir_all(config_home.join("threadmill")).expect("create test config directory");
-    setup_test_server_with_config_home_inner(guard, config_home).await
+    setup_test_server_with_config_home_inner(guard, config_home, capabilities).await
 }
 
 pub async fn setup_test_server_with_config_home(config_home: PathBuf) -> TestHarness {
     let guard = test_mutex().lock().await;
     fs::create_dir_all(config_home.join("threadmill")).expect("create test config directory");
-    setup_test_server_with_config_home_inner(guard, config_home).await
+    setup_test_server_with_config_home_inner(guard, config_home, TEST_CAPABILITIES).await
 }
 
 async fn setup_test_server_with_config_home_inner(
     guard: MutexGuard<'static, ()>,
     config_home: PathBuf,
+    capabilities: &[&str],
 ) -> TestHarness {
     let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
     set_env_var("XDG_CONFIG_HOME", &config_home);
@@ -448,7 +453,7 @@ async fn setup_test_server_with_config_home_inner(
                     "version": "dev",
                 },
                 "protocol_version": TEST_PROTOCOL_VERSION,
-                "capabilities": TEST_CAPABILITIES,
+                "capabilities": capabilities,
             }),
         )
         .await

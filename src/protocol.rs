@@ -9,10 +9,12 @@ use serde_json::Value;
 pub type StateVersion = u64;
 
 pub const PROTOCOL_VERSION: &str = "2026-03-17";
+pub const CHAT_BLOCKED_REQUESTS_CAPABILITY: &str = "chat.blocked_requests.v1";
 pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "state.delta.operations.v1",
     "preset.output.v1",
     "rpc.errors.structured.v1",
+    CHAT_BLOCKED_REQUESTS_CAPABILITY,
 ];
 
 pub const REQUIRED_CLIENT_CAPABILITIES: &[&str] = &[
@@ -120,6 +122,104 @@ pub struct ChatSessionSummary {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_blocked_requests: Vec<BlockedRequest>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum BlockedRequestKind {
+    #[serde(rename = "question")]
+    Question,
+    #[serde(rename = "permission")]
+    Permission,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum BlockedRequestAnswerAction {
+    #[serde(rename = "accept")]
+    Accept,
+    #[serde(rename = "decline")]
+    Decline,
+    #[serde(rename = "cancel")]
+    Cancel,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlockedQuestionRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub actions: Vec<BlockedRequestAnswerAction>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlockedPermissionOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlockedPermissionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub options: Vec<BlockedPermissionOption>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct BlockedRequest {
+    pub thread_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub kind: BlockedRequestKind,
+    pub title: String,
+    pub message: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<BlockedQuestionRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<BlockedPermissionRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_request: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockedRequestAddedEvent {
+    pub request: BlockedRequest,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockedRequestRemovedEvent {
+    pub thread_id: String,
+    pub session_id: String,
+    pub request_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlockedRequestAnswerResult {
+    pub thread_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<BlockedRequestAnswerAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+    pub answered_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockedRequestAnsweredEvent {
+    pub result: BlockedRequestAnswerResult,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlockedRequestAlreadyResolvedError {
+    pub thread_id: String,
+    pub session_id: String,
+    pub request_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -949,6 +1049,17 @@ pub struct ChatHistoryParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatAnswerBlockedRequestParams {
+    pub thread_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<BlockedRequestAnswerAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorkflowCreateParams {
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1669,6 +1780,8 @@ pub struct ChatAttachResult {
     pub models: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_options: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_blocked_requests: Vec<BlockedRequest>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1682,6 +1795,8 @@ pub struct ChatHistoryResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<u64>,
 }
+
+pub type ChatAnswerBlockedRequestResult = BlockedRequestAnswerResult;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorkflowCreateResult {
@@ -1780,6 +1895,7 @@ pub const METHOD_CHAT_DETACH: &str = "chat.detach";
 pub const METHOD_CHAT_HISTORY: &str = "chat.history";
 pub const METHOD_CHAT_STATUS: &str = "chat.status";
 pub const METHOD_CHAT_FORK: &str = "chat.fork";
+pub const METHOD_CHAT_ANSWER_BLOCKED_REQUEST: &str = "chat.answer_blocked_request";
 pub const METHOD_WORKFLOW_CREATE: &str = "workflow.create";
 pub const METHOD_WORKFLOW_STATUS: &str = "workflow.status";
 pub const METHOD_WORKFLOW_LIST: &str = "workflow.list";
@@ -1934,6 +2050,9 @@ pub enum RequestDispatch {
     ChatHistory(ChatHistoryParams),
     #[serde(rename = "chat.status")]
     ChatStatus(ChatStatusParams),
+    #[serde(rename = "chat.answer_blocked_request")]
+    ChatAnswerBlockedRequest(ChatAnswerBlockedRequestParams),
+    #[serde(rename = "chat.fork")]
     ChatFork(ChatForkParams),
     #[serde(rename = "workflow.create")]
     WorkflowCreate(WorkflowCreateParams),
@@ -2136,6 +2255,11 @@ pub fn parse_request_dispatch(
         METHOD_CHAT_STATUS => serde_json::from_value::<ChatStatusParams>(params)
             .map(RequestDispatch::ChatStatus)
             .map_err(|err| format!("invalid chat.status params: {err}")),
+        METHOD_CHAT_ANSWER_BLOCKED_REQUEST => {
+            serde_json::from_value::<ChatAnswerBlockedRequestParams>(params)
+                .map(RequestDispatch::ChatAnswerBlockedRequest)
+                .map_err(|err| format!("invalid chat.answer_blocked_request params: {err}"))
+        }
         METHOD_CHAT_FORK => serde_json::from_value::<ChatForkParams>(params)
             .map(RequestDispatch::ChatFork)
             .map_err(|err| format!("invalid chat.fork params: {err}")),

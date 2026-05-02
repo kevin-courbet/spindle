@@ -51,6 +51,19 @@ for raw in sys.stdin.buffer:
             "models": {"availableModels": [], "currentModelId": None},
             "configOptions": [],
         }
+    elif method == "session/prompt" and "TRIGGER_PERMISSION" in json.dumps(msg.get("params") or {}):
+        request = {
+            "jsonrpc": "2.0",
+            "id": "workflow-permission-before-attach",
+            "method": "request_permission",
+            "params": {
+                "message": "Allow workflow command?",
+                "options": [{"optionId": "run", "name": "Run", "kind": "allow"}]
+            },
+        }
+        sys.stdout.write(json.dumps(request) + "\n")
+        sys.stdout.flush()
+        result = {}
     else:
         result = {}
 
@@ -527,6 +540,77 @@ async fn workflow_spawn_worker_records_handoff_and_updates_on_external_end() {
             .iter()
             .any(|worker| worker["worker_id"] == "W002" && worker["status"] == "FAILED"),
         "W002 should fail when its chat session ends externally"
+    );
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
+#[tokio::test]
+async fn capable_workflow_spawn_worker_captures_initial_prompt_permission_before_attach() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping capable_workflow_spawn_worker_captures_initial_prompt_permission_before_attach: tmux unavailable"
+        );
+        return;
+    }
+
+    let mut harness = common::setup_test_server_with_capabilities(&[
+        "state.delta.operations.v1",
+        "preset.output.v1",
+        "rpc.errors.structured.v1",
+        "chat.blocked_requests.v1",
+    ])
+    .await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let thread_id = create_thread(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+    let workflow_id = create_workflow(&mut harness, &thread_id).await;
+
+    harness
+        .rpc(
+            "workflow.transition",
+            json!({
+                "workflow_id": workflow_id,
+                "phase": "IMPLEMENTING"
+            }),
+        )
+        .await
+        .expect("transition workflow to IMPLEMENTING");
+
+    let spawned = harness
+        .rpc(
+            "workflow.spawn_worker",
+            json!({
+                "workflow_id": workflow_id,
+                "agent_name": "mock",
+                "initial_prompt": "TRIGGER_PERMISSION in worker prompt",
+                "display_name": "Worker: W001"
+            }),
+        )
+        .await
+        .expect("workflow.spawn_worker");
+    let session_id = spawned["worker"]["session_id"]
+        .as_str()
+        .expect("worker session id")
+        .to_string();
+
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+    let blocked = harness
+        .wait_for_event("chat.blocked_request.added", Duration::from_secs(5))
+        .await
+        .expect("blocked request from workflow worker");
+    assert_eq!(
+        blocked["params"]["request"]["request_id"],
+        "workflow-permission-before-attach"
+    );
+
+    let status = harness
+        .rpc("chat.status", json!({ "session_id": session_id }))
+        .await
+        .expect("chat.status for workflow worker session");
+    assert_eq!(
+        status["pending_blocked_requests"].as_array().unwrap().len(),
+        1
     );
 
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;

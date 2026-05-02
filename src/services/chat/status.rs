@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use super::{
-    emit_state_delta_updated, io::request_id_key, runtime::ChatSessionRuntime, CHAT_CANCEL_METHOD,
+    collect_pending_blocked_request_cancellations, emit_state_delta_updated, io::request_id_key,
+    runtime::ChatSessionRuntime, BlockedRequestCancellation, CHAT_CANCEL_METHOD,
     CHAT_PROMPT_METHOD, CHAT_STALL_TIMEOUT, CHAT_UPDATE_METHOD,
 };
 use crate::{protocol, services::checkpoint::CheckpointService, AppState};
@@ -143,6 +144,7 @@ pub(super) struct SessionProcessingOutcome {
     pub(super) title_prompt_to_generate: Option<String>,
     /// Whether the per-session conversation context was consumed during this batch.
     pub(super) consumed_conversation_context: bool,
+    pub(super) blocked_request_cancellations: Vec<BlockedRequestCancellation>,
 }
 
 pub(super) fn apply_inbound_status_updates(
@@ -158,6 +160,7 @@ pub(super) fn apply_inbound_status_updates(
     let mut auto_checkpoints = Vec::new();
     let mut title_prompt_to_generate = None;
     let mut consumed_conversation_context = false;
+    let mut blocked_request_cancellations = Vec::new();
 
     for message in &mut messages {
         let method = message
@@ -235,6 +238,8 @@ pub(super) fn apply_inbound_status_updates(
 
         if method == CHAT_CANCEL_METHOD {
             reset_status_tracking(session, &mut transitions);
+            blocked_request_cancellations
+                .extend(collect_pending_blocked_request_cancellations(session));
         }
     }
 
@@ -249,6 +254,7 @@ pub(super) fn apply_inbound_status_updates(
         auto_checkpoints,
         title_prompt_to_generate,
         consumed_conversation_context,
+        blocked_request_cancellations,
     }
 }
 
