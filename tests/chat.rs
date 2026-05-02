@@ -686,6 +686,59 @@ async fn capable_chat_answers_synthetic_elicitation_and_permission_after_rpc_and
         );
     }
 
+    let create_request_id = "elicitation-create-accept";
+    harness
+        .send_binary(
+            channel_id,
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "emit-elicitation-create-accept",
+                    "method": "threadmill/emitElicitation",
+                    "params": {
+                        "requestId": create_request_id,
+                        "method": "elicitation/create",
+                        "message": "Question elicitation/create?",
+                        "requestedSchema": requested_schema.clone()
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send synthetic elicitation/create trigger");
+    let blocked = harness
+        .wait_for_event("chat.blocked_request.added", Duration::from_secs(5))
+        .await
+        .expect("elicitation/create blocked request added");
+    assert_eq!(
+        blocked["params"]["request"]["request_id"],
+        create_request_id
+    );
+    assert_eq!(blocked["params"]["request"]["kind"], "question");
+    let create_content = json!({"decision": "yes"});
+    harness
+        .rpc(
+            "chat.answer_blocked_request",
+            json!({
+                "thread_id": thread_id,
+                "session_id": session_id,
+                "request_id": create_request_id,
+                "action": protocol_action("accept"),
+                "content": create_content.clone(),
+            }),
+        )
+        .await
+        .expect("answer elicitation/create blocked request");
+    let create_response = wait_for_agent_response(&worktree_path, create_request_id).await;
+    assert_elicitation_create_response_matches_schema(
+        &create_response,
+        "accept",
+        &requested_schema,
+        Some(&create_content),
+    );
+
     harness
         .send_binary(
             channel_id,
@@ -893,6 +946,43 @@ fn assert_elicitation_response_matches_schema(
             .any(|option| option["const"].as_str() == Some(decision)),
         "decision content must match requested schema oneOf"
     );
+}
+
+fn assert_elicitation_create_response_matches_schema(
+    response: &Value,
+    expected_action: &str,
+    requested_schema: &Value,
+    expected_content: Option<&Value>,
+) {
+    assert_eq!(
+        response["result"]["action"].as_str(),
+        Some(expected_action),
+        "ACP elicitation/create response action must be flat"
+    );
+    if expected_action != "accept" {
+        assert!(
+            response["result"].get("content").is_none(),
+            "non-accept elicitation/create actions must not include content"
+        );
+        return;
+    }
+    let content = response["result"]
+        .get("content")
+        .expect("accepted elicitation/create response must include content");
+    assert_eq!(Some(content), expected_content);
+    let content_object = content
+        .as_object()
+        .expect("accepted elicitation/create content must be an object");
+    for required in requested_schema["required"]
+        .as_array()
+        .expect("requested schema required array")
+    {
+        let required = required.as_str().expect("required field name");
+        assert!(
+            content_object.contains_key(required),
+            "accepted elicitation/create content must satisfy required schema field {required}"
+        );
+    }
 }
 
 #[tokio::test]

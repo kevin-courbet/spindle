@@ -1718,27 +1718,42 @@ fn agent_response_for_blocked_request(
                 )
             })?;
             if pending_is_acp_elicitation(pending) {
-                let nested_action = match action {
-                    protocol::BlockedRequestAnswerAction::Accept => {
-                        AcpElicitationResponseAction::Accept {
-                            content: Some(elicitation_accept_content(pending, result)?),
+                if pending_is_session_elicitation(pending) {
+                    let nested_action = match action {
+                        protocol::BlockedRequestAnswerAction::Accept => {
+                            AcpElicitationResponseAction::Accept {
+                                content: Some(elicitation_accept_content(pending, result)?),
+                            }
                         }
+                        protocol::BlockedRequestAnswerAction::Decline => {
+                            AcpElicitationResponseAction::Decline
+                        }
+                        protocol::BlockedRequestAnswerAction::Cancel => {
+                            AcpElicitationResponseAction::Cancel
+                        }
+                    };
+                    serde_json::to_value(AcpElicitationResponse {
+                        action: nested_action,
+                    })
+                    .map_err(|err| {
+                        ChatBlockedRequestAnswerError::Invalid(format!(
+                            "failed to encode elicitation response: {err}"
+                        ))
+                    })?
+                } else {
+                    match action {
+                        protocol::BlockedRequestAnswerAction::Accept => json!({
+                            "action": "accept",
+                            "content": elicitation_accept_content(pending, result)?,
+                        }),
+                        protocol::BlockedRequestAnswerAction::Decline => json!({
+                            "action": "decline",
+                        }),
+                        protocol::BlockedRequestAnswerAction::Cancel => json!({
+                            "action": "cancel",
+                        }),
                     }
-                    protocol::BlockedRequestAnswerAction::Decline => {
-                        AcpElicitationResponseAction::Decline
-                    }
-                    protocol::BlockedRequestAnswerAction::Cancel => {
-                        AcpElicitationResponseAction::Cancel
-                    }
-                };
-                serde_json::to_value(AcpElicitationResponse {
-                    action: nested_action,
-                })
-                .map_err(|err| {
-                    ChatBlockedRequestAnswerError::Invalid(format!(
-                        "failed to encode elicitation response: {err}"
-                    ))
-                })?
+                }
             } else {
                 json!({
                     "action": match action {
@@ -1765,17 +1780,26 @@ fn agent_response_for_blocked_request(
 }
 
 fn pending_is_acp_elicitation(pending: &PendingBlockedRequestRuntime) -> bool {
+    pending_elicitation_method(pending).is_some()
+}
+
+fn pending_is_session_elicitation(pending: &PendingBlockedRequestRuntime) -> bool {
+    pending_elicitation_method(pending) == Some(CHAT_SESSION_ELICITATION_METHOD)
+}
+
+fn pending_elicitation_method(pending: &PendingBlockedRequestRuntime) -> Option<&str> {
     pending
         .request
         .raw_request
         .as_ref()
         .and_then(|request| request.get("method"))
         .and_then(Value::as_str)
-        .is_some_and(|method| {
+        .and_then(|method| {
             matches!(
                 method,
                 CHAT_SESSION_ELICITATION_METHOD | CHAT_ELICITATION_CREATE_METHOD
             )
+            .then_some(method)
         })
 }
 
@@ -2005,7 +2029,7 @@ fn cancelled_agent_response_for_blocked_request(pending: &PendingBlockedRequestR
             }
         }),
         protocol::BlockedRequestKind::Question => {
-            if pending_is_acp_elicitation(pending) {
+            if pending_is_session_elicitation(pending) {
                 json!({
                     "action": {
                         "action": "cancel"
@@ -3078,6 +3102,20 @@ mod tests {
             "jsonrpc": "2.0",
             "id": "blocked-1",
             "method": "session/elicitation",
+            "params": {
+                "message": "Continue?",
+                "requestedSchema": schema,
+            }
+        }));
+        pending
+    }
+
+    fn make_pending_elicitation_create_with_schema(schema: Value) -> PendingBlockedRequestRuntime {
+        let mut pending = make_pending_blocked_request(protocol::BlockedRequestKind::Question);
+        pending.request.raw_request = Some(json!({
+            "jsonrpc": "2.0",
+            "id": "blocked-1",
+            "method": "elicitation/create",
             "params": {
                 "message": "Continue?",
                 "requestedSchema": schema,
@@ -5726,6 +5764,54 @@ mod tests {
 
         assert_eq!(response["result"]["action"]["action"], "accept");
         assert_eq!(response["result"]["action"]["content"]["decision"], "yes");
+    }
+
+    #[test]
+    fn acp_elicitation_create_agent_response_flattens_action_and_content() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "oneOf": [
+                        {"const": "yes", "title": "Yes"},
+                        {"const": "no", "title": "No"}
+                    ]
+                }
+            },
+            "required": ["decision"]
+        });
+        let pending = make_pending_elicitation_create_with_schema(schema);
+        let result = protocol::BlockedRequestAnswerResult {
+            thread_id: "thread-1".to_string(),
+            session_id: "session-1".to_string(),
+            request_id: "blocked-1".to_string(),
+            action: Some(protocol::BlockedRequestAnswerAction::Accept),
+            option_id: None,
+            content: Some(json!({"decision": "yes"})),
+            answered_at: Utc::now().to_rfc3339(),
+        };
+
+        let response = agent_response_for_blocked_request(&pending, &result)
+            .expect("valid elicitation/create response");
+        let response: Value = serde_json::from_slice(&response).expect("parse response");
+
+        assert_eq!(response["result"]["action"], "accept");
+        assert_eq!(response["result"]["content"]["decision"], "yes");
+    }
+
+    #[test]
+    fn acp_elicitation_create_cancel_response_flattens_action() {
+        let pending = make_pending_elicitation_create_with_schema(json!({
+            "type": "object",
+            "properties": {}
+        }));
+
+        let response = cancelled_agent_response_for_blocked_request(&pending);
+        let response: Value = serde_json::from_slice(&response).expect("parse response");
+
+        assert_eq!(response["result"]["action"], "cancel");
+        assert!(response["result"].get("content").is_none());
     }
 
     #[test]
