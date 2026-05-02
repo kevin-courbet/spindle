@@ -578,6 +578,16 @@ async fn capable_chat_answers_synthetic_elicitation_and_permission_after_rpc_and
         .expect("session_id")
         .to_string();
     wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+    let initialize = read_agent_log(&worktree_path)
+        .into_iter()
+        .find(|entry| entry["method"] == "initialize")
+        .expect("agent initialize request logged");
+    assert!(
+        initialize["params"]["clientCapabilities"]
+            .get("elicitation")
+            .is_some(),
+        "blocked-request-capable clients should advertise ACP elicitation through daemon capture"
+    );
     let attached = harness
         .rpc(
             "chat.attach",
@@ -587,10 +597,39 @@ async fn capable_chat_answers_synthetic_elicitation_and_permission_after_rpc_and
         .expect("chat.attach");
     let channel_id = attached["channel_id"].as_u64().expect("channel_id") as u16;
 
-    for (request_id, action, expected_action) in [
-        ("elicitation-accept", protocol_action("accept"), "accept"),
-        ("elicitation-decline", protocol_action("decline"), "decline"),
-        ("elicitation-cancel", protocol_action("cancel"), "cancel"),
+    let requested_schema = json!({
+        "type": "object",
+        "properties": {
+            "decision": {
+                "type": "string",
+                "title": "Decision",
+                "oneOf": [
+                    {"const": "yes", "title": "Yes"},
+                    {"const": "no", "title": "No"}
+                ]
+            }
+        },
+        "required": ["decision"]
+    });
+    for (request_id, action, expected_action, answer_content) in [
+        (
+            "elicitation-accept",
+            protocol_action("accept"),
+            "accept",
+            Some(json!({"decision": "yes"})),
+        ),
+        (
+            "elicitation-decline",
+            protocol_action("decline"),
+            "decline",
+            None,
+        ),
+        (
+            "elicitation-cancel",
+            protocol_action("cancel"),
+            "cancel",
+            None,
+        ),
     ] {
         harness
             .send_binary(
@@ -603,7 +642,8 @@ async fn capable_chat_answers_synthetic_elicitation_and_permission_after_rpc_and
                         "method": "threadmill/emitElicitation",
                         "params": {
                             "requestId": request_id,
-                            "message": format!("Question {request_id}?")
+                            "message": format!("Question {request_id}?"),
+                            "requestedSchema": requested_schema.clone()
                         }
                     })
                 )
@@ -623,21 +663,27 @@ async fn capable_chat_answers_synthetic_elicitation_and_permission_after_rpc_and
             "agent must not receive elicitation response before answer RPC"
         );
 
+        let mut answer_params = json!({
+            "thread_id": thread_id,
+            "session_id": session_id,
+            "request_id": request_id,
+            "action": action,
+        });
+        if let Some(content) = answer_content.clone() {
+            answer_params["content"] = content;
+        }
         let answered = harness
-            .rpc(
-                "chat.answer_blocked_request",
-                json!({
-                    "thread_id": thread_id,
-                    "session_id": session_id,
-                    "request_id": request_id,
-                    "action": action,
-                }),
-            )
+            .rpc("chat.answer_blocked_request", answer_params)
             .await
             .expect("answer elicitation blocked request");
         assert_eq!(answered["request_id"], request_id);
         let response = wait_for_agent_response(&worktree_path, request_id).await;
-        assert_eq!(response["result"]["action"], expected_action);
+        assert_elicitation_response_matches_schema(
+            &response,
+            expected_action,
+            &requested_schema,
+            answer_content.as_ref(),
+        );
     }
 
     harness
@@ -748,8 +794,105 @@ async fn capable_chat_answers_synthetic_elicitation_and_permission_after_rpc_and
     cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
 }
 
+#[tokio::test]
+async fn noncapable_chat_start_does_not_advertise_acp_elicitation() {
+    if !common::tmux_available().await {
+        eprintln!(
+            "skipping noncapable_chat_start_does_not_advertise_acp_elicitation: tmux unavailable"
+        );
+        return;
+    }
+
+    let threadmill_capabilities = [
+        "state.delta.operations.v1",
+        "preset.output.v1",
+        "rpc.errors.structured.v1",
+    ];
+    let mut harness = common::setup_test_server_with_capabilities(&threadmill_capabilities).await;
+    let (_project, project_id) = add_project(&mut harness).await;
+    let (thread_id, worktree_path) = create_thread_with_worktree(&mut harness, &project_id).await;
+    wait_for_thread_ready(&mut harness, &thread_id).await;
+
+    let started = harness
+        .rpc(
+            "chat.start",
+            json!({"thread_id": thread_id, "agent_name": "mock"}),
+        )
+        .await
+        .expect("chat.start");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    wait_for_chat_ready(&mut harness, &thread_id, &session_id).await;
+
+    let initialize = read_agent_log(&worktree_path)
+        .into_iter()
+        .find(|entry| entry["method"] == "initialize")
+        .expect("agent initialize request logged");
+    assert!(
+        initialize["params"]["clientCapabilities"]
+            .get("elicitation")
+            .is_none(),
+        "Threadmill-current clients must not advertise ACP elicitation unless daemon-owned blocked request capture is enabled"
+    );
+
+    cleanup_thread_project(&mut harness, &thread_id, &project_id).await;
+}
+
 fn protocol_action(action: &str) -> Value {
     Value::String(action.to_string())
+}
+
+fn assert_elicitation_response_matches_schema(
+    response: &Value,
+    expected_action: &str,
+    requested_schema: &Value,
+    expected_content: Option<&Value>,
+) {
+    let action = response["result"]["action"]
+        .as_object()
+        .expect("ACP elicitation response action must be nested object");
+    assert_eq!(
+        action.get("action").and_then(Value::as_str),
+        Some(expected_action)
+    );
+    if expected_action != "accept" {
+        assert!(
+            action.get("content").is_none(),
+            "non-accept elicitation actions must not include content"
+        );
+        return;
+    }
+    let content = action
+        .get("content")
+        .expect("accepted elicitation response must include content");
+    assert_eq!(Some(content), expected_content);
+    let content_object = content
+        .as_object()
+        .expect("accepted elicitation content must be an object");
+    for required in requested_schema["required"]
+        .as_array()
+        .expect("requested schema required array")
+    {
+        let required = required.as_str().expect("required field name");
+        assert!(
+            content_object.contains_key(required),
+            "accepted elicitation content must satisfy required schema field {required}"
+        );
+    }
+    let decision = content["decision"]
+        .as_str()
+        .expect("decision content must be string");
+    let one_of = requested_schema["properties"]["decision"]["oneOf"]
+        .as_array()
+        .expect("decision oneOf options");
+    assert!(
+        one_of
+            .iter()
+            .any(|option| option["const"].as_str() == Some(decision)),
+        "decision content must match requested schema oneOf"
+    );
 }
 
 #[tokio::test]

@@ -207,6 +207,8 @@ pub struct BlockedRequestAnswerResult {
     pub action: Option<BlockedRequestAnswerAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
     pub answered_at: String,
 }
 
@@ -1057,6 +1059,8 @@ pub struct ChatAnswerBlockedRequestParams {
     pub action: Option<BlockedRequestAnswerAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
