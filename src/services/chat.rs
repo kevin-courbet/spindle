@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     sync::{mpsc, Mutex},
@@ -37,6 +38,8 @@ const CHAT_REQUEST_PERMISSION_METHOD: &str = "request_permission";
 const CHAT_SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
 const CHAT_REQUEST_QUESTION_METHOD: &str = "request_question";
 const CHAT_SESSION_REQUEST_QUESTION_METHOD: &str = "session/request_question";
+const CHAT_SESSION_ELICITATION_METHOD: &str = "session/elicitation";
+const CHAT_ELICITATION_CREATE_METHOD: &str = "elicitation/create";
 const CHAT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 mod context;
@@ -159,6 +162,25 @@ struct HandshakeResult {
     model_id: Option<String>,
     /// Notifications collected during session/load replay. Empty for session/new.
     replay_notifications: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AcpElicitationRequest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default, rename = "requestedSchema")]
+    requested_schema: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AcpElicitationResponse {
+    action: &'static str,
 }
 
 impl ChatService {
@@ -1178,7 +1200,10 @@ async fn perform_handshake(
                     "readTextFile": false,
                     "writeTextFile": false
                 },
-                "terminal": false
+                "terminal": false,
+                "elicitation": {
+                    "form": {}
+                }
             },
             "clientInfo": {
                 "name": "Threadmill",
@@ -1282,7 +1307,11 @@ fn blocked_request_from_message(
         method,
         CHAT_REQUEST_QUESTION_METHOD | CHAT_SESSION_REQUEST_QUESTION_METHOD
     );
-    if !is_permission_method && !is_question_method {
+    let is_elicitation_method = matches!(
+        method,
+        CHAT_SESSION_ELICITATION_METHOD | CHAT_ELICITATION_CREATE_METHOD
+    );
+    if !is_permission_method && !is_question_method && !is_elicitation_method {
         return BlockedRequestFrame::NotBlockedRequest;
     }
 
@@ -1334,33 +1363,65 @@ fn blocked_request_from_message(
         }));
     }
 
-    if is_question_method {
-        let Some(prompt) = params
-            .and_then(|params| {
+    if is_question_method || is_elicitation_method {
+        let parsed_elicitation = if is_elicitation_method {
+            match params
+                .cloned()
+                .map(serde_json::from_value::<AcpElicitationRequest>)
+            {
+                Some(Ok(request)) => Some(request),
+                Some(Err(error)) => {
+                    return BlockedRequestFrame::Invalid(InvalidBlockedRequestRuntime {
+                        method: method.to_string(),
+                        request_id: request_id_value,
+                        reason: format!("elicitation blocked request has invalid params: {error}"),
+                    });
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let prompt = parsed_elicitation
+            .as_ref()
+            .and_then(elicitation_prompt)
+            .or_else(|| {
                 params
-                    .get("question")
-                    .or_else(|| params.get("prompt"))
-                    .or_else(|| params.get("message"))
-            })
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty())
-        else {
+                    .and_then(|params| {
+                        params
+                            .get("question")
+                            .or_else(|| params.get("prompt"))
+                            .or_else(|| params.get("message"))
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|prompt| !prompt.is_empty())
+                    .map(ToOwned::to_owned)
+            });
+        let Some(prompt) = prompt else {
             return BlockedRequestFrame::Invalid(InvalidBlockedRequestRuntime {
                 method: method.to_string(),
                 request_id: request_id_value,
-                reason:
+                reason: if is_elicitation_method {
+                    "elicitation blocked request requires a non-empty message".to_string()
+                } else {
                     "question blocked request requires a non-empty question, prompt, or message"
-                        .to_string(),
+                        .to_string()
+                },
             });
         };
-        let prompt = prompt.to_string();
-        let title = params
-            .and_then(|params| params.get("title"))
-            .and_then(Value::as_str)
-            .filter(|title| !title.is_empty())
-            .unwrap_or("Question requested")
-            .to_string();
+        let title = parsed_elicitation
+            .as_ref()
+            .and_then(elicitation_title)
+            .or_else(|| {
+                params
+                    .and_then(|params| params.get("title"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "Question requested".to_string());
         return BlockedRequestFrame::Pending(Box::new(PendingBlockedRequestRuntime {
             acp_request_id,
             request: protocol::BlockedRequest {
@@ -1406,6 +1467,37 @@ fn invalid_blocked_request_error_payload(error: &InvalidBlockedRequestRuntime) -
         }
     })])
     .unwrap_or_default()
+}
+
+fn elicitation_prompt(request: &AcpElicitationRequest) -> Option<String> {
+    request
+        .message
+        .as_deref()
+        .or(request.prompt.as_deref())
+        .or(request.question.as_deref())
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn elicitation_title(request: &AcpElicitationRequest) -> Option<String> {
+    request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            request
+                .requested_schema
+                .as_ref()
+                .and_then(|schema| schema.get("title"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| Some("Question requested".to_string()))
 }
 
 fn blocked_permission_from_params(
@@ -1600,13 +1692,18 @@ fn agent_response_for_blocked_request(
                         .to_string(),
                 )
             })?;
-            json!({
-                "action": match action {
+            serde_json::to_value(AcpElicitationResponse {
+                action: match action {
                     protocol::BlockedRequestAnswerAction::Accept => "accept",
                     protocol::BlockedRequestAnswerAction::Decline => "decline",
                     protocol::BlockedRequestAnswerAction::Cancel => "cancel",
                 },
             })
+            .map_err(|err| {
+                ChatBlockedRequestAnswerError::Invalid(format!(
+                    "failed to encode elicitation response: {err}"
+                ))
+            })?
         }
     };
     let mut payload = serde_json::to_vec(&json!({
@@ -5473,8 +5570,8 @@ mod tests {
                 json!({
                     "jsonrpc": "2.0",
                     "id": "question-1",
-                    "method": "session/request_question",
-                    "params": {"question": "Continue?"}
+                    "method": "session/elicitation",
+                    "params": {"message": "Continue?", "requestedSchema": {"type": "object", "properties": {}}}
                 })
             )
             .as_bytes(),
