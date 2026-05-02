@@ -7,14 +7,14 @@ license = "MIT"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "5"
+dirs = "6"
 futures-util = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-rusqlite = { version = "0.31", features = ["bundled"] }
-sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.29"
 tracing = "0.1"
