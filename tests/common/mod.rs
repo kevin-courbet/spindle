@@ -60,6 +60,35 @@ impl TestHarness {
         &self.ws_url
     }
 
+    pub async fn reconnect_with_capabilities(
+        &mut self,
+        capabilities: &[&str],
+    ) -> Result<(), String> {
+        let (socket, _) = connect_async(self.ws_url.clone())
+            .await
+            .map_err(|err| format!("connect websocket: {err}"))?;
+        self.socket = socket;
+        self.events.clear();
+        self.binaries.clear();
+        let hello = self
+            .rpc(
+                "session.hello",
+                json!({
+                    "client": {
+                        "name": "spindle-tests",
+                        "version": "dev",
+                    },
+                    "protocol_version": TEST_PROTOCOL_VERSION,
+                    "capabilities": capabilities,
+                }),
+            )
+            .await?;
+        if !hello["session_id"].is_string() {
+            return Err("session.hello after reconnect missing session_id".to_string());
+        }
+        Ok(())
+    }
+
     pub async fn rpc(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;

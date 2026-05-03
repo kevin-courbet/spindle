@@ -140,6 +140,13 @@ pub(super) async fn run_session_task(
         session.stop_tx = Some(stop_tx);
     }
 
+    let capture_blocked_requests = {
+        let chat = state.chat.lock().await;
+        chat.sessions
+            .get(&session_id)
+            .is_some_and(|session| session.blocked_request_capture_enabled)
+    };
+
     let mut stdout = stdout;
     let is_new_session = load_session_id.is_none();
     let handshake = timeout(
@@ -150,6 +157,7 @@ pub(super) async fn run_session_task(
             load_session_id,
             &cwd,
             preferred_model.as_deref(),
+            capture_blocked_requests,
         ),
     )
     .await

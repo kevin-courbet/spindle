@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     sync::{mpsc, Mutex},
@@ -37,6 +38,8 @@ const CHAT_REQUEST_PERMISSION_METHOD: &str = "request_permission";
 const CHAT_SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
 const CHAT_REQUEST_QUESTION_METHOD: &str = "request_question";
 const CHAT_SESSION_REQUEST_QUESTION_METHOD: &str = "session/request_question";
+const CHAT_SESSION_ELICITATION_METHOD: &str = "session/elicitation";
+const CHAT_ELICITATION_CREATE_METHOD: &str = "elicitation/create";
 const CHAT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 mod context;
@@ -159,6 +162,39 @@ struct HandshakeResult {
     model_id: Option<String>,
     /// Notifications collected during session/load replay. Empty for session/new.
     replay_notifications: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AcpElicitationRequest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default, rename = "requestedSchema")]
+    requested_schema: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AcpElicitationResponse {
+    action: AcpElicitationResponseAction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "action")]
+enum AcpElicitationResponseAction {
+    #[serde(rename = "accept")]
+    Accept {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Value>,
+    },
+    #[serde(rename = "decline")]
+    Decline,
+    #[serde(rename = "cancel")]
+    Cancel,
 }
 
 impl ChatService {
@@ -1163,6 +1199,7 @@ async fn perform_handshake(
     load_session_id: Option<String>,
     cwd: &str,
     preferred_model: Option<&str>,
+    capture_blocked_requests: bool,
 ) -> Result<HandshakeResult, String> {
     let mut buffer = Vec::new();
     let mut collected = Vec::new();
@@ -1173,13 +1210,7 @@ async fn perform_handshake(
         "initialize",
         json!({
             "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {
-                    "readTextFile": false,
-                    "writeTextFile": false
-                },
-                "terminal": false
-            },
+            "clientCapabilities": acp_client_capabilities(capture_blocked_requests),
             "clientInfo": {
                 "name": "Threadmill",
                 "title": "Threadmill",
@@ -1267,6 +1298,23 @@ async fn perform_handshake(
     })
 }
 
+fn acp_client_capabilities(capture_blocked_requests: bool) -> Value {
+    let mut capabilities = serde_json::Map::from_iter([
+        (
+            "fs".to_string(),
+            json!({
+                "readTextFile": false,
+                "writeTextFile": false,
+            }),
+        ),
+        ("terminal".to_string(), Value::Bool(false)),
+    ]);
+    if capture_blocked_requests {
+        capabilities.insert("elicitation".to_string(), json!({ "form": {} }));
+    }
+    Value::Object(capabilities)
+}
+
 fn blocked_request_from_message(
     session: &ChatSessionRuntime,
     message: &Value,
@@ -1282,7 +1330,11 @@ fn blocked_request_from_message(
         method,
         CHAT_REQUEST_QUESTION_METHOD | CHAT_SESSION_REQUEST_QUESTION_METHOD
     );
-    if !is_permission_method && !is_question_method {
+    let is_elicitation_method = matches!(
+        method,
+        CHAT_SESSION_ELICITATION_METHOD | CHAT_ELICITATION_CREATE_METHOD
+    );
+    if !is_permission_method && !is_question_method && !is_elicitation_method {
         return BlockedRequestFrame::NotBlockedRequest;
     }
 
@@ -1334,33 +1386,65 @@ fn blocked_request_from_message(
         }));
     }
 
-    if is_question_method {
-        let Some(prompt) = params
-            .and_then(|params| {
+    if is_question_method || is_elicitation_method {
+        let parsed_elicitation = if is_elicitation_method {
+            match params
+                .cloned()
+                .map(serde_json::from_value::<AcpElicitationRequest>)
+            {
+                Some(Ok(request)) => Some(request),
+                Some(Err(error)) => {
+                    return BlockedRequestFrame::Invalid(InvalidBlockedRequestRuntime {
+                        method: method.to_string(),
+                        request_id: request_id_value,
+                        reason: format!("elicitation blocked request has invalid params: {error}"),
+                    });
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let prompt = parsed_elicitation
+            .as_ref()
+            .and_then(elicitation_prompt)
+            .or_else(|| {
                 params
-                    .get("question")
-                    .or_else(|| params.get("prompt"))
-                    .or_else(|| params.get("message"))
-            })
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty())
-        else {
+                    .and_then(|params| {
+                        params
+                            .get("question")
+                            .or_else(|| params.get("prompt"))
+                            .or_else(|| params.get("message"))
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|prompt| !prompt.is_empty())
+                    .map(ToOwned::to_owned)
+            });
+        let Some(prompt) = prompt else {
             return BlockedRequestFrame::Invalid(InvalidBlockedRequestRuntime {
                 method: method.to_string(),
                 request_id: request_id_value,
-                reason:
+                reason: if is_elicitation_method {
+                    "elicitation blocked request requires a non-empty message".to_string()
+                } else {
                     "question blocked request requires a non-empty question, prompt, or message"
-                        .to_string(),
+                        .to_string()
+                },
             });
         };
-        let prompt = prompt.to_string();
-        let title = params
-            .and_then(|params| params.get("title"))
-            .and_then(Value::as_str)
-            .filter(|title| !title.is_empty())
-            .unwrap_or("Question requested")
-            .to_string();
+        let title = parsed_elicitation
+            .as_ref()
+            .and_then(elicitation_title)
+            .or_else(|| {
+                params
+                    .and_then(|params| params.get("title"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "Question requested".to_string());
         return BlockedRequestFrame::Pending(Box::new(PendingBlockedRequestRuntime {
             acp_request_id,
             request: protocol::BlockedRequest {
@@ -1406,6 +1490,37 @@ fn invalid_blocked_request_error_payload(error: &InvalidBlockedRequestRuntime) -
         }
     })])
     .unwrap_or_default()
+}
+
+fn elicitation_prompt(request: &AcpElicitationRequest) -> Option<String> {
+    request
+        .message
+        .as_deref()
+        .or(request.prompt.as_deref())
+        .or(request.question.as_deref())
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn elicitation_title(request: &AcpElicitationRequest) -> Option<String> {
+    request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            request
+                .requested_schema
+                .as_ref()
+                .and_then(|schema| schema.get("title"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| Some("Question requested".to_string()))
 }
 
 fn blocked_permission_from_params(
@@ -1532,6 +1647,7 @@ fn build_blocked_request_answer_result(
                 request_id: request.request_id.clone(),
                 action: Some(action),
                 option_id: None,
+                content: params.content.clone(),
                 answered_at,
             })
         }
@@ -1568,6 +1684,7 @@ fn build_blocked_request_answer_result(
                 request_id: request.request_id.clone(),
                 action: None,
                 option_id: Some(option_id),
+                content: None,
                 answered_at,
             })
         }
@@ -1600,13 +1717,52 @@ fn agent_response_for_blocked_request(
                         .to_string(),
                 )
             })?;
-            json!({
-                "action": match action {
-                    protocol::BlockedRequestAnswerAction::Accept => "accept",
-                    protocol::BlockedRequestAnswerAction::Decline => "decline",
-                    protocol::BlockedRequestAnswerAction::Cancel => "cancel",
-                },
-            })
+            if pending_is_acp_elicitation(pending) {
+                if pending_is_session_elicitation(pending) {
+                    let nested_action = match action {
+                        protocol::BlockedRequestAnswerAction::Accept => {
+                            AcpElicitationResponseAction::Accept {
+                                content: Some(elicitation_accept_content(pending, result)?),
+                            }
+                        }
+                        protocol::BlockedRequestAnswerAction::Decline => {
+                            AcpElicitationResponseAction::Decline
+                        }
+                        protocol::BlockedRequestAnswerAction::Cancel => {
+                            AcpElicitationResponseAction::Cancel
+                        }
+                    };
+                    serde_json::to_value(AcpElicitationResponse {
+                        action: nested_action,
+                    })
+                    .map_err(|err| {
+                        ChatBlockedRequestAnswerError::Invalid(format!(
+                            "failed to encode elicitation response: {err}"
+                        ))
+                    })?
+                } else {
+                    match action {
+                        protocol::BlockedRequestAnswerAction::Accept => json!({
+                            "action": "accept",
+                            "content": elicitation_accept_content(pending, result)?,
+                        }),
+                        protocol::BlockedRequestAnswerAction::Decline => json!({
+                            "action": "decline",
+                        }),
+                        protocol::BlockedRequestAnswerAction::Cancel => json!({
+                            "action": "cancel",
+                        }),
+                    }
+                }
+            } else {
+                json!({
+                    "action": match action {
+                        protocol::BlockedRequestAnswerAction::Accept => "accept",
+                        protocol::BlockedRequestAnswerAction::Decline => "decline",
+                        protocol::BlockedRequestAnswerAction::Cancel => "cancel",
+                    }
+                })
+            }
         }
     };
     let mut payload = serde_json::to_vec(&json!({
@@ -1623,6 +1779,248 @@ fn agent_response_for_blocked_request(
     Ok(payload)
 }
 
+fn pending_is_acp_elicitation(pending: &PendingBlockedRequestRuntime) -> bool {
+    pending_elicitation_method(pending).is_some()
+}
+
+fn pending_is_session_elicitation(pending: &PendingBlockedRequestRuntime) -> bool {
+    pending_elicitation_method(pending) == Some(CHAT_SESSION_ELICITATION_METHOD)
+}
+
+fn pending_elicitation_method(pending: &PendingBlockedRequestRuntime) -> Option<&str> {
+    pending
+        .request
+        .raw_request
+        .as_ref()
+        .and_then(|request| request.get("method"))
+        .and_then(Value::as_str)
+        .and_then(|method| {
+            matches!(
+                method,
+                CHAT_SESSION_ELICITATION_METHOD | CHAT_ELICITATION_CREATE_METHOD
+            )
+            .then_some(method)
+        })
+}
+
+fn elicitation_requested_schema(pending: &PendingBlockedRequestRuntime) -> Option<&Value> {
+    pending
+        .request
+        .raw_request
+        .as_ref()
+        .and_then(|request| request.get("params"))
+        .and_then(|params| params.get("requestedSchema"))
+}
+
+fn elicitation_accept_content(
+    pending: &PendingBlockedRequestRuntime,
+    result: &protocol::BlockedRequestAnswerResult,
+) -> Result<Value, ChatBlockedRequestAnswerError> {
+    let content = result
+        .content
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let Some(schema) = elicitation_requested_schema(pending) else {
+        validate_elicitation_content_value(&content)?;
+        return Ok(content);
+    };
+    validate_elicitation_content_against_schema(&content, schema)?;
+    Ok(content)
+}
+
+fn validate_elicitation_content_value(
+    content: &Value,
+) -> Result<(), ChatBlockedRequestAnswerError> {
+    let Some(fields) = content.as_object() else {
+        return Err(ChatBlockedRequestAnswerError::Invalid(
+            "elicitation accept content must be an object".to_string(),
+        ));
+    };
+    for (field, value) in fields {
+        if !is_elicitation_content_primitive(value) {
+            return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                "elicitation accept content field {field} must be a string, integer, number, boolean, or string array"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_elicitation_content_against_schema(
+    content: &Value,
+    schema: &Value,
+) -> Result<(), ChatBlockedRequestAnswerError> {
+    let Some(content_fields) = content.as_object() else {
+        return Err(ChatBlockedRequestAnswerError::Invalid(
+            "elicitation accept content must be an object".to_string(),
+        ));
+    };
+    if schema
+        .get("type")
+        .is_some_and(|schema_type| schema_type.as_str() != Some("object"))
+    {
+        return Err(ChatBlockedRequestAnswerError::Invalid(
+            "elicitation requestedSchema must be an object schema".to_string(),
+        ));
+    }
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ChatBlockedRequestAnswerError::Invalid(
+                "elicitation requestedSchema must define object properties".to_string(),
+            )
+        })?;
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    for field in required {
+        if !content_fields.contains_key(field) {
+            return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                "elicitation accept content missing required field {field}"
+            )));
+        }
+    }
+    for (field, value) in content_fields {
+        let Some(property_schema) = properties.get(field) else {
+            return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                "elicitation accept content field {field} is not declared by requestedSchema"
+            )));
+        };
+        validate_elicitation_field_value(field, value, property_schema)?;
+    }
+    Ok(())
+}
+
+fn validate_elicitation_field_value(
+    field: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> Result<(), ChatBlockedRequestAnswerError> {
+    let schema_type = property_schema
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ChatBlockedRequestAnswerError::Invalid(format!(
+                "elicitation requestedSchema field {field} must declare a type"
+            ))
+        })?;
+    match schema_type {
+        "string" => validate_elicitation_string_field(field, value, property_schema),
+        "integer" => {
+            if value.as_i64().is_none() {
+                return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                    "elicitation accept content field {field} must be an integer"
+                )));
+            }
+            Ok(())
+        }
+        "number" => {
+            if value.as_f64().is_none() {
+                return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                    "elicitation accept content field {field} must be a number"
+                )));
+            }
+            Ok(())
+        }
+        "boolean" => {
+            if !value.is_boolean() {
+                return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                    "elicitation accept content field {field} must be a boolean"
+                )));
+            }
+            Ok(())
+        }
+        "array" => validate_elicitation_string_array_field(field, value, property_schema),
+        other => Err(ChatBlockedRequestAnswerError::Invalid(format!(
+            "elicitation requestedSchema field {field} has unsupported type {other}"
+        ))),
+    }
+}
+
+fn validate_elicitation_string_field(
+    field: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> Result<(), ChatBlockedRequestAnswerError> {
+    let Some(value) = value.as_str() else {
+        return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+            "elicitation accept content field {field} must be a string"
+        )));
+    };
+    if let Some(options) = property_schema.get("enum").and_then(Value::as_array) {
+        if !options.iter().any(|option| option.as_str() == Some(value)) {
+            return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                "elicitation accept content field {field} is not an allowed enum value"
+            )));
+        }
+    }
+    if let Some(options) = property_schema.get("oneOf").and_then(Value::as_array) {
+        if !options
+            .iter()
+            .filter_map(|option| option.get("const"))
+            .any(|option| option.as_str() == Some(value))
+        {
+            return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                "elicitation accept content field {field} is not an allowed oneOf value"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_elicitation_string_array_field(
+    field: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> Result<(), ChatBlockedRequestAnswerError> {
+    let Some(values) = value.as_array() else {
+        return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+            "elicitation accept content field {field} must be an array"
+        )));
+    };
+    if values.iter().any(|item| item.as_str().is_none()) {
+        return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+            "elicitation accept content field {field} must be a string array"
+        )));
+    }
+    let Some(item_schema) = property_schema.get("items") else {
+        return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+            "elicitation requestedSchema field {field} array must declare items"
+        )));
+    };
+    if item_schema.get("type").and_then(Value::as_str) != Some("string") {
+        return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+            "elicitation requestedSchema field {field} array items must be strings"
+        )));
+    }
+    if let Some(options) = item_schema.get("enum").and_then(Value::as_array) {
+        for value in values.iter().filter_map(Value::as_str) {
+            if !options.iter().any(|option| option.as_str() == Some(value)) {
+                return Err(ChatBlockedRequestAnswerError::Invalid(format!(
+                    "elicitation accept content field {field} contains an unsupported value"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_elicitation_content_primitive(value: &Value) -> bool {
+    value.is_string()
+        || value.is_i64()
+        || value.is_u64()
+        || value.is_f64()
+        || value.is_boolean()
+        || value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string))
+}
+
 fn cancelled_agent_response_for_blocked_request(pending: &PendingBlockedRequestRuntime) -> Vec<u8> {
     let result_value = match pending.request.kind {
         protocol::BlockedRequestKind::Permission => json!({
@@ -1630,9 +2028,19 @@ fn cancelled_agent_response_for_blocked_request(pending: &PendingBlockedRequestR
                 "outcome": "cancelled",
             }
         }),
-        protocol::BlockedRequestKind::Question => json!({
-            "action": "cancel",
-        }),
+        protocol::BlockedRequestKind::Question => {
+            if pending_is_session_elicitation(pending) {
+                json!({
+                    "action": {
+                        "action": "cancel"
+                    }
+                })
+            } else {
+                json!({
+                    "action": "cancel",
+                })
+            }
+        }
     };
     let mut payload = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
@@ -2686,6 +3094,34 @@ mod tests {
             },
             acp_request_id: json!("blocked-1"),
         }
+    }
+
+    fn make_pending_elicitation_with_schema(schema: Value) -> PendingBlockedRequestRuntime {
+        let mut pending = make_pending_blocked_request(protocol::BlockedRequestKind::Question);
+        pending.request.raw_request = Some(json!({
+            "jsonrpc": "2.0",
+            "id": "blocked-1",
+            "method": "session/elicitation",
+            "params": {
+                "message": "Continue?",
+                "requestedSchema": schema,
+            }
+        }));
+        pending
+    }
+
+    fn make_pending_elicitation_create_with_schema(schema: Value) -> PendingBlockedRequestRuntime {
+        let mut pending = make_pending_blocked_request(protocol::BlockedRequestKind::Question);
+        pending.request.raw_request = Some(json!({
+            "jsonrpc": "2.0",
+            "id": "blocked-1",
+            "method": "elicitation/create",
+            "params": {
+                "message": "Continue?",
+                "requestedSchema": schema,
+            }
+        }));
+        pending
     }
 
     #[test]
@@ -3932,6 +4368,7 @@ mod tests {
                 request_id: "permission-mixed".to_string(),
                 action: None,
                 option_id: Some("run".to_string()),
+                content: None,
             },
         )
         .await
@@ -3966,6 +4403,7 @@ mod tests {
                 request_id: "permission-mixed".to_string(),
                 action: None,
                 option_id: Some("run".to_string()),
+                content: None,
             },
         )
         .await
@@ -4952,6 +5390,7 @@ mod tests {
                 request_id: "permission-1".to_string(),
                 action: None,
                 option_id: Some("run".to_string()),
+                content: None,
             },
         )
         .await
@@ -4988,6 +5427,7 @@ mod tests {
                 request_id: "permission-1".to_string(),
                 action: None,
                 option_id: Some("run".to_string()),
+                content: None,
             },
         )
         .await
@@ -5045,6 +5485,7 @@ mod tests {
                 request_id: "question-1".to_string(),
                 action: Some(protocol::BlockedRequestAnswerAction::Decline),
                 option_id: None,
+                content: None,
             },
         )
         .await
@@ -5258,6 +5699,7 @@ mod tests {
             request_id: "blocked-1".to_string(),
             action: None,
             option_id: None,
+            content: None,
             answered_at: Utc::now().to_rfc3339(),
         };
 
@@ -5278,6 +5720,7 @@ mod tests {
             request_id: "blocked-1".to_string(),
             action: None,
             option_id: None,
+            content: None,
             answered_at: Utc::now().to_rfc3339(),
         };
 
@@ -5287,6 +5730,117 @@ mod tests {
         assert!(
             matches!(error, ChatBlockedRequestAnswerError::Invalid(message) if message == "invariant violation: question blocked request answer missing action")
         );
+    }
+
+    #[test]
+    fn acp_elicitation_agent_response_nests_action_and_content() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "oneOf": [
+                        {"const": "yes", "title": "Yes"},
+                        {"const": "no", "title": "No"}
+                    ]
+                }
+            },
+            "required": ["decision"]
+        });
+        let pending = make_pending_elicitation_with_schema(schema);
+        let result = protocol::BlockedRequestAnswerResult {
+            thread_id: "thread-1".to_string(),
+            session_id: "session-1".to_string(),
+            request_id: "blocked-1".to_string(),
+            action: Some(protocol::BlockedRequestAnswerAction::Accept),
+            option_id: None,
+            content: Some(json!({"decision": "yes"})),
+            answered_at: Utc::now().to_rfc3339(),
+        };
+
+        let response = agent_response_for_blocked_request(&pending, &result)
+            .expect("valid elicitation response");
+        let response: Value = serde_json::from_slice(&response).expect("parse response");
+
+        assert_eq!(response["result"]["action"]["action"], "accept");
+        assert_eq!(response["result"]["action"]["content"]["decision"], "yes");
+    }
+
+    #[test]
+    fn acp_elicitation_create_agent_response_flattens_action_and_content() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "oneOf": [
+                        {"const": "yes", "title": "Yes"},
+                        {"const": "no", "title": "No"}
+                    ]
+                }
+            },
+            "required": ["decision"]
+        });
+        let pending = make_pending_elicitation_create_with_schema(schema);
+        let result = protocol::BlockedRequestAnswerResult {
+            thread_id: "thread-1".to_string(),
+            session_id: "session-1".to_string(),
+            request_id: "blocked-1".to_string(),
+            action: Some(protocol::BlockedRequestAnswerAction::Accept),
+            option_id: None,
+            content: Some(json!({"decision": "yes"})),
+            answered_at: Utc::now().to_rfc3339(),
+        };
+
+        let response = agent_response_for_blocked_request(&pending, &result)
+            .expect("valid elicitation/create response");
+        let response: Value = serde_json::from_slice(&response).expect("parse response");
+
+        assert_eq!(response["result"]["action"], "accept");
+        assert_eq!(response["result"]["content"]["decision"], "yes");
+    }
+
+    #[test]
+    fn acp_elicitation_create_cancel_response_flattens_action() {
+        let pending = make_pending_elicitation_create_with_schema(json!({
+            "type": "object",
+            "properties": {}
+        }));
+
+        let response = cancelled_agent_response_for_blocked_request(&pending);
+        let response: Value = serde_json::from_slice(&response).expect("parse response");
+
+        assert_eq!(response["result"]["action"], "cancel");
+        assert!(response["result"].get("content").is_none());
+    }
+
+    #[test]
+    fn acp_elicitation_accept_rejects_missing_required_content() {
+        let pending = make_pending_elicitation_with_schema(json!({
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string"}
+            },
+            "required": ["decision"]
+        }));
+        let result = protocol::BlockedRequestAnswerResult {
+            thread_id: "thread-1".to_string(),
+            session_id: "session-1".to_string(),
+            request_id: "blocked-1".to_string(),
+            action: Some(protocol::BlockedRequestAnswerAction::Accept),
+            option_id: None,
+            content: None,
+            answered_at: Utc::now().to_rfc3339(),
+        };
+
+        let error = agent_response_for_blocked_request(&pending, &result)
+            .expect_err("missing required schema content must fail");
+
+        assert!(matches!(
+            error,
+            ChatBlockedRequestAnswerError::Invalid(message)
+                if message == "elicitation accept content missing required field decision"
+        ));
     }
 
     #[tokio::test]
@@ -5325,6 +5879,7 @@ mod tests {
                 request_id: "permission-2".to_string(),
                 action: None,
                 option_id: Some("not-advertised".to_string()),
+                content: None,
             },
         )
         .await
@@ -5381,6 +5936,7 @@ mod tests {
                 request_id: "permission-3".to_string(),
                 action: None,
                 option_id: Some("run".to_string()),
+                content: None,
             },
         )
         .await
@@ -5437,6 +5993,7 @@ mod tests {
                 request_id: "permission-4".to_string(),
                 action: None,
                 option_id: Some("run".to_string()),
+                content: None,
             },
         )
         .await
@@ -5473,8 +6030,8 @@ mod tests {
                 json!({
                     "jsonrpc": "2.0",
                     "id": "question-1",
-                    "method": "session/request_question",
-                    "params": {"question": "Continue?"}
+                    "method": "session/elicitation",
+                    "params": {"message": "Continue?", "requestedSchema": {"type": "object", "properties": {}}}
                 })
             )
             .as_bytes(),
